@@ -62,7 +62,7 @@ chmod +x setup.sh
 ```bash
 python -m venv venv
 source venv/bin/activate   # Linux/macOS
-venv\Scripts\activate      # Windows
+.\venv\Scripts\activate      # Windows
 pip install tiktoken typer python-dotenv openai rich prompt-toolkit pdfminer.six python-docx
 ```
 
