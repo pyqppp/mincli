@@ -18,6 +18,8 @@ DeepSeek CLI - 交互式 AI 助手（支持树状对话 & 推理过程）
 
 import os
 import re
+import io
+import csv
 import sys
 import datetime
 from dataclasses import dataclass, field
@@ -500,6 +502,36 @@ class InteractiveSession:
         thinking_enabled: bool = False,
         reasoning_effort: str = "high",
     ):
+        """
+        初始化交互会话管理器。
+
+        Args:
+            client: OpenAI 客户端实例，用于 API 调用。
+            default_system: 默认系统提示词。
+            default_temperature: 默认温度参数。
+            default_model: 默认使用的模型（默认为 'deepseek-v4-flash'）。
+            start_tree_mode: 是否以树状对话模式启动（默认 False）。
+            thinking_enabled: 是否启用思考/推理过程显示。
+            reasoning_effort: 推理强度（'high' 或 'max'）。
+
+        Attributes:
+            client: OpenAI 客户端。
+            current_system: 当前使用的系统提示词。
+            current_temperature: 当前温度参数。
+            current_model: 当前使用的模型。
+            tree_mode: 是否为树状模式。
+            thinking_enabled: 是否显示推理过程。
+            reasoning_effort: 推理强度。
+            linear_conversations: 线性模式下的历史对话列表。
+            linear_messages: 线性模式下的消息列表（用于 API 调用）。
+            tree: 树状模式下 ConversationTree 对象。
+            browse_mode: 是否正在浏览历史。
+            browse_index: 历史浏览索引。
+            session: Prompt Toolkit 会话（含历史记录和按键绑定）。
+            bindings: 自定义按键绑定。
+            imported_content: 导入的外部内容（可选）。
+        """
+        # 客户端与基础配置
         self.client = client
         self.current_system = default_system
         self.current_temperature = default_temperature
@@ -508,25 +540,28 @@ class InteractiveSession:
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
 
-        # 线性模式状态
+        # 线性模式状态：对话快照与 API 消息列表
         self.linear_conversations: List[Dict] = []
         self.linear_messages = [{"role": "system", "content": default_system}]
 
-        # 树状模式状态
+        # 树状模式状态：初始化为空，若为树状模式则创建新树
         self.tree: Optional[ConversationTree] = None
         if start_tree_mode:
             self.tree = ConversationTree(default_system)
 
-        # 历史浏览状态（线性模式）
+        # 历史浏览状态（仅线性模式生效）
         self.browse_mode = False
         self.browse_index = -1
 
-        # Prompt Toolkit 会话
+        # Prompt Toolkit 会话：使用文件历史持久化
         self.history_file = os.path.expanduser("~/.deepseek_cli_history")
         self.session = PromptSession(history=FileHistory(self.history_file))
         self.bindings = self._create_key_bindings()
 
+        # 尝试恢复上次会话（线性或树状模式）
         self._load_session()
+        # 可选：存储从外部导入的内容（如文件读取）
+        self.imported_content: Optional[str] = None
 
     def _get_save_file_path(self) -> str:
         return self.SAVE_FILE_TREE if self.tree_mode else self.SAVE_FILE_LINEAR
@@ -544,6 +579,7 @@ class InteractiveSession:
                     "thinking_enabled": self.thinking_enabled,
                     "reasoning_effort": self.reasoning_effort,
                     "tree": self.tree.to_dict(),
+                    "imported_content": self.imported_content,
                 }
             else:
                 data = {
@@ -555,6 +591,7 @@ class InteractiveSession:
                     "reasoning_effort": self.reasoning_effort,
                     "linear_conversations": self.linear_conversations,
                     "linear_messages": self.linear_messages,
+                    "imported_content": self.imported_content,
                 }
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -623,6 +660,9 @@ class InteractiveSession:
             console.print(f"[dim]📂 已从文件恢复为{'树状' if self.tree_mode else '线性'}模式[/dim]")
         else:
             console.print("[dim]📂 已加载上次会话记录[/dim]")
+        # 恢复导入内容
+        self.imported_content = data.get("imported_content")
+        
         return True
 
     def _delete_session_file(self) -> None:
@@ -796,7 +836,7 @@ class InteractiveSession:
                 "/help", "/h",
                 "/cd", "/list", "/info", "/back", "/root", "/save_node",
                 "/save", "/save_group",
-                "/rm",
+                "/rm","/imp",
             ]
             cmd_lower = cmd_stripped.lower()
             is_valid = any(cmd_lower.startswith(vc) for vc in valid_commands)
@@ -840,6 +880,17 @@ class InteractiveSession:
             if cmd.startswith("/save"):
                 self._handle_linear_save(cmd)
                 return True
+        
+        if cmd_lower.startswith("/imp"):
+            parts = cmd.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print("[yellow]用法: /imp <文件路径>[/yellow]")
+            else:
+                result = self._parse_file(parts[1].strip())
+                if result:
+                    self.imported_content = result
+                    console.print("[green]✅ 文件内容已导入，将在下一次提问时自动附加。[/green]")
+            return True
 
         return False
 
@@ -936,6 +987,7 @@ class InteractiveSession:
         /save <序号>          - 保存线性模式下的指定对话
         /tree                 - 线性模式切换到树状模式
         /help, /h             - 显示此帮助
+        /imp <文件路径>       - 导入文件内容（txt/csv/pdf/docx），下次提问自动附加
 
         树状模式命令（仅树状模式下有效）：
         /cd <节点ID>          - 切换到指定节点
@@ -1053,6 +1105,9 @@ class InteractiveSession:
             console.print("[red]序号必须是数字[/red]")
 
     def process_user_input(self, user_input: str) -> None:
+        if self.imported_content:
+            user_input = self.imported_content + "\n\n" + user_input
+            self.imported_content = None   # 仅使用一次
         if self.tree_mode:
             self._process_tree_input(user_input)
         else:
@@ -1156,7 +1211,7 @@ class InteractiveSession:
         console.print(Panel.fit(f"DeepSeek CLI {mode_str}", style="bold green"))
         console.print(
             "命令: /set system <提示词>  /set temp <值>  /set model <flash|pro>  "
-            "/set thinking <on|off>  /set effort <high|max>  /set show  /clear  /save <序号>  /tree  /exit"
+            "/set thinking <on|off>  /set effort <high|max>  /set show  /clear  /save <序号>  /tree  /exit /imp <路径>"
         )
         if self.tree_mode:
             console.print("树状命令: /cd <ID>  /list  /info [ID]  /back  /root  /save_node [ID]")
@@ -1167,6 +1222,56 @@ class InteractiveSession:
 
         if self.tree_mode and not self.tree:
             console.print("[dim]当前为空树，请输入第一个问题以创建根节点。[/dim]\n")
+    
+    def _parse_file(self, filepath: str) -> Optional[str]:
+        """解析文件，返回“文件名：内容”格式的字符串，失败返回 None"""
+        filepath = os.path.expanduser(filepath)
+        if not os.path.exists(filepath):
+            console.print(f"[red]文件不存在: {filepath}[/red]")
+            return None
+        ext = os.path.splitext(filepath)[1].lower()
+        filename = os.path.basename(filepath)
+        content = ""
+
+        try:
+            if ext == '.txt':
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            elif ext == '.csv':
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    reader = csv.reader(f)
+                    rows = [','.join(row) for row in reader]
+                    content = '\n'.join(rows)
+            elif ext == '.pdf':
+                try:
+                    from pdfminer.high_level import extract_text
+                    content = extract_text(filepath)
+                except ImportError:
+                    console.print("[red]需安装 pdfminer.six: pip install pdfminer.six[/red]")
+                    return None
+            elif ext == '.docx':
+                try:
+                    from docx import Document
+                    doc = Document(filepath)
+                    content = '\n'.join([p.text for p in doc.paragraphs])
+                except ImportError:
+                    console.print("[red]需安装 python-docx: pip install python-docx[/red]")
+                    return None
+            elif ext == '.doc':
+                console.print("[yellow]不支持 .doc 格式，请转换为 .docx 或 .txt[/yellow]")
+                return None
+            else:
+                console.print(f"[red]不支持的文件格式: {ext}[/red]")
+                return None
+
+            if not content.strip():
+                console.print("[yellow]文件内容为空[/yellow]")
+                return None
+
+            return f"{filename}：\n{content.strip()}"
+        except Exception as e:
+            console.print(f"[red]文件解析失败: {e}[/red]")
+            return None
 
 
 # ---------- CLI 入口 ----------

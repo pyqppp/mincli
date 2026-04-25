@@ -40,7 +40,7 @@ if errorlevel 1 (
 :: 安装依赖 - 使用清华镜像
 echo 正在安装依赖包（使用清华镜像）...
 pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-pip install tiktoken typer "python-dotenv>=1.0.0" "openai>=1.0.0" rich prompt-toolkit -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+pip install tiktoken typer "python-dotenv>=1.0.0" "openai>=1.0.0" rich prompt-toolkit pdfminer.six python-docx -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
 
 if errorlevel 1 (
     echo [错误] 安装依赖失败，请检查网络连接。

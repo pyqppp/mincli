@@ -35,6 +35,8 @@ venv/bin/pip install \
     "openai>=1.0.0" \
     rich \
     prompt-toolkit \
+    pdfminer.six \
+    python-docx \
     -i $PIP_INDEX --trusted-host $PIP_TRUSTED_HOST
 
 echo ""
