@@ -180,7 +180,7 @@ def stream_response(
         )
 
         with Live(auto_refresh=False, console=console, screen=True) as live:
-            header = f"**你:** {user_question}\n\n"
+            header = f"**你:**\n{user_question}\n\n"
             initial_display = header + "**DeepSeek:** "
             live.update(Markdown(initial_display), refresh=True)
 
@@ -198,16 +198,16 @@ def stream_response(
                 # 构建动态显示
                 display = header
                 if reasoning_text:
-                    display += "[dim]**DeepSeek 思考过程:**\n> "
-                    display += reasoning_text.replace("\n", "\n> ") + "[/dim]\n\n"
+                    display += "[dim]**DeepSeek 思考过程:**\n "
+                    display += reasoning_text + "[/dim]\n\n"
                 display += f"**DeepSeek:** {full_content}"
                 live.update(Markdown(display), refresh=True)
 
             # 最终渲染
             final_display = header
             if reasoning_text:
-                final_display += "[dim]**DeepSeek 思考过程:**\n> "
-                final_display += reasoning_text.replace("\n", "\n> ") + "[/dim]\n\n"
+                final_display += "[dim]**DeepSeek 思考过程:**\n "
+                final_display += reasoning_text + "[/dim]\n\n"
             final_display += f"**DeepSeek:** {full_content}"
             live.update(Markdown(final_display), refresh=True)
 
@@ -396,6 +396,40 @@ class ConversationTree:
             self.current_node = self.nodes[node_id]
             return True
         return False
+
+    def delete_node(self, node_id: str) -> bool:
+        """删除指定节点及其所有子节点。返回 True 表示成功。"""
+        if node_id not in self.nodes:
+            return False
+        node = self.nodes[node_id]
+        # 收集所有要删除的节点 ID（包括自身和所有后代）
+        to_delete = set()
+        self._collect_descendants(node, to_delete)
+
+        # 从父节点的 children 列表中移除该节点
+        if node.parent_id:
+            parent = self.nodes.get(node.parent_id)
+            if parent:
+                parent.children = [c for c in parent.children if c.id != node_id]
+
+        # 从 nodes 字典中删除
+        for nid in to_delete:
+            del self.nodes[nid]
+
+        # 如果删除的节点是当前节点，将 current_node 切换到其父节点或根节点
+        if self.current_node and self.current_node.id in to_delete:
+            if node.parent_id and node.parent_id in self.nodes:
+                self.current_node = self.nodes[node.parent_id]
+            else:
+                self.current_node = self.root
+
+        return True
+
+    def _collect_descendants(self, node: ConversationNode, result: set):
+        """递归收集节点及其所有后代的 ID。"""
+        result.add(node.id)
+        for child in node.children:
+            self._collect_descendants(child, result)
 
     def render_tree(self, highlight_id: Optional[str] = None) -> RichTree:
         """使用 Rich 库渲染树状图。"""
@@ -691,7 +725,7 @@ class InteractiveSession:
             f"## 用户问题\n\n{conv['user']}\n\n"
         )
         if conv.get('reasoning'):
-            content += f"## DeepSeek 思考过程\n\n> {conv['reasoning'].replace(chr(10), chr(10)+'> ')}\n\n"
+            content += f"## DeepSeek 思考过程\n\n {conv['reasoning'].replace(chr(10), chr(10)+'> ')}\n\n"
         content += f"## DeepSeek 回答\n\n{conv['assistant']}\n\n"
         token_stats = {
             'input_tokens': conv['input_tokens'],
@@ -712,7 +746,7 @@ class InteractiveSession:
             f"## 用户问题\n\n{node.user_msg}\n\n"
         )
         if node.reasoning:
-            content += f"## DeepSeek 思考过程\n\n> {node.reasoning.replace(chr(10), chr(10)+'> ')}\n\n"
+            content += f"## DeepSeek 思考过程\n\n {node.reasoning.replace(chr(10), chr(10)+'> ')}\n\n"
         content += f"## DeepSeek 回答\n\n{node.assistant_msg}\n\n"
         token_stats = {
             'input_tokens': node.input_tokens,
@@ -937,6 +971,39 @@ class InteractiveSession:
         if cmd_lower.startswith("/save_node"):
             nid = parts[1] if len(parts) > 1 else self.tree.current_node.id
             self._save_tree_node(nid)
+            return True
+        
+        if cmd_lower.startswith("/rm"):
+            nid = parts[1] if len(parts) > 1 else None
+            if nid is None:
+                console.print("[yellow]用法: /rm <节点ID>[/yellow]")
+                return True
+            if nid not in self.tree.nodes:
+                console.print(f"[red]未找到节点 {nid}[/red]")
+                return True
+            # 禁止删除根节点
+            if nid == "main" or nid == self.tree.root.id:
+                console.print("[red]不能删除根节点[/red]")
+                return True
+            # 重新获取节点对象（已确认存在）
+            node_to_delete = self.tree.nodes[nid]
+            # 确认删除
+            child_count = len(self.tree.nodes) - 1  # 粗略估算会删除多少节点
+            console.print(f"[yellow]确定要删除节点 {nid} 及其所有子节点吗？(y/N)[/yellow]")
+            try:
+                confirm = console.input("").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                confirm = "n"
+            if confirm != "y":
+                console.print("[dim]取消删除[/dim]")
+                return True
+            if self.tree.delete_node(nid):
+                # 删除成功后，重新显示当前节点
+                if self.tree.current_node:
+                    self._display_tree_node(self.tree.current_node)
+                console.print(f"[green]节点 {nid} 及其所有子节点已删除[/green]")
+            else:
+                console.print(f"[red]删除节点 {nid} 失败[/red]")
             return True
         
         return False
