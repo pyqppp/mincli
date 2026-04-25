@@ -299,75 +299,56 @@ class ConversationTree:
         self.current_node: Optional[ConversationNode] = None
 
     def _generate_child_id(self, parent: ConversationNode) -> str:
-        """生成全局唯一的子节点 ID。"""
-        # 根节点 "main" 的特殊处理
-        if parent.id == "main":
-            if not parent.children:
+        """
+        生成 ID 规则：
+        - 父节点无子节点 → 继承父字母，数字 +1（主线发展）。
+        - 父节点已有子节点 → 从 'a' 开始寻找全局未使用的字母，分配 '字母1' 作为新分支。
+        """
+        used_ids = set(self.nodes.keys())
+    
+        # 1. 主线发展：父节点无子节点
+        if not parent.children:
+            # 提取父 ID 的字母部分（忽略数字）
+            match = re.match(r'^([a-z]+)(\d+)$', parent.id)
+            if match:
+                prefix = match.group(1)
+                num = int(match.group(2)) + 1
+                candidate = f"{prefix}{num}"
+                while candidate in used_ids:
+                    num += 1
+                    candidate = f"{prefix}{num}"
+                return candidate
+            else:
+                # 若父 ID 格式非字母+数字（如 main），则以 a1 作为主线起始
                 candidate = "a1"
-                while candidate in self.nodes:
+                while candidate in used_ids:
                     num = int(re.search(r'\d+$', candidate).group()) + 1
                     candidate = f"a{num}"
                 return candidate
-            
-            # 已有子节点，从 b1 开始寻找未占用的全局唯一 ID
-            used = {nid for nid in self.nodes if re.match(r'^[a-z]\d+$', nid)}
-            branch = 'b'
-            while branch <= 'z':
-                candidate = f"{branch}1"
-                if candidate not in used and candidate not in self.nodes:
+    
+        # 2. 分支发展：父节点已有子节点 → 分配新字母
+        # 收集全局已使用的字母
+        used_letters = set()
+        for nid in used_ids:
+            match = re.match(r'^([a-z]+)\d+$', nid)
+            if match:
+                used_letters.add(match.group(1))
+    
+        # 从 'a' 开始寻找第一个未使用的字母
+        for letter in range(ord('a'), ord('z') + 1):
+            l = chr(letter)
+            if l not in used_letters:
+                candidate = f"{l}1"
+                if candidate not in used_ids:
                     return candidate
-                branch = chr(ord(branch) + 1)
-            return f"z_{datetime.datetime.now().strftime('%H%M%S')}"
-
-        # 非根节点：基于父节点 ID 生成唯一后缀
-        # 提取父 ID 的字母前缀和数字
-        match = re.match(r'^([a-z]+)(\d+)$', parent.id)
-        if not match:
-            prefix, num = parent.id, 0
-            base = parent.id + "_next"
-            count = 1
-            candidate = base
-            while candidate in self.nodes:
-                count += 1
-                candidate = f"{base}{count}"
-            return candidate
-
-        prefix, num_str = match.groups()
-        num = int(num_str)
-
-        # 如果尚无子节点，递增主线或分支
-        if not parent.children:
-            candidate_num = num + 1
-            while True:
-                candidate = f"{prefix}{candidate_num}"
-                if candidate not in self.nodes:
-                    return candidate
-                candidate_num += 1
-            # 不会到达
-
-        # 已有子节点，生成分支字母+1
-        used_branch_letters = set()
-        for child in parent.children:
-            tail = child.id[len(parent.id):]
-            if tail and tail[0].isalpha():
-                used_branch_letters.add(tail[0])
-            else:
-                if child.id[0].isalpha():
-                    used_branch_letters.add(child.id[0])
-
-        branch_letter = 'b'
-        while branch_letter in used_branch_letters:
-            branch_letter = chr(ord(branch_letter) + 1)
-            if branch_letter > 'z':
-                break
-        if branch_letter > 'z':
-            return f"{parent.id}_branch_{datetime.datetime.now().strftime('%H%M%S')}"
-
-        candidate = f"{parent.id}{branch_letter}1"
-        while candidate in self.nodes:
-            num_part = int(re.search(r'\d+$', candidate).group()) + 1
-            candidate = f"{parent.id}{branch_letter}{num_part}"
-        return candidate
+                # 如果字母+1已被占用（极端情况），则尝试字母+2...
+                num = 2
+                while f"{l}{num}" in used_ids:
+                    num += 1
+                return f"{l}{num}"
+    
+        # 字母表耗尽（极其罕见）的兜底
+        return f"z_{datetime.datetime.now().strftime('%H%M%S')}"
 
     def create_root(self, user_msg: str, assistant_msg: str, reasoning: str,
                     title: str, input_tokens: int, output_tokens: int) -> ConversationNode:
