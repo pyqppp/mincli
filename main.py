@@ -60,9 +60,14 @@ SAVE_BASE_DIR = os.path.expanduser(
 
 # ---------- 辅助函数 ----------
 def clear_screen() -> None:
-    """清空终端屏幕并重置滚动缓冲区。"""
-    sys.stdout.write("\033]1337;ClearScrollback\007")
-    sys.stdout.flush()
+    """清空终端屏幕。在 iTerm2 中同时重置滚动缓冲区。"""
+    # 检测是否在 iTerm2 中（环境变量 TERM_PROGRAM=iTerm.app）
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+        sys.stdout.write("\033]1337;ClearScrollback\007")
+        sys.stdout.flush()
+    else:
+        # 跨平台通用清屏
+        os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def estimate_tokens(messages: list) -> int:
