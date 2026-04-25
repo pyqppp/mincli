@@ -54,7 +54,7 @@ chmod +x setup.sh
 #### Windows
 双击运行 `setup.bat` 或在命令行中执行：
 ```cmd
-setup.bat
+.\setup.bat
 ```
 
 该脚本会自动创建虚拟环境并安装所有依赖（包括 pdfminer.six 和 python-docx，用于 PDF/DOCX 导入）。  
