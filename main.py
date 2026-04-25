@@ -793,13 +793,15 @@ class InteractiveSession:
                 "/clear", "/c",
                 "/set",
                 "/tree",
+                "/help", "/h",
                 "/cd", "/list", "/info", "/back", "/root", "/save_node",
                 "/save", "/save_group",
+                "/rm",
             ]
             cmd_lower = cmd_stripped.lower()
             is_valid = any(cmd_lower.startswith(vc) for vc in valid_commands)
             if not is_valid:
-                console.print(f"[yellow]未知命令: {cmd_stripped}。输入 /help 查看可用命令（暂不支持）。[/yellow]")
+                console.print(f"[yellow]未知命令: {cmd_stripped}。输入 /help 查看可用命令。[/yellow]")
                 return True
         
         cmd_lower = cmd.lower().strip()
@@ -810,6 +812,10 @@ class InteractiveSession:
 
         if cmd_lower in ["/clear", "/c"]:
             self._clear_history()
+            return True
+
+        if cmd_lower in ["/help", "/h"]:
+            self._show_help()
             return True
 
         if cmd.startswith("/set"):
@@ -914,6 +920,33 @@ class InteractiveSession:
         console.print(f"[cyan]模式: {'树状' if self.tree_mode else '线性'}[/cyan]")
         if self.tree_mode and self.tree and self.tree.current_node:
             console.print(f"[cyan]当前节点: {self.tree.current_node.id} ({self.tree.current_node.title})[/cyan]")
+
+    def _show_help(self) -> None:
+        """显示完整帮助信息"""
+        help_text = """
+        可用命令：
+        /exit, /quit, /q, /e  - 退出程序
+        /clear, /c            - 清除对话历史
+        /set system <提示词>   - 设置系统提示词
+        /set temp <值>        - 设置温度参数
+        /set model <flash|pro>- 切换模型（flash 或 pro）
+        /set thinking <on|off>- 开启/关闭思考模式
+        /set effort <high|max>- 设置推理强度
+        /set show             - 显示当前所有配置
+        /save <序号>          - 保存线性模式下的指定对话
+        /tree                 - 线性模式切换到树状模式
+        /help, /h             - 显示此帮助
+
+        树状模式命令（仅树状模式下有效）：
+        /cd <节点ID>          - 切换到指定节点
+        /list                 - 列出所有节点
+        /info [节点ID]        - 查看节点详情
+        /back                 - 返回父节点
+        /root                 - 跳转到根节点
+        /save_node [节点ID]   - 保存当前或指定节点
+        /rm <节点ID>          - 删除节点及其所有子节点（根节点不可删除）
+        """
+        console.print(help_text.strip())
 
     def _handle_tree_command(self, cmd: str) -> bool:
         parts = cmd.split()
