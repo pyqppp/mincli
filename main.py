@@ -731,10 +731,14 @@ class InteractiveSession:
     def _render_conversation(self, user_msg: str, assistant_msg: str, reasoning: str,
                              title: str, input_tokens: int, output_tokens: int) -> None:
         console.print(Panel(title, style="bold cyan"))
+        # 先显示用户问题
+        console.print(Markdown(f"**你:** {user_msg}"))
+        # 再显示思考过程（如果有）
         if reasoning:
-            console.print("[dim]DeepSeek 思考过程:[/dim]")
-            console.print(f"[dim]> {reasoning.replace(chr(10), chr(10)+'> ')}[/dim]\n")
-        console.print(Markdown(f"**你:** {user_msg}\n\n**DeepSeek:** {assistant_msg}"))
+            console.print("\n[dim]**DeepSeek 思考过程:**[/dim]")
+            console.print(f"[dim]{reasoning}[/dim]")
+        # 最后显示正式回答
+        console.print(Markdown(f"**DeepSeek:** {assistant_msg}"))
         console.print(
             f"[dim]📊 输入: {input_tokens} tokens | 输出: {output_tokens} tokens[/dim]"
         )
@@ -765,7 +769,7 @@ class InteractiveSession:
             f"## 用户问题\n\n{conv['user']}\n\n"
         )
         if conv.get('reasoning'):
-            content += f"## DeepSeek 思考过程\n\n {conv['reasoning'].replace(chr(10), chr(10)+'> ')}\n\n"
+            content += f"## DeepSeek 思考过程\n\n{conv['reasoning']}\n\n"
         content += f"## DeepSeek 回答\n\n{conv['assistant']}\n\n"
         token_stats = {
             'input_tokens': conv['input_tokens'],
@@ -786,7 +790,7 @@ class InteractiveSession:
             f"## 用户问题\n\n{node.user_msg}\n\n"
         )
         if node.reasoning:
-            content += f"## DeepSeek 思考过程\n\n {node.reasoning.replace(chr(10), chr(10)+'> ')}\n\n"
+            content += f"## DeepSeek 思考过程\n\n{node.reasoning}\n\n"
         content += f"## DeepSeek 回答\n\n{node.assistant_msg}\n\n"
         token_stats = {
             'input_tokens': node.input_tokens,
