@@ -1,9 +1,0 @@
-tiktoken
-typer
-python-dotenv>=1.0.0
-openai>=1.0.0
-rich
-prompt-toolkit
-pdfminer.six
-python-docx
-trafilatura

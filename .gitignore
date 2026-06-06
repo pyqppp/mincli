@@ -1,5 +1,6 @@
 .env
 venv/
+mincli.egg-info/
 .opencode/
 __pycache__/
 .DS_Store

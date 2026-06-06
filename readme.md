@@ -47,35 +47,22 @@ git clone <your-repo-url>
 cd mincli
 ```
 
-### 2. Install Dependencies
+### 2. Install
 
-#### macOS / Linux
+Create a virtual environment (recommended but optional):
 ```bash
-chmod +x setup.sh
-./setup.sh
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-Chinese version (with Chinese output):
+Install the mincli package (editable mode for development):
 ```bash
-chmod +x setup.zh.sh
-./setup.zh.sh
+pip install -e .
 ```
 
-#### Windows
-Double-click `setup.bat` or run in Command Prompt:
-```cmd
-.\setup.bat
-```
-
-Chinese version (with Chinese output):
-```cmd
-.\setup.zh.bat
-```
-
-The script creates a virtual environment and installs all dependencies (including pdfminer.six and python-docx for PDF/DOCX import).  
-Alternatively, install directly with pip:
+Or install normally:
 ```bash
-pip install -r requirements.txt
+pip install .
 ```
 
 ### 3. Configure API Keys
@@ -88,9 +75,10 @@ mincli loads configuration from three locations (priority: high → low):
 | 2 | `~/.mincli/.env` | User-level config file |
 | 3 (lowest) | `.env` (current directory) | Project-level config file |
 
-Create `~/.mincli/.env` with your DeepSeek API Key:
-```
-DEEPSEEK_API_KEY=your_api_key_here
+Copy the template and fill in your API key:
+```bash
+cp .env.example .env
+# Edit .env with DEEPSEEK_API_KEY
 ```
 
 Optionally set a custom save path and Bocha Search API key (required for the `web_search` tool):
@@ -101,9 +89,14 @@ BOCHA_API_KEY=your_bocha_api_key_here
 
 ### 4. Launch
 
-Activate the virtual environment and run:
+After installation, run directly:
 ```bash
-python main.py chat              # Start tree conversation mode
+mincli chat              # Start tree conversation mode
+```
+Or use Python module:
+```bash
+python -m mincli chat    # Same as above
+python main.py chat      # Legacy compatibility
 ```
 
 ---

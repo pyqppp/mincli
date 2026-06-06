@@ -1,11 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['main.py'],
+    ['mincli/cli.py'],
     pathex=[],
     binaries=[],
     datas=[],
     hiddenimports=[
+        'mincli',
+        'mincli.config',
+        'mincli.models',
+        'mincli.helpers',
+        'mincli.render',
+        'mincli.streaming',
+        'mincli.session',
+        'mincli.tools',
+        'mincli.tools.registry',
+        'mincli.tools.execute',
+        'mincli.tools.file_ops',
+        'mincli.tools.web_fetch',
+        'mincli.tools.thinking',
         'trafilatura',
         'trafilatura.xml',
         'trafilatura.settings',

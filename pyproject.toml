@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mincli"
+version = "0.1.0"
+description = "Mini CLI AI Assistant"
+requires-python = ">=3.10"
+dependencies = [
+    "tiktoken",
+    "typer",
+    "python-dotenv>=1.0.0",
+    "openai>=1.0.0",
+    "rich",
+    "prompt-toolkit",
+    "trafilatura",
+    "pdfminer.six",
+    "python-docx",
+]
+
+[project.scripts]
+mincli = "mincli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mincli*"]

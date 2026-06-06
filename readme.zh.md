@@ -47,35 +47,22 @@ git clone <你的仓库地址>
 cd mincli
 ```
 
-### 2. 安装依赖
+### 2. 安装
 
-#### macOS / Linux
+推荐创建虚拟环境后安装（可选，但建议）：
 ```bash
-chmod +x setup.sh
-./setup.sh
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-中文版（输出信息为中文）：
+安装 mincli 包（开发模式，修改源码即时生效）：
 ```bash
-chmod +x setup.zh.sh
-./setup.zh.sh
+pip install -e .
 ```
 
-#### Windows
-双击运行 `setup.bat` 或在命令行中执行：
-```cmd
-.\setup.bat
-```
-
-中文版（输出信息为中文）：
-```cmd
-.\setup.zh.bat
-```
-
-该脚本会自动创建虚拟环境并安装所有依赖（包括 pdfminer.six 和 python-docx，用于 PDF/DOCX 导入）。  
-也可以直接用 pip 安装：
+也可直接安装（不编辑源码时）：
 ```bash
-pip install -r requirements.txt
+pip install .
 ```
 
 ### 3. 配置 API 密钥
@@ -88,19 +75,26 @@ mincli 从多个位置加载配置（优先级从高到低）：
 | 2 | `~/.mincli/.env` | 用户级配置文件 |
 | 3（最低） | `.env`（当前目录） | 项目级配置文件 |
 
-在 `~/.mincli/.env` 中写入你的 DeepSeek API Key：
+复制模板文件并填入你的 API Key：
+```bash
+cp .env.example .env
+# 编辑 .env 填入 DEEPSEEK_API_KEY
 ```
-DEEPSEEK_API_KEY=your_api_key_here
-```
+
 也可以自定义会话保存路径（可选）：
 ```
 MINCLI_SAVE_PATH=~/Documents/MyChats
 ```
 
 ### 4. 启动
-激活虚拟环境后运行：
+安装后可直接运行：
 ```bash
-python main.py chat              # 启动树状对话
+mincli chat    # 启动树状对话
+```
+或使用 Python 模块方式：
+```bash
+python -m mincli chat    # 同上
+python main.py chat      # 兼容方式
 ```
 
 ---
