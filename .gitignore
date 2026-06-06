@@ -1,0 +1,8 @@
+.env
+venv/
+.opencode/
+__pycache__/
+.DS_Store
+dist/
+build/
+*.dmg
