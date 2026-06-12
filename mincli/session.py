@@ -21,6 +21,7 @@ from mincli.models import ConversationTree
 from mincli.helpers import (
     clear_screen, get_balance, format_balance,
     generate_conversation_title, save_conversation_to_file,
+    convert_formulas,
 )
 from mincli.render import console
 from mincli.streaming import stream_response
@@ -154,14 +155,15 @@ class InteractiveSession:
             console.print("[red]节点不存在[/red]")
             return
 
-        content = (
-            f"# 节点 {node.id}: {node.title}\n\n"
-            f"**时间：** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"## 用户问题\n\n{node.user_msg}\n\n"
-        )
+        user_msg = convert_formulas(node.user_msg)
+        assistant_msg = convert_formulas(node.assistant_msg)
+        reasoning = convert_formulas(node.reasoning)
+
+        content = f"# {node.title}\n\n"
+        content += f"---\n\n**你：**\n\n{user_msg}\n\n"
         if node.reasoning:
-            content += f"## DeepSeek 思考过程\n\n{node.reasoning}\n\n"
-        content += f"## DeepSeek 回答\n\n{node.assistant_msg}\n\n"
+            content += f"---\n\n**DeepSeek 思考过程：**\n\n{reasoning}\n\n"
+        content += f"---\n\n**DeepSeek：**\n\n{assistant_msg}\n\n"
         token_stats = {
             'input_tokens': node.input_tokens,
             'output_tokens': node.output_tokens,

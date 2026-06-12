@@ -102,6 +102,15 @@ def generate_conversation_title(client: OpenAI, user_msg: str, assistant_msg: st
         return f"对话_{datetime.datetime.now().strftime('%H%M%S')}"
 
 
+def convert_formulas(text: str) -> str:
+    text = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', text, flags=re.DOTALL)
+    text = re.sub(r'\\begin\{equation\}(.*?)\\end\{equation\}', r'$$\1$$', text, flags=re.DOTALL)
+    text = re.sub(r'\\begin\{align\*?\}(.*?)\\end\{align\*?\}', r'$$\1$$', text, flags=re.DOTALL)
+    text = re.sub(r'\\begin\{gather\*?\}(.*?)\\end\{gather\*?\}', r'$$\1$$', text, flags=re.DOTALL)
+    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text)
+    return text
+
+
 def save_conversation_to_file(
     content: str,
     title: str,
