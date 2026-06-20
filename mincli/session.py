@@ -11,6 +11,7 @@ from rich.table import Table
 from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 
 from mincli.config import (
     MODEL_V4_FLASH, MODEL_V4_PRO,
@@ -53,9 +54,17 @@ class InteractiveSession:
         self.tree = ConversationTree(default_system)
 
         self.history_file = os.path.expanduser("~/.mincli_history")
+        kb = KeyBindings()
+        @kb.add('enter')
+        def _accept(event):
+            event.current_buffer.validate_and_handle()
+        @kb.add('escape', 'enter')
+        def _newline(event):
+            event.current_buffer.insert_text('\n')
         self.session = PromptSession(
             history=FileHistory(self.history_file),
             multiline=True,
+            key_bindings=kb,
         )
 
         self.search_quota: int = 0
@@ -661,7 +670,7 @@ class InteractiveSession:
         )
         console.print("树状命令: /cd <ID>  /list  /info [ID]  /back  /root  /save [ID] /rm <ID>")
         console.print(f"💡 当前模型: [bold]{self.current_model}[/bold] | 思考: [bold]{'开' if self.thinking_enabled else '关'}[/bold] (effort: {self.reasoning_effort})")
-        console.print("[dim]💡 Enter 换行 | Option+Enter 发送 | 多行输入完成后按 Option+Enter 提交[/dim]")
+        console.print("[dim]💡 Enter 发送 | Alt+Enter 换行[/dim]")
         console.print("[dim]等待第一个问题...[/dim]\n")
 
     def _write_file(self, filepath: str, content: str) -> str:
