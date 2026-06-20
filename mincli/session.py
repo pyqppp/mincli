@@ -59,7 +59,13 @@ class InteractiveSession:
         def _accept(event):
             event.current_buffer.validate_and_handle()
         @kb.add('escape', 'enter')
-        def _newline(event):
+        def _newline_alt(event):
+            event.current_buffer.insert_text('\n')
+        @kb.add('c-j')
+        def _newline_ctrlj(event):
+            event.current_buffer.insert_text('\n')
+        @kb.add('escape', '[', '1', '3', ';', '2', 'u')
+        def _newline_shift(event):
             event.current_buffer.insert_text('\n')
         self.session = PromptSession(
             history=FileHistory(self.history_file),
@@ -670,7 +676,7 @@ class InteractiveSession:
         )
         console.print("树状命令: /cd <ID>  /list  /info [ID]  /back  /root  /save [ID] /rm <ID>")
         console.print(f"💡 当前模型: [bold]{self.current_model}[/bold] | 思考: [bold]{'开' if self.thinking_enabled else '关'}[/bold] (effort: {self.reasoning_effort})")
-        console.print("[dim]💡 Enter 发送 | Alt+Enter 换行[/dim]")
+        console.print("[dim]💡 Enter 发送 | Ctrl+J 换行 | 开启 iTerm2 Reports modifiers 后 Shift+Enter 也可换行[/dim]")
         console.print("[dim]等待第一个问题...[/dim]\n")
 
     def _write_file(self, filepath: str, content: str) -> str:
