@@ -138,7 +138,8 @@ class InteractiveSession:
     def _render_conversation(self, user_msg: str, assistant_msg: str, reasoning: str,
                              title: str, input_tokens: int, output_tokens: int) -> None:
         console.print(Panel(title, style="bold cyan"))
-        console.print(Markdown(f"**你:** {user_msg}"))
+        console.print(f"[bold]你:[/bold]")
+        console.print(user_msg)
         if reasoning:
             console.print(Markdown("\n**DeepSeek 思考过程:**"))
             console.print(f"[dim]{reasoning}[/dim]")
