@@ -28,9 +28,9 @@ def execute_command(command: str, timeout: int) -> str:
     except subprocess.TimeoutExpired as e:
         partial = ""
         if e.stdout:
-            partial += e.stdout
+            partial += e.stdout if isinstance(e.stdout, str) else e.stdout.decode("utf-8")
         if e.stderr:
-            partial += f"[stderr]\n{e.stderr}"
+            partial += f"[stderr]\n{e.stderr if isinstance(e.stderr, str) else e.stderr.decode('utf-8')}"
         partial = partial.strip()
         if partial:
             return f"{partial}\n[命令执行超时（{timeout}秒），以上为已产生的部分输出]"
