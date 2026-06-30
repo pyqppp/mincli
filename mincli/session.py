@@ -12,7 +12,14 @@ from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.shortcuts import yes_no_dialog
+from prompt_toolkit.application import Application
+from prompt_toolkit.layout import (
+    Layout, HSplit, VSplit, Float, FloatContainer,
+    Window, FormattedTextControl, Dimension,
+)
+from prompt_toolkit.widgets import Button, Label
+from prompt_toolkit.styles import Style
+from prompt_toolkit.formatted_text import HTML
 
 from mincli.config import (
     MODEL_V4_FLASH, MODEL_V4_PRO,
@@ -629,8 +636,7 @@ class InteractiveSession:
 
                         elif self.audit_level == 3:
                             if matches_dangerous(command):
-                                console.print(f"[yellow]⚠️ 检测到高危命令: {command}[/yellow]")
-                                if self._confirm("高危命令", "确认执行？"):
+                                if self._confirm("高危命令", f"命令: {command}\n\n⚠️ 匹配到高危命令模式，确认执行？"):
                                     tool_result = execute_command(command, timeout)
                                 else:
                                     tool_result = "用户未确认执行此命令"
@@ -641,16 +647,12 @@ class InteractiveSession:
                         elif self.audit_level == 2:
                             level, desc, risk, audit_reasoning = audit_command(self.client, command)
                             level_icons = {1: "🟢", 2: "🔵", 3: "🟡", 4: "🟠", 5: "🔴"}
-                            icon = level_icons.get(level, "⚪")
                             if level <= 2:
-                                console.print(f"[dim]{icon} {desc}（风险等级 {level}/5，自动执行）[/dim]")
+                                console.print(f"[dim]{level_icons[level]} {desc}（风险等级 {level}/5，自动执行）[/dim]")
                                 tool_result = execute_command(command, timeout)
                             else:
-                                console.print(f"[bold]{icon} 审核建议: 等级 {level}/5 | {desc}[/bold]")
-                                if risk:
-                                    console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
-                                console.print(f"[cyan]命令: {command}[/cyan]")
-                                if self._confirm("执行确认", "是否执行此命令？"):
+                                risk_text = f"\n⚠️ {risk}" if risk else ""
+                                if self._confirm("执行确认", f"命令: {command}\n\n审核: 等级 {level}/5 | {desc}{risk_text}"):
                                     tool_result = execute_command(command, timeout)
                                 else:
                                     tool_result = "用户未确认执行此命令"
@@ -659,13 +661,8 @@ class InteractiveSession:
                             level, desc, risk, audit_reasoning = audit_command(self.client, command)
                             if audit_reasoning:
                                 console.print(f"[dim]🧠 审核思考: {audit_reasoning}[/dim]")
-                            level_icons = {1: "🟢", 2: "🔵", 3: "🟡", 4: "🟠", 5: "🔴"}
-                            icon = level_icons.get(level, "⚪")
-                            console.print(f"[bold]{icon} 审核建议: 等级 {level}/5 | {desc}[/bold]")
-                            if risk:
-                                console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
-                            console.print(f"[cyan]命令: {command}[/cyan]")
-                            if self._confirm("执行确认", "是否执行此命令？"):
+                            risk_text = f"\n⚠️ {risk}" if risk else ""
+                            if self._confirm("执行确认", f"命令: {command}\n\n审核: 等级 {level}/5 | {desc}{risk_text}"):
                                 tool_result = execute_command(command, timeout)
                             else:
                                 tool_result = "用户未确认执行此命令"
@@ -780,10 +777,90 @@ class InteractiveSession:
         console.print(Panel(content, border_style="bright_cyan"))
 
     def _confirm(self, title: str = "确认执行", text: str = "是否执行？") -> bool:
+        result = [False]
+        app_ref = [None]
+
+        def done(val: bool):
+            result[0] = val
+            if app_ref[0]:
+                app_ref[0].exit()
+
+        TL, TR, H, V, BL, BR = '╭', '╮', '─', '│', '╰', '╯'
+        bs = 'class:dialog.border'
+        vs = Window(width=1, char=V, style=bs)
+
+        yes_btn = Button(" 是 ", handler=lambda: done(True), left_symbol="", right_symbol="")
+        no_btn = Button(" 否 ", handler=lambda: done(False), left_symbol="", right_symbol="")
+
+        def body_row(content, height=None):
+            return VSplit([vs, Window(width=1), content, Window(width=1), vs], height=height)
+
+        body = HSplit([
+            VSplit([
+                Window(width=1, height=1, char=TL, style=bs),
+                Window(char=H, style=bs),
+                Window(FormattedTextControl(HTML(f"<b> {title} </b>")),
+                       style='class:dialog.title', dont_extend_width=True),
+                Window(char=H, style=bs),
+                Window(width=1, height=1, char=TR, style=bs),
+            ], height=1),
+            body_row(Window(height=1)),
+            body_row(Label(text=text, style='class:dialog.text')),
+            body_row(Window(height=1)),
+            body_row(VSplit([
+                Window(),
+                yes_btn,
+                Window(width=3),
+                no_btn,
+                Window(),
+            ]), height=1),
+            body_row(Window(height=1)),
+            VSplit([
+                Window(width=1, height=1, char=BL, style=bs),
+                Window(char=H, style=bs),
+                Window(width=1, height=1, char=BR, style=bs),
+            ], height=1),
+        ])
+
+        root = FloatContainer(
+            content=Window(FormattedTextControl('')),
+            floats=[Float(content=body, allow_cover_cursor=True)],
+        )
+
+        dlg_kb = KeyBindings()
+        @dlg_kb.add('tab')
+        def _(event):
+            event.app.layout.focus_next()
+        @dlg_kb.add('s-tab')
+        def _(event):
+            event.app.layout.focus_previous()
+        @dlg_kb.add('right')
+        def _(event):
+            event.app.layout.focus_next()
+        @dlg_kb.add('left')
+        def _(event):
+            event.app.layout.focus_previous()
+
+        dlg_style = Style([
+            ("dialog.title", "bg:default fg:ansicyan bold"),
+            ("dialog.text", "bg:default fg:white"),
+            ("dialog.border", "bg:default fg:ansicyan"),
+            ("button", "bg:default fg:ansicyan"),
+            ("button.focused", "bg:ansicyan fg:white bold"),
+        ])
+
         try:
-            return yes_no_dialog(title=title, text=text).run() or False
+            app = Application(
+                layout=Layout(root),
+                key_bindings=dlg_kb,
+                style=dlg_style,
+                full_screen=True,
+            )
+            app_ref[0] = app
+            app.run()
         except Exception:
             return False
+        return result[0]
 
     def _write_file(self, filepath: str, content: str) -> str:
         filepath = os.path.expanduser(filepath)
@@ -797,9 +874,8 @@ class InteractiveSession:
             preview = "\n".join(preview_lines) + f"\n…（共 {line_count} 行）"
 
         details = f"路径: {filepath}\n操作: {mode}\n内容: {line_count} 行, {len(content)} 字符\n预览:\n{preview}"
-        console.print(f"[yellow]⚠️ 即将{'覆盖' if exists else '写入'}文件[/yellow]")
-        console.print(details)
-        if not self._confirm("文件操作", "确认执行？"):
+        title_text = f"即将{'覆盖' if exists else '写入'}文件"
+        if not self._confirm(title_text, details):
             return "用户已取消操作"
 
         try:
@@ -832,9 +908,7 @@ class InteractiveSession:
         for line in new_string.split("\n"):
             details += f"  + {line}\n"
 
-        console.print(f"[yellow]⚠️ 即将修改文件[/yellow]")
-        console.print(details)
-        if not self._confirm("文件修改", "确认执行？"):
+        if not self._confirm("即将修改文件", details):
             return "用户已取消操作"
 
         try:
