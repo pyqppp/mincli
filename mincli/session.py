@@ -298,7 +298,7 @@ class InteractiveSession:
     def _handle_set_command(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         if len(parts) < 2:
-            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set show[/yellow]")
+            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set audit <1-4>  /set show[/yellow]")
             return
 
         sub = parts[1]
@@ -364,8 +364,7 @@ class InteractiveSession:
             self._show_config()
         else:
             console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set audit <1-4>  /set show[/yellow]")
-
-    def _show_config(self) -> None:
+            return
         console.print(f"[cyan]系统提示词: {self.current_system}[/cyan]")
         console.print(f"[cyan]温度: {self.current_temperature}[/cyan]")
         console.print(f"[cyan]模型: {self.current_model}[/cyan]")
@@ -378,38 +377,74 @@ class InteractiveSession:
             console.print(f"[cyan]当前节点: {self.tree.current_node.id} ({self.tree.current_node.title})[/cyan]")
 
     def _show_help(self) -> None:
-        help_text = """
-        可用命令：
-        /exit, /quit, /q, /e  - 退出程序
-        /clear, /c            - 清除对话历史
-        /set system <提示词>   - 设置系统提示词
-        /set temp <值>        - 设置温度参数
-        /set model <flash|pro>- 切换模型（flash 或 pro）
-        /set thinking <on|off>- 开启/关闭思考模式
-        /set effort <high|max>- 设置推理强度
-        /set show             - 显示当前所有配置
-        /search <次数>        - 为 AI 授权 N 次互联网搜索（调用 web_search 消耗配额）
-        /show                 - 将当前节点的回答正文保存到临时文件，并使用系统默认编辑器打开
-        /help, /h             - 显示此帮助
-        /imp <文件路径>       - 导入文件内容（txt/md/py/bat/sh/csv/pdf/docx），下次提问自动附加
-        /fetch <URL>          - 抓取网页内容，下次提问自动附加
+        from rich.table import Table
+        from rich.panel import Panel
 
-        树状命令：
-        /cd <节点ID>          - 切换到指定节点
-        /list                 - 列出所有节点
-        /info [节点ID]        - 查看节点详情
-        /back                 - 返回父节点
-        /root                 - 跳转到根节点
-        /save [节点ID]        - 保存当前或指定节点
-        /rm <节点ID>          - 删除节点及其所有子节点（根节点不可删除）
-        """
-        console.print(help_text.strip())
+        basic = Table(show_header=False, box=None, padding=(0, 2))
+        basic.add_column("cmd", style="cyan")
+        basic.add_column("desc")
+        basic.add_row("/exit, /quit, /q, /e", "退出程序（自动保存会话）")
+        basic.add_row("/clear, /c", "清空当前会话")
+        basic.add_row("/help, /h", "显示此帮助")
+        basic.add_row("/imp <路径>", "导入文件（txt/md/py/csv/pdf/docx）")
+        basic.add_row("/fetch <URL>", "抓取网页内容")
+        basic.add_row("/search <次数>", "授权 AI 联网搜索（需 BOCHA_API_KEY）")
+        basic.add_row("/show", "用编辑器打开当前回答")
+
+        set_cmds = Table(show_header=False, box=None, padding=(0, 2))
+        set_cmds.add_column("cmd", style="cyan")
+        set_cmds.add_column("desc")
+        set_cmds.add_row("/set system <提示词>", "修改系统提示词")
+        set_cmds.add_row("/set temp <值>", "设置温度（0.0~2.0）")
+        set_cmds.add_row("/set model <flash|pro>", "切换模型")
+        set_cmds.add_row("/set thinking <on|off>", "开关思考模式")
+        set_cmds.add_row("/set effort <high|max>", "推理强度")
+        set_cmds.add_row("/set audit <1-4>", "审核层级（默认 1）")
+        set_cmds.add_row("/set show", "显示当前配置")
+
+        tree_cmds = Table(show_header=False, box=None, padding=(0, 2))
+        tree_cmds.add_column("cmd", style="cyan")
+        tree_cmds.add_column("desc")
+        tree_cmds.add_row("/cd <节点ID>", "切换到指定节点")
+        tree_cmds.add_row("/list", "列出所有节点")
+        tree_cmds.add_row("/info [节点ID]", "查看节点详情")
+        tree_cmds.add_row("/back", "返回父节点")
+        tree_cmds.add_row("/root", "跳回根节点")
+        tree_cmds.add_row("/save [节点ID]", "导出节点为 Markdown")
+        tree_cmds.add_row("/rm <节点ID>", "删除节点及其子节点")
+
+        keys = Table(show_header=False, box=None, padding=(0, 2))
+        keys.add_column("key", style="cyan")
+        keys.add_column("desc")
+        keys.add_row("Enter", "发送消息")
+        keys.add_row("Ctrl+J", "插入换行")
+        keys.add_row("Alt+Enter", "插入换行")
+        keys.add_row("Ctrl+C", "中断/退出")
+
+        content = Table.grid(padding=(0, 1))
+        content.add_column()
+        content.add_row("[bold]基本命令[/bold]")
+        content.add_row(basic)
+        content.add_row("")
+        content.add_row("[bold]配置命令[/bold]")
+        content.add_row(set_cmds)
+        content.add_row("")
+        content.add_row("[bold]树状命令[/bold]")
+        content.add_row(tree_cmds)
+        content.add_row("")
+        content.add_row("[bold]快捷键[/bold]")
+        content.add_row(keys)
+
+        console.print(Panel(content, title="📖 帮助", border_style="cyan"))
 
     def _handle_tree_command(self, cmd: str) -> bool:
         parts = cmd.split()
         cmd_lower = parts[0].lower()
 
-        if cmd_lower == "/cd" and len(parts) == 2:
+        if cmd_lower == "/cd":
+            if len(parts) != 2:
+                console.print("[yellow]用法: /cd <节点ID>[/yellow]")
+                return True
             node_id = parts[1]
             if self.tree.switch_to_node(node_id):
                 bt = self.tree.get_branch_total_tokens(self.tree.current_node.id)
@@ -716,16 +751,33 @@ class InteractiveSession:
         return "你: "
 
     def _show_welcome(self) -> None:
+        from rich.table import Table
+
         clear_screen()
-        console.print(Panel.fit("mincli 树状对话模式", style="bold green"))
-        console.print(
-            "命令: /set system <提示词>  /set temp <值>  /set model <flash|pro>  "
-            "/set thinking <on|off>  /set effort <high|max>  /set show  /clear  /exit /imp <路径>  /fetch <URL>  /show"
-        )
-        console.print("树状命令: /cd <ID>  /list  /info [ID]  /back  /root  /save [ID] /rm <ID>")
-        console.print(f"💡 当前模型: [bold]{self.current_model}[/bold] | 思考: [bold]{'开' if self.thinking_enabled else '关'}[/bold] (effort: {self.reasoning_effort})")
-        console.print("[dim]💡 Enter 发送 | Ctrl+J 换行 | 开启 iTerm2 Reports modifiers 后 Shift+Enter 也可换行[/dim]")
-        console.print("[dim]等待第一个问题...[/dim]\n")
+        cmd_table = Table.grid(padding=(0, 3))
+        cmd_table.add_column()
+        cmd_table.add_row("[bold]基本[/bold]  /imp  /fetch  /search  /clear  /exit")
+        cmd_table.add_row("[bold]配置[/bold]  /set system /temp /model /thinking /effort /audit")
+        cmd_table.add_row("[bold]树状[/bold]  /cd /list /info /back /root /save /rm")
+        cmd_table.add_row("")
+        cmd_table.add_row("[dim]输入 /help 查看完整命令说明[/dim]")
+
+        thinking_status = f"思考{'开' if self.thinking_enabled else '关'}"
+        audit_labels = {1: "最高", 2: "中等", 3: "最低", 4: "无"}
+        status_line = f"[bold]{self.current_model}[/bold] \u00b7 {thinking_status} \u00b7 审核{self.audit_level}({audit_labels[self.audit_level]})"
+
+        content = Table.grid(padding=(0, 1))
+        content.add_column()
+        content.add_row(f"[bold]mincli 树状对话模式[/bold]")
+        content.add_row("")
+        content.add_row(cmd_table)
+        content.add_row("")
+        content.add_row(f"\u2007{status_line}")
+        content.add_row("  Enter \u2192 发送  Ctrl+J \u2192 换行")
+        content.add_row("")
+        content.add_row("[dim]等待第一个问题...[/dim]")
+
+        console.print(Panel(content, border_style="bright_cyan"))
 
     def _confirm(self, title: str = "确认执行", text: str = "是否执行？") -> bool:
         try:

@@ -23,13 +23,6 @@ def clear_screen() -> None:
         os.system('cls' if os.name == 'nt' else 'clear')
 
 
-def clip_for_terminal(text: str, max_lines: int) -> str:
-    lines = text.split("\n")
-    if len(lines) <= max_lines:
-        return text
-    return "…（上略）\n" + "\n".join(lines[-(max_lines - 1):])
-
-
 def get_balance(client: OpenAI) -> Optional[List[Dict]]:
     try:
         api_key = os.getenv("DEEPSEEK_API_KEY")

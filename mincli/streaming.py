@@ -1,12 +1,10 @@
-import shutil
 from typing import Optional, List, Dict
 
 from openai import OpenAI
 from rich.live import Live
 from rich.markdown import Markdown
 
-from mincli.config import DISPLAY_BODY_MIN, DISPLAY_BODY_PADDING
-from mincli.helpers import estimate_tokens, clip_for_terminal
+from mincli.helpers import estimate_tokens
 from mincli.models import StreamResult
 from mincli.render import console
 
@@ -84,22 +82,16 @@ def stream_response(
                 for chunk in response:
                     _process_chunk(chunk)
 
-                    term_lines = shutil.get_terminal_size().lines
-                    max_body = max(DISPLAY_BODY_MIN, term_lines - DISPLAY_BODY_PADDING)
                     display = header
                     if reasoning_text:
-                        display += "[dim]**DeepSeek 思考过程:**\n "
-                        display += clip_for_terminal(reasoning_text, max_body // 2) + "[/dim]\n\n"
-                    display += f"**DeepSeek:** {clip_for_terminal(full_content, max_body // 2)}"
+                        display += "[dim]**DeepSeek 思考过程:**\n " + reasoning_text + "[/dim]\n\n"
+                    display += f"**DeepSeek:** {full_content}"
                     live.update(Markdown(display), refresh=True)
 
-                term_lines = shutil.get_terminal_size().lines
-                max_body = max(DISPLAY_BODY_MIN, term_lines - DISPLAY_BODY_PADDING)
                 final_display = header
                 if reasoning_text:
-                    final_display += "[dim]**DeepSeek 思考过程:**\n "
-                    final_display += clip_for_terminal(reasoning_text, max_body // 2) + "[/dim]\n\n"
-                final_display += f"**DeepSeek:** {clip_for_terminal(full_content, max_body // 2)}"
+                    final_display += "[dim]**DeepSeek 思考过程:**\n " + reasoning_text + "[/dim]\n\n"
+                final_display += f"**DeepSeek:** {full_content}"
                 live.update(Markdown(final_display), refresh=True)
 
         if accumulated_tool_calls:
