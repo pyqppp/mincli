@@ -12,6 +12,7 @@ from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import yes_no_dialog
 
 from mincli.config import (
     MODEL_V4_FLASH, MODEL_V4_PRO,
@@ -477,12 +478,7 @@ class InteractiveSession:
                 console.print("[red]不能删除根节点[/red]")
                 return True
             node_to_delete = self.tree.nodes[nid]
-            console.print(f"[yellow]确定要删除节点 {nid} 及其所有子节点吗？(y/N)[/yellow]")
-            try:
-                confirm = console.input("").strip().lower()
-            except (KeyboardInterrupt, EOFError):
-                confirm = "n"
-            if confirm != "y":
+            if not self._confirm("删除节点", f"确定要删除节点 {nid} 及其所有子节点吗？"):
                 console.print("[dim]取消删除[/dim]")
                 return True
             if self.tree.delete_node(nid):
@@ -518,6 +514,8 @@ class InteractiveSession:
         tool_messages: List[Dict] = []
 
         while True:
+            if tool_messages:
+                clear_screen()
             sr = stream_response(
                 self.client, messages, self.current_model,
                 self.current_temperature, user_input,
@@ -597,12 +595,7 @@ class InteractiveSession:
                         elif self.audit_level == 3:
                             if matches_dangerous(command):
                                 console.print(f"[yellow]⚠️ 检测到高危命令: {command}[/yellow]")
-                                console.print("[yellow]确认执行？(y/N)[/yellow]")
-                                try:
-                                    confirm = console.input("").strip().lower()
-                                except (KeyboardInterrupt, EOFError):
-                                    confirm = "n"
-                                if confirm == "y":
+                                if self._confirm("高危命令", "确认执行？"):
                                     tool_result = execute_command(command, timeout)
                                 else:
                                     tool_result = "用户未确认执行此命令"
@@ -622,11 +615,7 @@ class InteractiveSession:
                                 if risk:
                                     console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
                                 console.print(f"[cyan]命令: {command}[/cyan]")
-                                try:
-                                    confirm = console.input("是否执行？(y/n) ")
-                                except (KeyboardInterrupt, EOFError):
-                                    confirm = "n"
-                                if confirm.strip().lower() == "y":
+                                if self._confirm("执行确认", "是否执行此命令？"):
                                     tool_result = execute_command(command, timeout)
                                 else:
                                     tool_result = "用户未确认执行此命令"
@@ -641,11 +630,7 @@ class InteractiveSession:
                             if risk:
                                 console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
                             console.print(f"[cyan]命令: {command}[/cyan]")
-                            try:
-                                confirm = console.input("是否执行？(y/n) ")
-                            except (KeyboardInterrupt, EOFError):
-                                confirm = "n"
-                            if confirm.strip().lower() == "y":
+                            if self._confirm("执行确认", "是否执行此命令？"):
                                 tool_result = execute_command(command, timeout)
                             else:
                                 tool_result = "用户未确认执行此命令"
@@ -742,6 +727,12 @@ class InteractiveSession:
         console.print("[dim]💡 Enter 发送 | Ctrl+J 换行 | 开启 iTerm2 Reports modifiers 后 Shift+Enter 也可换行[/dim]")
         console.print("[dim]等待第一个问题...[/dim]\n")
 
+    def _confirm(self, title: str = "确认执行", text: str = "是否执行？") -> bool:
+        try:
+            return yes_no_dialog(title=title, text=text).run() or False
+        except Exception:
+            return False
+
     def _write_file(self, filepath: str, content: str) -> str:
         filepath = os.path.expanduser(filepath)
         exists = os.path.exists(filepath)
@@ -756,12 +747,7 @@ class InteractiveSession:
         details = f"路径: {filepath}\n操作: {mode}\n内容: {line_count} 行, {len(content)} 字符\n预览:\n{preview}"
         console.print(f"[yellow]⚠️ 即将{'覆盖' if exists else '写入'}文件[/yellow]")
         console.print(details)
-        console.print("[yellow]确认执行? (y/N)[/yellow]")
-        try:
-            confirm = console.input("").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            confirm = "n"
-        if confirm != "y":
+        if not self._confirm("文件操作", "确认执行？"):
             return "用户已取消操作"
 
         try:
@@ -796,12 +782,7 @@ class InteractiveSession:
 
         console.print(f"[yellow]⚠️ 即将修改文件[/yellow]")
         console.print(details)
-        console.print("[yellow]确认执行? (y/N)[/yellow]")
-        try:
-            confirm = console.input("").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            confirm = "n"
-        if confirm != "y":
+        if not self._confirm("文件修改", "确认执行？"):
             return "用户已取消操作"
 
         try:
