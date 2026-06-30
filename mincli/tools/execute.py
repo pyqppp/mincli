@@ -11,6 +11,29 @@ from mincli.streaming import stream_response
 from mincli.tools.thinking import AUDIT_SYSTEM_PROMPT
 
 
+DANGEROUS_PATTERNS = [
+    r'\brm\s+-rf\s+/\s*(?:$|\s)',
+    r'\brm\s+-rf\s+/\*',
+    r'\brm\s+-rf\s+~',
+    r'\bdd\s+if=',
+    r'>\s*/dev/sd[a-z]',
+    r'\bmkfs\.',
+    r':\(\)\s*\{.*\};',
+    r'\bchmod\s+-R\s+000\s+/',
+    r'\bwget\s+.*\|\s*(bash|sh)\b',
+    r'\bcurl\s+.*\|\s*(bash|sh)\b',
+    r'\bshutdown\b',
+    r'\breboot\b',
+    r'\bpoweroff\b',
+    r'\binit\s+0\b',
+    r'\b>\s*/dev/sda',
+]
+
+
+def matches_dangerous(command: str) -> bool:
+    return any(re.search(p, command) for p in DANGEROUS_PATTERNS)
+
+
 def execute_command(command: str, timeout: int) -> str:
     try:
         workdir = os.path.expanduser("~")

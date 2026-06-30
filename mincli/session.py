@@ -29,7 +29,7 @@ from mincli.streaming import stream_response
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage, web_search
 from mincli.tools.file_ops import parse_file, list_directory
-from mincli.tools.execute import execute_command, audit_command
+from mincli.tools.execute import execute_command, audit_command, matches_dangerous
 
 
 class InteractiveSession:
@@ -50,6 +50,7 @@ class InteractiveSession:
         self.current_model = default_model
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
+        self.audit_level: int = 1
 
         self.tree = ConversationTree(default_system)
 
@@ -88,6 +89,7 @@ class InteractiveSession:
                 "model": self.current_model,
                 "thinking_enabled": self.thinking_enabled,
                 "reasoning_effort": self.reasoning_effort,
+                "audit_level": self.audit_level,
                 "tree": self.tree.to_dict(),
                 "imported_content": self.imported_content,
                 "search_quota": self.search_quota,
@@ -116,6 +118,7 @@ class InteractiveSession:
         self.current_model = data.get("model", self.current_model)
         self.thinking_enabled = data.get("thinking_enabled", False)
         self.reasoning_effort = data.get("reasoning_effort", "high")
+        self.audit_level = data.get("audit_level", 1)
 
         tree_data = data.get("tree")
         if tree_data:
@@ -343,16 +346,32 @@ class InteractiveSession:
             else:
                 console.print("[yellow]用法: /set effort <high|max>[/yellow]")
 
+        elif sub == "audit" and len(parts) == 3:
+            try:
+                level = int(parts[2])
+                if level in (1, 2, 3, 4):
+                    self.audit_level = level
+                    labels = {1: "最高（AI审核 + 用户确认）", 2: "中等（AI审核，低风险自动执行）",
+                              3: "最低（文本匹配，高风险询问）", 4: "无（直接执行）"}
+                    console.print(f"[green]审核层级已设置为: {labels[level]}[/green]")
+                else:
+                    console.print("[yellow]审核层级须为 1-4[/yellow]")
+            except ValueError:
+                console.print("[yellow]审核层级须为数字 1-4[/yellow]")
+
         elif sub == "show":
             self._show_config()
         else:
-            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set show[/yellow]")
+            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set audit <1-4>  /set show[/yellow]")
 
     def _show_config(self) -> None:
         console.print(f"[cyan]系统提示词: {self.current_system}[/cyan]")
         console.print(f"[cyan]温度: {self.current_temperature}[/cyan]")
         console.print(f"[cyan]模型: {self.current_model}[/cyan]")
         console.print(f"[cyan]思考模式: {'开' if self.thinking_enabled else '关'} | 推理强度: {self.reasoning_effort}[/cyan]")
+        audit_labels = {1: "最高（AI审核 + 用户确认）", 2: "中等（AI审核，低风险自动执行）",
+                        3: "最低（文本匹配，高风险询问）", 4: "无（直接执行）"}
+        console.print(f"[cyan]审核层级: {self.audit_level} - {audit_labels[self.audit_level]}[/cyan]")
         console.print(f"[cyan]搜索配额: 剩余 {self.search_quota} 次[/cyan]")
         if self.tree and self.tree.current_node:
             console.print(f"[cyan]当前节点: {self.tree.current_node.id} ({self.tree.current_node.title})[/cyan]")
@@ -570,23 +589,66 @@ class InteractiveSession:
                     elif name == "execute_command":
                         command = args.get("command", "")
                         timeout = args.get("timeout", 30)
-                        level, desc, risk, audit_reasoning = audit_command(self.client, command)
-                        if audit_reasoning:
-                            console.print(f"[dim]🧠 审核思考: {audit_reasoning}[/dim]")
-                        level_icons = {1: "🟢", 2: "🔵", 3: "🟡", 4: "🟠", 5: "🔴"}
-                        icon = level_icons.get(level, "⚪")
-                        console.print(f"[bold]{icon} 审核建议: 等级 {level}/5 | {desc}[/bold]")
-                        if risk:
-                            console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
-                        console.print(f"[cyan]命令: {command}[/cyan]")
-                        try:
-                            confirm = console.input("是否执行？(y/n) ")
-                        except (KeyboardInterrupt, EOFError):
-                            confirm = "n"
-                        if confirm.strip().lower() == "y":
+
+                        if self.audit_level == 4:
+                            console.print(f"[dim]🔧 执行命令（无审核）: {command}[/dim]")
                             tool_result = execute_command(command, timeout)
+
+                        elif self.audit_level == 3:
+                            if matches_dangerous(command):
+                                console.print(f"[yellow]⚠️ 检测到高危命令: {command}[/yellow]")
+                                console.print("[yellow]确认执行？(y/N)[/yellow]")
+                                try:
+                                    confirm = console.input("").strip().lower()
+                                except (KeyboardInterrupt, EOFError):
+                                    confirm = "n"
+                                if confirm == "y":
+                                    tool_result = execute_command(command, timeout)
+                                else:
+                                    tool_result = "用户未确认执行此命令"
+                            else:
+                                console.print(f"[dim]🔧 执行命令（文本审核通过）: {command}[/dim]")
+                                tool_result = execute_command(command, timeout)
+
+                        elif self.audit_level == 2:
+                            level, desc, risk, audit_reasoning = audit_command(self.client, command)
+                            level_icons = {1: "🟢", 2: "🔵", 3: "🟡", 4: "🟠", 5: "🔴"}
+                            icon = level_icons.get(level, "⚪")
+                            if level <= 2:
+                                console.print(f"[dim]{icon} {desc}（风险等级 {level}/5，自动执行）[/dim]")
+                                tool_result = execute_command(command, timeout)
+                            else:
+                                console.print(f"[bold]{icon} 审核建议: 等级 {level}/5 | {desc}[/bold]")
+                                if risk:
+                                    console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
+                                console.print(f"[cyan]命令: {command}[/cyan]")
+                                try:
+                                    confirm = console.input("是否执行？(y/n) ")
+                                except (KeyboardInterrupt, EOFError):
+                                    confirm = "n"
+                                if confirm.strip().lower() == "y":
+                                    tool_result = execute_command(command, timeout)
+                                else:
+                                    tool_result = "用户未确认执行此命令"
+
                         else:
-                            tool_result = "用户未确认执行此命令"
+                            level, desc, risk, audit_reasoning = audit_command(self.client, command)
+                            if audit_reasoning:
+                                console.print(f"[dim]🧠 审核思考: {audit_reasoning}[/dim]")
+                            level_icons = {1: "🟢", 2: "🔵", 3: "🟡", 4: "🟠", 5: "🔴"}
+                            icon = level_icons.get(level, "⚪")
+                            console.print(f"[bold]{icon} 审核建议: 等级 {level}/5 | {desc}[/bold]")
+                            if risk:
+                                console.print(f"[yellow]⚠️ 风险提示: {risk}[/yellow]")
+                            console.print(f"[cyan]命令: {command}[/cyan]")
+                            try:
+                                confirm = console.input("是否执行？(y/n) ")
+                            except (KeyboardInterrupt, EOFError):
+                                confirm = "n"
+                            if confirm.strip().lower() == "y":
+                                tool_result = execute_command(command, timeout)
+                            else:
+                                tool_result = "用户未确认执行此命令"
                     else:
                         tool_result = f"未知工具: {name}"
 
