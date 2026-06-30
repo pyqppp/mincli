@@ -73,7 +73,7 @@ def estimate_tokens(messages: list) -> int:
 def generate_conversation_title(client: OpenAI, user_msg: str, assistant_msg: str) -> str:
     try:
         prompt = (
-            "请用不超过30字的汉字为以下内容写一个标题，只输出标题，不要有其他解释，"
+            "请用不超过30字的汉字为以下内容写一个标题，标题内容简略，只输出标题，不要有其他解释，"
             "不要包含标点符号和特殊字符。\n\n"
             f"用户：{user_msg}\n助手：{assistant_msg}"
         )

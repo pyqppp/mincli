@@ -84,6 +84,7 @@ class ConversationTree:
         self.nodes: Dict[str, ConversationNode] = {}
         self.root: Optional[ConversationNode] = None
         self.current_node: Optional[ConversationNode] = None
+        self.subtree_titles: Dict[str, str] = {}
 
     def _generate_child_id(self, parent: ConversationNode) -> str:
         used_ids = set(self.nodes.keys())
@@ -195,13 +196,73 @@ class ConversationTree:
         for child in node.children:
             self._collect_descendants(child, result)
 
-    def render_tree(self, highlight_id: Optional[str] = None) -> Any:
+    def _get_subtree_root_prefix(self, node_id: str) -> Optional[str]:
+        node = self.nodes.get(node_id)
+        if not node or not self.root or node.id == "main":
+            return None
+        while node.parent_id != "main":
+            parent = self.nodes.get(node.parent_id)
+            if not parent:
+                return None
+            node = parent
+        match = re.match(r'^([a-z]+)', node.id)
+        return match.group(1) if match else None
+
+    def count_subtree_nodes(self, prefix: str) -> int:
+        root_id = next((nid for nid in self.nodes
+                        if nid.startswith(prefix)
+                        and self.nodes[nid].parent_id == "main"), None)
+        if not root_id:
+            return 0
+        descendants = set()
+        self._collect_descendants(self.nodes[root_id], descendants)
+        return len(descendants)
+
+    def get_subtree_branches(self, prefix: str) -> List[str]:
+        root_id = next((nid for nid in self.nodes
+                        if nid.startswith(prefix)
+                        and self.nodes[nid].parent_id == "main"), None)
+        if not root_id:
+            return []
+        descendants = set()
+        self._collect_descendants(self.nodes[root_id], descendants)
+        branches = set()
+        for nid in descendants:
+            m = re.match(r'^([a-z]+)', nid)
+            if m and m.group(1) != prefix:
+                branches.add(m.group(1))
+        return sorted(branches)
+
+    def render_tree(self, highlight_id: Optional[str] = None,
+                    active_subtree: Optional[str] = None) -> Any:
         from rich.tree import Tree as RichTree
 
         if not self.root:
             return RichTree("[空树]")
-        root_tree = RichTree(f"📁 {self.root.id}: {self.root.title}")
-        self._add_node_to_rich_tree(root_tree, self.root, highlight_id)
+        root_tree = RichTree(f"{self.root.id}: {self.root.title}")
+
+        if active_subtree:
+            for child in self.root.children:
+                prefix = self._get_subtree_root_prefix(child.id)
+                if prefix == active_subtree:
+                    label = f"{child.id}: {child.title}"
+                    if child.id == highlight_id:
+                        label = f"[bold cyan]➤ {label}[/bold cyan]"
+                    child_tree = root_tree.add(label)
+                    self._add_node_to_rich_tree(child_tree, child, highlight_id)
+                elif prefix and prefix in self.subtree_titles:
+                    branches = self.get_subtree_branches(prefix)
+                    label = f"{prefix}：{self.subtree_titles[prefix]}"
+                    if branches:
+                        label += f"（{'，'.join(branches)}）"
+                    root_tree.add(label)
+                else:
+                    label = f"{child.id}: {child.title}"
+                    child_tree = root_tree.add(label)
+                    self._add_node_to_rich_tree(child_tree, child, highlight_id)
+        else:
+            self._add_node_to_rich_tree(root_tree, self.root, highlight_id)
+
         return root_tree
 
     def _add_node_to_rich_tree(self, rich_node, node: ConversationNode,
@@ -232,6 +293,7 @@ class ConversationTree:
             "nodes": nodes_data,
             "root_id": self.root.id if self.root else None,
             "current_node_id": self.current_node.id if self.current_node else None,
+            "subtree_titles": self.subtree_titles,
         }
 
     @classmethod
@@ -251,4 +313,5 @@ class ConversationTree:
         current_id = data.get("current_node_id")
         if current_id:
             tree.current_node = tree.nodes.get(current_id)
+        tree.subtree_titles = data.get("subtree_titles", {})
         return tree

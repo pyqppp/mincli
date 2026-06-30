@@ -176,8 +176,48 @@ class InteractiveSession:
                 f"{' | 💰 ' + balance_str if balance_str else ''}[/dim]"
             )
         console.print("[bold]对话树：[/bold]")
-        console.print(self.tree.render_tree(node.id))
+        active_prefix = self.tree._get_subtree_root_prefix(node.id)
+        console.print(self.tree.render_tree(node.id, active_subtree=active_prefix))
         console.print(f"[dim]当前节点: {node.id} ({node.title})[/dim]")
+
+    def _auto_title_subtree(self, node) -> None:
+        if not self.tree.root or node.id == "main":
+            return
+        prefix = self.tree._get_subtree_root_prefix(node.id)
+        if not prefix or prefix in self.tree.subtree_titles:
+            return
+        count = self.tree.count_subtree_nodes(prefix)
+        if count == 3:
+            root_id = next((nid for nid in self.tree.nodes
+                            if nid.startswith(prefix)
+                            and self.tree.nodes[nid].parent_id == "main"), None)
+            if not root_id:
+                return
+            descendants = set()
+            self.tree._collect_descendants(self.tree.nodes[root_id], descendants)
+            titles = []
+            for nid in sorted(descendants):
+                n = self.tree.nodes.get(nid)
+                if n and n.title:
+                    titles.append(f"{nid}: {n.title}")
+            prompt = (
+                "以下是一组对话中各部分的标题，请为这组对话取一个不超过10字的总标题，"
+                "只输出标题，不要有其他解释。\n\n" + "\n".join(titles)
+            )
+            try:
+                resp = self.client.chat.completions.create(
+                    model=MODEL_V4_FLASH,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.5,
+                    max_tokens=30,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                title = resp.choices[0].message.content.strip()
+                if title:
+                    self.tree.subtree_titles[prefix] = title
+                    console.print(f"[cyan]📌 已自动为对话树「{prefix}」命名: {title}[/cyan]")
+            except Exception:
+                pass
 
     def _save_tree_node(self, node_id: str) -> None:
         node = self.tree.nodes.get(node_id) if self.tree else None
@@ -713,6 +753,7 @@ class InteractiveSession:
         if tool_messages:
             node.tool_messages = tool_messages
         self.tree.current_node = node
+        self._auto_title_subtree(node)
         branch_total = self.tree.get_branch_total_tokens(node.id)
         self._display_tree_node(node, branch_total)
         console.print("\n[bold green]--- 请输入下一个问题或命令 ---[/bold green]\n")
