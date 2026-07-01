@@ -74,7 +74,7 @@ def stream_response(
             for chunk in response:
                 _process_chunk(chunk)
         else:
-            with Live(auto_refresh=False, console=console) as live:
+            with Live(auto_refresh=False, console=console, vertical_overflow="visible") as live:
                 header = f"**你:**\n{user_question}\n\n"
                 initial_display = header + "**DeepSeek:** "
                 live.update(Markdown(initial_display), refresh=True)
