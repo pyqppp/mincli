@@ -35,7 +35,15 @@ def parse_file(filepath: str) -> str:
         elif ext == '.doc':
             return "不支持 .doc 格式，请转换为 .docx 或 .txt"
         else:
-            return f"不支持的文件格式: {ext}"
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    chunk = f.read(4096)
+                if '\x00' in chunk:
+                    return f"不支持二进制格式: {ext}"
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except Exception:
+                return f"不支持的文件格式: {ext}"
 
         if not content.strip():
             return f"文件内容为空: {filename}"

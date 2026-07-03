@@ -5,7 +5,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取本地文件的内容，支持 txt、md、py、bat、sh、csv、pdf、docx 格式，返回文件内容",
+            "description": "读取本地文件的内容。支持 txt、md、py、csv、pdf、docx 等常见格式，也支持其他纯文本文件。二进制文件不可读取",
             "parameters": {
                 "type": "object",
                 "properties": {
