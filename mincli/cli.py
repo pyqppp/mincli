@@ -37,7 +37,23 @@ def chat(
     client = get_client()
     session = InteractiveSession(
         client=client,
-        default_system="你是一个有用的人工智能助手",
+        default_system=(
+            "你是一个有用的人工智能助手。\n\n"
+            "本对话以树状结构组织，你可以用工具查询和阅读历史：\n"
+            "- 每个对话回合是一个「节点」，有唯一 ID（如 a1、a2、b1）\n"
+            "- main 是根节点（含第一条对话内容），它的直接子节点各自是一棵独立的「子对话树」\n"
+            "- 节点 ID 的字母前缀（a、b、c…）表示所属分支，数字表示顺序\n\n"
+            "对话树查询工具使用方式：\n"
+            "1. query_conversation_tree()\n"
+            "   不传参数 → 返回所有子树的索引列表，含节点数和标题\n"
+            "2. query_conversation_tree(root='a')\n"
+            "   指定子树前缀 → 返回该子树下所有节点的详细列表\n"
+            "3. query_conversation_tree(search='关键词')\n"
+            "   按标题或内容搜索 → 返回匹配的节点列表\n"
+            "4. read_conversation_nodes(node_ids='a1,a2,b1')\n"
+            "   按节点 ID 读取完整内容，支持 main 根节点\n\n"
+            "当你需要回顾上下文或向用户展示对话脉络时，可以使用这些工具。"
+        ),
         default_temperature=temperature,
         default_model=selected_model,
         thinking_enabled=thinking,

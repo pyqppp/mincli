@@ -412,6 +412,8 @@ class InteractiveSession:
         else:
             console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set audit <1-4>  /set show[/yellow]")
             return
+
+    def _show_config(self) -> None:
         console.print(f"[cyan]系统提示词: {self.current_system}[/cyan]")
         console.print(f"[cyan]温度: {self.current_temperature}[/cyan]")
         console.print(f"[cyan]模型: {self.current_model}[/cyan]")
@@ -706,6 +708,10 @@ class InteractiveSession:
                                 tool_result = execute_command(command, timeout)
                             else:
                                 tool_result = "用户未确认执行此命令"
+                    elif name == "query_conversation_tree":
+                        tool_result = self._query_conversation_tree(args.get("root", ""))
+                    elif name == "read_conversation_nodes":
+                        tool_result = self._read_conversation_nodes(args.get("node_ids", ""))
                     else:
                         tool_result = f"未知工具: {name}"
 
@@ -958,3 +964,61 @@ class InteractiveSession:
             return f"已成功替换文件 {filepath}"
         except Exception as e:
             return f"写入失败: {e}"
+
+    def _query_conversation_tree(self, root: str = "", search: str = "") -> str:
+        if not self.tree or not self.tree.root:
+            return "（暂无对话记录）"
+
+        if search:
+            results = []
+            kw = search.lower()
+            for nid, node in self.tree.nodes.items():
+                if kw in (node.title or "").lower() or kw in (node.user_msg or "").lower():
+                    results.append(f"{nid}: {node.title}")
+            return "\n".join(results) if results else f"（未找到包含「{search}」的节点）"
+
+        if root:
+            nodes_in_tree = []
+            root_id = next((nid for nid in self.tree.nodes
+                            if nid.startswith(root)
+                            and self.tree.nodes[nid].parent_id == "main"), None)
+            if not root_id:
+                return f"（子对话树 {root} 不存在）"
+            descendants = set()
+            self.tree._collect_descendants(self.tree.nodes[root_id], descendants)
+            for nid in sorted(descendants):
+                node = self.tree.nodes[nid]
+                depth = 0
+                cur = node
+                while cur.parent_id and cur.parent_id != "main":
+                    depth += 1
+                    cur = self.tree.nodes.get(cur.parent_id)
+                nodes_in_tree.append(f"{'  ' * depth}{nid}: {node.title}")
+            return "\n".join(nodes_in_tree)
+
+        lines = [f"main: {self.tree.root.title}"]
+        for child in self.tree.root.children:
+            prefix = self.tree._get_subtree_root_prefix(child.id)
+            if prefix:
+                count = self.tree.count_subtree_nodes(prefix)
+                suffix = self.tree.subtree_titles.get(prefix, child.title)
+                lines.append(f"  {prefix}: {suffix}（{count}个节点）")
+        return "\n".join(lines)
+
+    def _read_conversation_nodes(self, node_ids: str) -> str:
+        parts = []
+        for nid in node_ids.split(","):
+            nid = nid.strip()
+            if not nid:
+                continue
+            node = self.tree.nodes.get(nid)
+            if not node:
+                parts.append(f"--- {nid} ---\n（节点不存在）")
+            else:
+                parts.append(
+                    f"--- {nid} ---\n"
+                    f"用户: {node.user_msg}\n"
+                    + (f"思考过程: {node.reasoning}\n" if node.reasoning else "")
+                    + f"回答: {node.assistant_msg}"
+                )
+        return "\n\n".join(parts) if parts else "（未指定节点）"
