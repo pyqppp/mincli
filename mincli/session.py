@@ -153,7 +153,7 @@ class InteractiveSession:
         console.print(user_msg)
         if reasoning:
             console.print(Markdown("\n**DeepSeek 思考过程:**"))
-            console.print(f"[dim]{reasoning}[/dim]")
+            console.print(reasoning)
         console.print(Markdown(f"**DeepSeek:** {assistant_msg}"))
         balance_infos = get_balance(self.client)
         balance_str = format_balance(balance_infos)
@@ -596,6 +596,7 @@ class InteractiveSession:
         accumulated_in_tok = 0
         accumulated_out_tok = 0
         tool_messages: List[Dict] = []
+        silent_after_tool = False
 
         while True:
             if tool_messages:
@@ -606,7 +607,9 @@ class InteractiveSession:
                 thinking_enabled=self.thinking_enabled,
                 reasoning_effort=self.reasoning_effort,
                 tools=TOOLS,
+                silent=silent_after_tool,
             )
+            silent_after_tool = False
 
             content, reasoning, in_tok, out_tok, tool_calls = (
                 sr.content, sr.reasoning, sr.input_tokens, sr.output_tokens, sr.tool_calls
@@ -633,7 +636,7 @@ class InteractiveSession:
                     except json.JSONDecodeError:
                         args = {}
 
-                    console.print(f"[dim]🔧 调用 {name}…[/dim]")
+                    console.print(f"[bright_black]▸ {name}[/bright_black]")
 
                     if name == "read_file":
                         tool_result = parse_file(args.get("filepath", ""))
@@ -673,7 +676,7 @@ class InteractiveSession:
                         timeout = args.get("timeout", 30)
 
                         if self.audit_level == 4:
-                            console.print(f"[dim]🔧 执行命令（无审核）: {command}[/dim]")
+                            console.print(f"[bright_black]▸ execute_command（无审核）[/bright_black]")
                             tool_result = execute_command(command, timeout)
 
                         elif self.audit_level == 3:
@@ -683,14 +686,13 @@ class InteractiveSession:
                                 else:
                                     tool_result = "用户未确认执行此命令"
                             else:
-                                console.print(f"[dim]🔧 执行命令（文本审核通过）: {command}[/dim]")
+                                console.print(f"[bright_black]▸ execute_command（文本审核通过）[/bright_black]")
                                 tool_result = execute_command(command, timeout)
 
                         elif self.audit_level == 2:
                             level, desc, risk, audit_reasoning = audit_command(self.client, command)
-                            level_icons = {1: "🟢", 2: "🔵", 3: "🟡", 4: "🟠", 5: "🔴"}
                             if level <= 2:
-                                console.print(f"[dim]{level_icons[level]} {desc}（风险等级 {level}/5，自动执行）[/dim]")
+                                console.print(f"[bright_black]▸ {desc}（等级{level}/5，自动执行）[/bright_black]")
                                 tool_result = execute_command(command, timeout)
                             else:
                                 risk_text = f"\n⚠️ {risk}" if risk else ""
@@ -715,6 +717,9 @@ class InteractiveSession:
                     else:
                         tool_result = f"未知工具: {name}"
 
+                    summary = (tool_result or "").strip()[:100].replace("\n", " ")
+                    console.print(f"[bright_black]  └─ {summary}[/bright_black]")
+
                     assistant_msg["tool_calls"].append({
                         "id": tc["id"],
                         "type": "function",
@@ -729,21 +734,24 @@ class InteractiveSession:
                         "content": tool_result if tool_result else "执行失败或无结果",
                     })
 
-                    args_str = json.dumps(args, ensure_ascii=False)
-                    accumulated_reasoning += f"\n\n[调用工具] {name}({args_str})"
+                    args_repr = json.dumps(args, ensure_ascii=False)
+                    accumulated_reasoning += f"\n[cyan]▸ {name}({args_repr})[/cyan]"
                     if tool_result:
                         summary = tool_result.strip()[:200].replace("\n", " ")
-                        accumulated_reasoning += f"\n[工具返回] {summary}{'…' if len(tool_result.strip()) > 200 else ''}"
+                        accumulated_reasoning += f"\n[cyan]  └─ {summary}{'…' if len(tool_result.strip()) > 200 else ''}[/cyan]"
 
                 messages.append(assistant_msg)
                 messages.extend(tool_results)
                 tool_messages.append(assistant_msg)
                 tool_messages.extend(tool_results)
+                silent_after_tool = True
                 continue
 
             if content is not None:
                 final_answer = content
                 final_reasoning = accumulated_reasoning
+                if silent_after_tool and content.strip():
+                    console.print(f"[bright_black]▸ {content.strip()}[/bright_black]")
                 break
 
             console.print("[red]回答生成失败，请重试[/red]")
