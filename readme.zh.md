@@ -101,8 +101,8 @@ mincli chat --help
 
 ### 对话中常用操作
 ```
-# 导入文件后提问
-/imp ~/document.pdf
+# 导入文件或网页后提问
+/import ~/document.pdf
 这个文档讲了什么？
 
 # AI 自主工具调用（直接提问即可）
@@ -146,16 +146,15 @@ mincli chat --help
 | `/set effort <high\|max>` | 推理强度 |
 | `/set show` | 显示当前配置 |
 | `/search <次数>` | 授权 AI 搜索网页（需 BOCHA_API_KEY） |
-| `/imp <路径>` | 导入文件（txt/md/py/csv/pdf/docx） |
-| `/fetch <URL>` | 抓取网页内容 |
-| `/cd <节点ID>` | 跳转到指定节点 |
-| `/list` | 列出所有节点 |
+| `/import <路径或URL>` | 导入文件（txt/md/py/csv/pdf/docx）或抓取网页 |
+| `/<节点ID>`（如 `/a3`） | 直接跳转到指定节点 |
+| `/tree` | 列出所有节点 |
 | `/info [节点ID]` | 查看节点详情 |
-| `/back` | 回到父节点 |
-| `/root` | 跳回根节点 |
+| `/up` | 回到父节点 |
+| `/home` | 跳回根节点 |
 | `/save [节点ID]` | 导出节点为 Markdown |
-| `/rm <节点ID>` | 删除节点及其子节点 |
-| `/show` | 用编辑器打开当前回答 |
+| `/delete <节点ID>` | 删除节点及其子节点 |
+| `/view` | 用编辑器打开当前回答 |
 
 ---
 
@@ -240,7 +239,7 @@ A：删除 `~/.mincli_session.json` 后重启。
 **Q：思考模式开启但看不到推理过程？**  
 A：请确认使用 `flash` 或 `pro` 模型并已开启 `--thinking`。
 
-**Q：`/imp` 导入 PDF/DOCX 报错？**  
+**Q：`/import` 导入 PDF/DOCX 报错？**  
 A：确保依赖已安装：`pip install pdfminer.six python-docx`。
 
 ---

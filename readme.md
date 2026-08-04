@@ -103,7 +103,7 @@ mincli chat --help
 
 ### In-conversation examples
 ```
-/imp ~/document.pdf
+/import ~/document.pdf
 What does this document say?
 
 # Or just ask — AI calls tools autonomously
@@ -147,16 +147,15 @@ CLI flags:
 | `/set effort <high\|max>` | Set reasoning effort |
 | `/set show` | Show current config |
 | `/search <N>` | Authorize N web searches (needs BOCHA_API_KEY) |
-| `/imp <path>` | Import file (txt/md/py/csv/pdf/docx) |
-| `/fetch <URL>` | Fetch web page |
-| `/cd <node-id>` | Jump to node |
-| `/list` | List all nodes |
+| `/import <path-or-URL>` | Import file (txt/md/py/csv/pdf/docx) or fetch web page |
+| `/<node-id>` (e.g. `/a3`) | Jump to node directly |
+| `/tree` | List all nodes |
 | `/info [node-id]` | Show node details |
-| `/back` | Go to parent node |
-| `/root` | Jump to root |
+| `/up` | Go to parent node |
+| `/home` | Jump to root |
 | `/save [node-id]` | Export node as Markdown |
-| `/rm <node-id>` | Delete node and children |
-| `/show` | Open reply in editor |
+| `/delete <node-id>` | Delete node and children |
+| `/view` | Open reply in editor |
 
 ---
 
@@ -241,7 +240,7 @@ A: Delete `~/.mincli_session.json` and restart.
 **Q: Thinking mode on but no reasoning shown?**  
 A: Make sure using `flash`/`pro` model with `--thinking` enabled.
 
-**Q: `/imp` fails to import PDF/DOCX?**  
+**Q: `/import` fails to import PDF/DOCX?**  
 A: Install deps: `pip install pdfminer.six python-docx`.
 
 ---

@@ -265,14 +265,37 @@ class ConversationTree:
 
         return root_tree
 
+    def _count_linear_chain(self, node: ConversationNode) -> int:
+        count = 0
+        while len(node.children) == 1:
+            count += 1
+            node = node.children[0]
+        return count
+
     def _add_node_to_rich_tree(self, rich_node, node: ConversationNode,
                                highlight_id: Optional[str]):
         for child in node.children:
-            label = f"{child.id}: {child.title}"
-            if child.id == highlight_id:
-                label = f"[bold cyan]➤ {label}[/bold cyan]"
-            child_tree = rich_node.add(label)
-            self._add_node_to_rich_tree(child_tree, child, highlight_id)
+            chain_len = self._count_linear_chain(child) + 1
+            if chain_len >= 5:
+                lines = []
+                last = child
+                for i in range(chain_len):
+                    if last.id == highlight_id:
+                        lines.append(f"[bold cyan]➤ {last.id}: {last.title}[/bold cyan]")
+                    else:
+                        lines.append(f"{last.id}: {last.title}")
+                    if i < chain_len - 1:
+                        last = last.children[0]
+                child_tree = rich_node.add("\n".join(lines))
+                self._add_node_to_rich_tree(child_tree, last, highlight_id)
+            else:
+                label = f"{child.id}: {child.title}"
+                if child.id == highlight_id:
+                    label = f"[bold cyan]➤ {label}[/bold cyan]"
+                child_tree = rich_node.add(label)
+                self._add_node_to_rich_tree(child_tree, child, highlight_id)
+
+
 
     def get_branch_total_tokens(self, node_id: str) -> Tuple[int, int]:
         total_in = 0

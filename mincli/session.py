@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import datetime
 import tempfile
@@ -253,7 +254,7 @@ class InteractiveSession:
             self._clear_history()
             return True
 
-        if cmd_lower in ["/show"]:
+        if cmd_lower in ["/view"]:
             self._show_current_node()
             return True
 
@@ -277,28 +278,27 @@ class InteractiveSession:
                 console.print("[yellow]用法: /search <正整数>[/yellow]")
             return True
 
-        if cmd_lower.startswith("/fetch"):
+        if cmd_lower.startswith("/import"):
             parts = cmd.split(maxsplit=1)
             if len(parts) < 2:
-                console.print("[yellow]用法: /fetch <URL>[/yellow]")
+                console.print("[yellow]用法: /import <文件路径或URL>[/yellow]")
             else:
-                console.print(f"[dim]正在抓取 {parts[1].strip()}…[/dim]")
-                result = fetch_webpage(parts[1].strip())
+                target = parts[1].strip()
+                if re.match(r'^https?://', target):
+                    console.print(f"[dim]正在抓取 {target}…[/dim]")
+                    result = fetch_webpage(target)
+                else:
+                    result = parse_file(target)
                 if result:
                     self.imported_content = result
-                    console.print("[green]✅ 网页内容已导入，将在下一次提问时自动附加。[/green]")
+                    console.print("[green]✅ 内容已导入，将在下一次提问时自动附加。[/green]")
             return True
 
-        if cmd_lower.startswith("/imp"):
-            parts = cmd.split(maxsplit=1)
-            if len(parts) < 2:
-                console.print("[yellow]用法: /imp <文件路径>[/yellow]")
-            else:
-                result = parse_file(parts[1].strip())
-                if result:
-                    self.imported_content = result
-                    console.print("[green]✅ 文件内容已导入，将在下一次提问时自动附加。[/green]")
-            return True
+        if self.tree:
+            m = re.match(r'^/([a-z]+\d+|main)$', cmd_stripped)
+            if m and m.group(1) in self.tree.nodes:
+                self._jump_to_node(m.group(1))
+                return True
 
         if cmd_stripped.startswith("/"):
             console.print(f"[yellow]未知命令: {cmd_stripped}。输入 /help 查看可用命令。[/yellow]")
@@ -435,10 +435,9 @@ class InteractiveSession:
         basic.add_row("/exit, /quit, /q, /e", "退出程序（自动保存会话）")
         basic.add_row("/clear, /c", "清空当前会话")
         basic.add_row("/help, /h", "显示此帮助")
-        basic.add_row("/imp <路径>", "导入文件（txt/md/py/csv/pdf/docx）")
-        basic.add_row("/fetch <URL>", "抓取网页内容")
+        basic.add_row("/import <路径或URL>", "导入文件或抓取网页")
         basic.add_row("/search <次数>", "授权 AI 联网搜索（需 BOCHA_API_KEY）")
-        basic.add_row("/show", "用编辑器打开当前回答")
+        basic.add_row("/view", "用编辑器打开当前回答")
 
         set_cmds = Table(show_header=False, box=None, padding=(0, 2))
         set_cmds.add_column("cmd", style="cyan")
@@ -454,13 +453,13 @@ class InteractiveSession:
         tree_cmds = Table(show_header=False, box=None, padding=(0, 2))
         tree_cmds.add_column("cmd", style="cyan")
         tree_cmds.add_column("desc")
-        tree_cmds.add_row("/cd <节点ID>", "切换到指定节点")
-        tree_cmds.add_row("/list", "列出所有节点")
+        tree_cmds.add_row("/<节点ID>（如 /a3）", "直接跳转到指定节点")
+        tree_cmds.add_row("/tree", "列出所有节点")
         tree_cmds.add_row("/info [节点ID]", "查看节点详情")
-        tree_cmds.add_row("/back", "返回父节点")
-        tree_cmds.add_row("/root", "跳回根节点")
+        tree_cmds.add_row("/up", "返回父节点")
+        tree_cmds.add_row("/home", "跳回根节点")
         tree_cmds.add_row("/save [节点ID]", "导出节点为 Markdown")
-        tree_cmds.add_row("/rm <节点ID>", "删除节点及其子节点")
+        tree_cmds.add_row("/delete <节点ID>", "删除节点及其子节点")
 
         keys = Table(show_header=False, box=None, padding=(0, 2))
         keys.add_column("key", style="cyan")
@@ -486,24 +485,19 @@ class InteractiveSession:
 
         console.print(Panel(content, title="📖 帮助", border_style="cyan"))
 
+    def _jump_to_node(self, node_id: str) -> None:
+        if self.tree.switch_to_node(node_id):
+            bt = self.tree.get_branch_total_tokens(self.tree.current_node.id)
+            self._display_tree_node(self.tree.current_node, bt)
+            console.print("\n[bold green]--- 已切换节点 ---[/bold green]\n")
+        else:
+            console.print("[red]未找到该节点ID[/red]")
+
     def _handle_tree_command(self, cmd: str) -> bool:
         parts = cmd.split()
         cmd_lower = parts[0].lower()
 
-        if cmd_lower == "/cd":
-            if len(parts) != 2:
-                console.print("[yellow]用法: /cd <节点ID>[/yellow]")
-                return True
-            node_id = parts[1]
-            if self.tree.switch_to_node(node_id):
-                bt = self.tree.get_branch_total_tokens(self.tree.current_node.id)
-                self._display_tree_node(self.tree.current_node, bt)
-                console.print("\n[bold green]--- 已切换节点 ---[/bold green]\n")
-            else:
-                console.print("[red]未找到该节点ID[/red]")
-            return True
-
-        if cmd_lower == "/list":
+        if cmd_lower == "/tree":
             table = Table(title="所有节点")
             table.add_column("ID", style="cyan")
             table.add_column("标题", style="green")
@@ -525,7 +519,7 @@ class InteractiveSession:
                 console.print("[red]节点不存在[/red]")
             return True
 
-        if cmd_lower == "/back":
+        if cmd_lower == "/up":
             if self.tree.current_node and self.tree.current_node.parent_id:
                 parent = self.tree.nodes.get(self.tree.current_node.parent_id)
                 if parent:
@@ -537,7 +531,7 @@ class InteractiveSession:
                 console.print("[yellow]已在根节点[/yellow]")
             return True
 
-        if cmd_lower == "/root":
+        if cmd_lower == "/home":
             if self.tree.root:
                 self.tree.current_node = self.tree.root
                 bt = self.tree.get_branch_total_tokens(self.tree.root.id)
@@ -550,10 +544,10 @@ class InteractiveSession:
             self._save_tree_node(nid)
             return True
 
-        if cmd_lower.startswith("/rm"):
+        if cmd_lower.startswith("/delete"):
             nid = parts[1] if len(parts) > 1 else None
             if nid is None:
-                console.print("[yellow]用法: /rm <节点ID>[/yellow]")
+                console.print("[yellow]用法: /delete <节点ID>[/yellow]")
                 return True
             if nid not in self.tree.nodes:
                 console.print(f"[red]未找到节点 {nid}[/red]")
@@ -596,7 +590,6 @@ class InteractiveSession:
         accumulated_in_tok = 0
         accumulated_out_tok = 0
         tool_messages: List[Dict] = []
-        silent_after_tool = False
 
         while True:
             if tool_messages:
@@ -607,15 +600,13 @@ class InteractiveSession:
                 thinking_enabled=self.thinking_enabled,
                 reasoning_effort=self.reasoning_effort,
                 tools=TOOLS,
-                silent=silent_after_tool,
             )
-            silent_after_tool = False
 
             content, reasoning, in_tok, out_tok, tool_calls = (
                 sr.content, sr.reasoning, sr.input_tokens, sr.output_tokens, sr.tool_calls
             )
             if reasoning:
-                accumulated_reasoning += ("\n" if accumulated_reasoning else "") + reasoning
+                accumulated_reasoning += ("\n[dim]" if accumulated_reasoning else "[dim]") + reasoning + "[/dim]"
             accumulated_in_tok += in_tok
             accumulated_out_tok += out_tok
 
@@ -744,14 +735,11 @@ class InteractiveSession:
                 messages.extend(tool_results)
                 tool_messages.append(assistant_msg)
                 tool_messages.extend(tool_results)
-                silent_after_tool = True
                 continue
 
             if content is not None:
                 final_answer = content
                 final_reasoning = accumulated_reasoning
-                if silent_after_tool and content.strip():
-                    console.print(f"[bright_black]▸ {content.strip()}[/bright_black]")
                 break
 
             console.print("[red]回答生成失败，请重试[/red]")
@@ -808,9 +796,9 @@ class InteractiveSession:
         clear_screen()
         cmd_table = Table.grid(padding=(0, 3))
         cmd_table.add_column()
-        cmd_table.add_row("[bold]基本[/bold]  /imp  /fetch  /search  /clear  /exit")
+        cmd_table.add_row("[bold]基本[/bold]  /import  /search  /clear  /exit")
         cmd_table.add_row("[bold]配置[/bold]  /set system /temp /model /thinking /effort /audit")
-        cmd_table.add_row("[bold]树状[/bold]  /cd /list /info /back /root /save /rm")
+        cmd_table.add_row("[bold]树状[/bold]  /<ID>跳转 /tree /info /up /home /save /delete")
         cmd_table.add_row("")
         cmd_table.add_row("[dim]输入 /help 查看完整命令说明[/dim]")
 
