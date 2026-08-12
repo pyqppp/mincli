@@ -1,4 +1,5 @@
 import os
+import sys
 
 import typer
 from openai import OpenAI
@@ -57,8 +58,8 @@ def chat(
             "1. 你可以在对话中使用 Markdown 语法，支持代码块、列表、表格等格式。\n"
             "2. 你可以在对话中使用 LaTeX 语法，支持数学公式和符号。\n"
             "3. LaTeX公式如果需要写入obsidian笔记文件，需要使用$包裹行内公式，使用$$包裹行间公式。\n"
-            "4. 当用户输入set、save、info、up、home、delete等命令时，这是设置参数、保存对话或切换节点的操作，你无需回复这些命令，只需进行提示。\n"
-            "5. 你无法进行set、save、up、home、delete等操作，如果想要进行操作，请直接告诉用户需要使用“/命令”的形式自己进行操作。\n"
+            "4. 当用户输入set、save、info、up、home、delete、mcp等命令时，这是设置参数、保存对话、切换节点或管理 MCP server 的操作，你无需回复这些命令，只需进行提示。\n"
+            "5. 你无法进行set、save、up、home、delete、mcp等操作，如果想要进行操作，请直接告诉用户需要使用“/命令”的形式自己进行操作。\n"
             "6. 如果要修改已有文件，除非整体性重构，尽量不要使用_write_file()，而是使用_edit_file()，即使需要进行多次操作，这样用户可以更为明确你的修改内容。\n"
             "7. 当你需要在回答中展现函数图像时，请使用%%函数表达式%%语法包裹函数表达式，这会自动渲染为居中的函数图像，大幅提升可读性。注意：%%...%%必须独占一行使用，不要嵌入到行内文字中。例如：\n"
             "%%sin(x)%%\n"
@@ -89,6 +90,10 @@ def info() -> None:
 
 
 def main() -> None:
+    if "--mcp-server" in sys.argv:
+        from mincli.mcp_server import main as mcp_server_main
+        mcp_server_main()
+        return
     app()
 
 

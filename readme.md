@@ -17,7 +17,7 @@ AI can autonomously invoke tools: read/write/edit files, fetch web pages, list d
 - 🚀 **Streaming Output** — Real-time Markdown rendering, word-by-word display
 - 🌲 **Tree Conversations** — Main line + branch nodes with globally unique IDs; jump freely between nodes
 - 🧠 **Thinking Mode** — Full V4 reasoning chain display, toggleable on the fly
-- 🔧 **Tool Calling** — AI autonomously invokes 7 tools: read/write/edit files, fetch web pages, list directories, search the web, execute commands
+- 🔧 **Tool Calling** — AI autonomously invokes 6 tools: read/write/edit files, fetch web pages, list directories, execute commands
 - 💾 **Auto-Save Session** — Saved on exit, restored on next launch
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
 - ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking, reasoning effort mid-conversation
@@ -110,7 +110,6 @@ What does this document say?
 Show me config.json
 Fetch https://example.com
 What files are here?
-Search for recent AI news
 ```
 
 ---
@@ -120,7 +119,6 @@ Search for recent AI news
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DEEPSEEK_API_KEY` | Yes | — | DeepSeek API key |
-| `BOCHA_API_KEY` | No | — | Bocha Search key (enables web_search) |
 | `MINCLI_SAVE_PATH` | No | `~/Documents/mincli_Conversations` | Export directory |
 
 CLI flags:
@@ -146,7 +144,10 @@ CLI flags:
 | `/set thinking <on\|off>` | Toggle thinking |
 | `/set effort <high\|max>` | Set reasoning effort |
 | `/set show` | Show current config |
-| `/search <N>` | Authorize N web searches (needs BOCHA_API_KEY) |
+| `/mcp list` | Show MCP server config & connection status |
+| `/mcp add <name> <command> [args...]` | Add a third-party MCP server (local command); a `http(s)://` second arg adds it as a remote server |
+| `/mcp remove <name>` | Remove a third-party MCP server |
+| `/mcp reload` | Reload MCP server config |
 | `/import <path-or-URL>` | Import file (txt/md/py/csv/pdf/docx) or fetch web page |
 | `/<node-id>` (e.g. `/a3`) | Jump to node directly |
 | `/tree` | List all nodes |
@@ -170,8 +171,53 @@ AI autonomously invokes these tools as needed:
 | `list_directory` | List directory contents | `directory`; `show_hidden` (opt) |
 | `write_file` | Write/overwrite file (user confirms) | `filepath`; `content` |
 | `edit_file` | Search & replace in file (user confirms) | `filepath`; `old_string`; `new_string` |
-| `web_search` | Web search (needs `/search` auth) | `query`; `freshness` (opt); `count` (opt) |
 | `execute_command` | Execute shell command (AI-audited + user confirms) | `command`; `timeout` |
+| `query_conversation_tree` | Query conversation tree (in-memory, no MCP) | `root`; `search` (opt) |
+| `read_conversation_nodes` | Read conversation nodes (in-memory, no MCP) | `node_ids` |
+
+---
+
+## MCP Integration
+
+mincli's tool execution is built on the standard [MCP protocol](https://modelcontextprotocol.io/):
+
+- **Bundled MCP server**: the 6 external tools (file ops, web fetch, command execution) are provided by a subprocess server that mincli launches and talks to over stdio. Safety/interaction policies (user confirmation, AI audit) stay client-side, so behavior is unchanged.
+- **Conversation tree tools** (`query_conversation_tree` / `read_conversation_nodes`) depend on in-memory session state and stay in-process.
+
+### Add third-party MCP servers
+
+Configure `~/.mincli/mcp_servers.json` (Claude Desktop-compatible; override path with `MINCLI_MCP_CONFIG`), or use `/mcp add` interactively in chat, `/mcp list` to check status, `/mcp reload` to apply changes:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    }
+  }
+}
+```
+
+Tools from third-party servers are merged into the AI tool list on startup; on name collision, mincli's own tools win.
+
+**Two kinds of third-party servers are supported:**
+- **Local command (stdio)**: `command` + `args` + optional `env`, like the filesystem example above
+- **Remote HTTP (streamable-http)**: just set `url`, e.g.:
+
+```json
+{
+  "mcpServers": {
+    "remote-tools": { "url": "https://example.com/mcp" }
+  }
+}
+```
+
+In chat you can also add a remote server directly with `/mcp add <name> <URL>`.
+
+### Packaging note
+
+When packaged with PyInstaller, mincli re-execs itself (`mincli --mcp-server`) to run the server — no separate Python environment needed.
 
 ---
 
@@ -186,7 +232,7 @@ AI autonomously invokes these tools as needed:
 ├── readme.md                # English docs
 ├── readme.zh.md             # Chinese docs
 │
-├── mincli/                  # Core package (14 modules)
+├── mincli/                  # Core package (16 modules)
 │   ├── __init__.py          # Version
 │   ├── __main__.py          # python -m mincli entry
 │   ├── cli.py               # Typer CLI commands
@@ -196,8 +242,10 @@ AI autonomously invokes these tools as needed:
 │   ├── render.py            # Rich theme + console
 │   ├── streaming.py         # Streaming API + live rendering
 │   ├── session.py           # InteractiveSession main loop
+│   ├── mcp_client.py        # MCP client (async bridge + bundled/third-party)
+│   ├── mcp_server.py        # Bundled MCP server (7 external tools)
 │   └── tools/
-│       ├── registry.py      # Tool definitions
+│       ├── registry.py      # Local tool defs (conversation tree tools)
 │       ├── execute.py       # Command execution + AI audit
 │       ├── file_ops.py      # File read/parse operations
 │       ├── web_fetch.py     # Web scraping + search

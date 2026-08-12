@@ -17,6 +17,7 @@ dependencies = [
     "trafilatura",
     "pdfminer.six",
     "python-docx",
+    "mcp>=2.0.0",
 ]
 
 [project.scripts]

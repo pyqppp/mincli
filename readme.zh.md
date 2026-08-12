@@ -7,7 +7,7 @@
 
 基于 DeepSeek V4 模型的树状对话 CLI AI 助手。  
 流式输出、Markdown 渲染、树状对话分支、完整推理链显示。  
-支持动态切换模型/提示词/温度/思考模式，AI 可自主调用文件读写、网页抓取、目录浏览、互联网搜索、Shell 执行等工具。
+支持动态切换模型/提示词/温度/思考模式，AI 可自主调用文件读写、网页抓取、目录浏览、Shell 执行等工具。
 
 ---
 
@@ -16,7 +16,7 @@
 - 🚀 **流式输出** — 实时 Markdown 渲染，回答逐字呈现
 - 🌲 **树状对话** — 主线＋分支节点，全局唯一 ID，任意节点间自由跳转
 - 🧠 **思考模式** — 支持 DeepSeek V4 推理链，可随时开关
-- 🔧 **工具调用** — AI 自主调用 7 种工具：读文件、写文件、编辑文件、抓网页、列目录、搜网络、执行命令
+- 🔧 **工具调用** — AI 自主调用 6 种工具：读文件、写文件、编辑文件、抓网页、列目录、执行命令
 - 💾 **会话自动保存** — 退出自动保存，下次启动恢复
 - 📄 **导出 Markdown** — `/save` 将节点对话导出为 `.md` 文件
 - ⚙️ **动态配置** — `/set` 命令随时修改系统提示词、温度、模型、思考开关、推理强度
@@ -109,7 +109,6 @@ mincli chat --help
 帮我看看 config.json 的内容
 查一下 https://example.com
 当前目录下有哪些文件？
-帮我搜索最近的 AI 新闻
 ```
 
 ---
@@ -119,7 +118,6 @@ mincli chat --help
 | 变量 | 必需 | 默认值 | 说明 |
 |------|------|--------|------|
 | `DEEPSEEK_API_KEY` | 是 | 无 | DeepSeek API 密钥 |
-| `BOCHA_API_KEY` | 否 | 无 | 博查搜索密钥（启用 web_search） |
 | `MINCLI_SAVE_PATH` | 否 | `~/Documents/mincli_Conversations` | 对话导出目录 |
 
 命令行参数：
@@ -145,7 +143,10 @@ mincli chat --help
 | `/set thinking <on\|off>` | 开关思考模式 |
 | `/set effort <high\|max>` | 推理强度 |
 | `/set show` | 显示当前配置 |
-| `/search <次数>` | 授权 AI 搜索网页（需 BOCHA_API_KEY） |
+| `/mcp list` | 显示 MCP server 配置与连接状态 |
+| `/mcp add <名称> <命令> [参数...]` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加 |
+| `/mcp remove <名称>` | 移除第三方 MCP server |
+| `/mcp reload` | 重新加载 MCP server 配置 |
 | `/import <路径或URL>` | 导入文件（txt/md/py/csv/pdf/docx）或抓取网页 |
 | `/<节点ID>`（如 `/a3`） | 直接跳转到指定节点 |
 | `/tree` | 列出所有节点 |
@@ -169,8 +170,53 @@ AI 在对话中视需要自主调用以下工具：
 | `list_directory` | 列出目录内容 | `directory`; `show_hidden`（可选） |
 | `write_file` | 写入/覆盖文件（需用户确认） | `filepath`; `content` |
 | `edit_file` | 搜索替换文件内容（需用户确认） | `filepath`; `old_string`; `new_string` |
-| `web_search` | 联网搜索（需 `/search` 授权） | `query`; `freshness`（可选）; `count`（可选） |
 | `execute_command` | 执行 Shell 命令（AI 审核 + 用户确认） | `command`; `timeout` |
+| `query_conversation_tree` | 查询对话树结构（内存内，不走 MCP） | `root`; `search`（可选） |
+| `read_conversation_nodes` | 读取对话节点内容（内存内，不走 MCP） | `node_ids` |
+
+---
+
+## MCP 接入
+
+mincli 的工具执行基于标准 [MCP 协议](https://modelcontextprotocol.io/)（Model Context Protocol）：
+
+- **自建 MCP server**：6 个外部工具（文件读写、网页抓取、命令执行）由 mincli 启动的子进程 server 提供，client 通过 stdio 调用。安全/交互策略（用户确认、AI 审核）仍留在客户端，行为与之前一致。
+- **对话树工具**（`query_conversation_tree` / `read_conversation_nodes`）依赖内存中的对话状态，保留在进程内直接分发。
+
+### 接入第三方 MCP server
+
+在 `~/.mincli/mcp_servers.json` 配置（Claude Desktop 兼容格式，可用 `MINCLI_MCP_CONFIG` 改路径），或在对话中用 `/mcp add` 交互式添加、`/mcp list` 查看状态、`/mcp reload` 生效：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    }
+  }
+}
+```
+
+启动后第三方 server 的工具会自动合并进 AI 工具列表；与已有工具重名时以 mincli 自带的为准。
+
+**支持两种类型的第三方 server：**
+- **本地命令（stdio）**：`command` + `args` + 可选 `env`，如上面的 filesystem 示例
+- **远程 HTTP（streamable-http）**：只写 `url` 即可，如：
+
+```json
+{
+  "mcpServers": {
+    "remote-tools": { "url": "https://example.com/mcp" }
+  }
+}
+```
+
+对话中也可直接 `/mcp add <名称> <URL>` 添加远程 server。
+
+### 打包说明
+
+PyInstaller 打包后，mincli 通过 re-exec 自举拉起 server（`mincli --mcp-server`），无需额外 Python 环境。
 
 ---
 
@@ -185,7 +231,7 @@ AI 在对话中视需要自主调用以下工具：
 ├── readme.md                # 英文文档
 ├── readme.zh.md             # 中文文档
 │
-├── mincli/                  # 核心包（14 个模块）
+├── mincli/                  # 核心包（16 个模块）
 │   ├── __init__.py          # 版本号
 │   ├── __main__.py          # python -m mincli 入口
 │   ├── cli.py               # Typer CLI 命令
@@ -195,8 +241,10 @@ AI 在对话中视需要自主调用以下工具：
 │   ├── render.py            # Rich 主题 + console
 │   ├── streaming.py         # 流式 API 交互 + 实时渲染
 │   ├── session.py           # InteractiveSession 主循环
+│   ├── mcp_client.py        # MCP 客户端（异步桥 + 自建/第三方 server）
+│   ├── mcp_server.py        # 自建 MCP server（7 个外部工具）
 │   └── tools/
-│       ├── registry.py      # 工具定义列表
+│       ├── registry.py      # 本地工具定义列表（对话树工具）
 │       ├── execute.py       # 命令执行 + AI 安全审计
 │       ├── file_ops.py      # 文件读写/解析
 │       ├── web_fetch.py     # 网页抓取 + 搜索

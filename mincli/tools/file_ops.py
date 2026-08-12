@@ -53,6 +53,40 @@ def parse_file(filepath: str) -> str:
         return f"文件解析失败: {e}"
 
 
+def write_file_content(filepath: str, content: str) -> str:
+    filepath = os.path.expanduser(filepath)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"已成功写入 {len(content)} 字符到 {filepath}"
+    except Exception as e:
+        return f"写入失败: {e}"
+
+
+def edit_file_content(filepath: str, old_string: str, new_string: str) -> str:
+    filepath = os.path.expanduser(filepath)
+    if not os.path.exists(filepath):
+        return f"文件不存在: {filepath}"
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return f"读取文件失败: {e}"
+
+    if old_string not in content:
+        return "未找到匹配的原文，请确保 old_string 与文件内容完全一致（包括空格和换行）"
+
+    new_content = content.replace(old_string, new_string, 1)
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return f"已成功替换文件 {filepath}"
+    except Exception as e:
+        return f"写入失败: {e}"
+
+
 def list_directory(directory: str, show_hidden: bool = False) -> str:
     directory = os.path.expanduser(directory)
     if not os.path.isdir(directory):

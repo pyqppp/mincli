@@ -70,12 +70,13 @@ def estimate_tokens(messages: list) -> int:
     return tokens
 
 
-def generate_conversation_title(client: OpenAI, user_msg: str, assistant_msg: str) -> str:
+def generate_conversation_title(client: OpenAI, user_msg: str) -> str:
     try:
         prompt = (
-            "请用不超过30字的汉字为以下内容写一个标题，标题内容简略，只输出标题，不要有其他解释，"
+            "请用不超过30字的汉字概括以下用户请求，写一个简略标题，"
+            "标题内容简略，只输出标题，不要有其他解释，"
             "不要包含标点符号和特殊字符。\n\n"
-            f"用户：{user_msg}\n助手：{assistant_msg}"
+            f"用户：{user_msg}"
         )
         resp = client.chat.completions.create(
             model=MODEL_V4_FLASH,
