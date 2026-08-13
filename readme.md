@@ -127,7 +127,7 @@ CLI flags:
 |------|---------|-------------|
 | `-m` / `--model` | `flash` | Model: `flash` \| `pro` |
 | `--thinking` | off | Enable thinking mode |
-| `--effort` | `high` | Reasoning effort: `high` \| `max` |
+| `--effort` | `high` | Reasoning effort: `low` \| `high` \| `max` |
 | `--temp` | `1.0` | Temperature |
 
 ---
@@ -142,7 +142,7 @@ CLI flags:
 | `/set temp <value>` | Change temperature |
 | `/set model <flash\|pro>` | Switch model |
 | `/set thinking <on\|off>` | Toggle thinking |
-| `/set effort <high\|max>` | Set reasoning effort |
+| `/set effort <low\|high\|max>` | Set reasoning effort |
 | `/set show` | Show current config |
 | `/mcp list` | Show MCP server config & connection status |
 | `/mcp add <name> <command> [args...]` | Add a third-party MCP server (local command); a `http(s)://` second arg adds it as a remote server |

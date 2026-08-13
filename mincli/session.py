@@ -354,7 +354,7 @@ class InteractiveSession:
     def _handle_set_command(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         if len(parts) < 2:
-            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set audit <1-4>  /set show[/yellow]")
+            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <low|high|max>  /set audit <1-4>  /set show[/yellow]")
             return
 
         sub = parts[1]
@@ -397,11 +397,11 @@ class InteractiveSession:
 
         elif sub == "effort" and len(parts) == 3:
             arg = parts[2].lower()
-            if arg in ["high", "max"]:
+            if arg in ["low", "high", "max"]:
                 self.reasoning_effort = arg
                 console.print(f"[green]推理强度已设置为: {arg}[/green]")
             else:
-                console.print("[yellow]用法: /set effort <high|max>[/yellow]")
+                console.print("[yellow]用法: /set effort <low|high|max>[/yellow]")
 
         elif sub == "audit" and len(parts) == 3:
             try:
@@ -419,7 +419,7 @@ class InteractiveSession:
         elif sub == "show":
             self._show_config()
         else:
-            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <high|max>  /set audit <1-4>  /set show[/yellow]")
+            console.print("[yellow]用法: /set system <提示词>  /set temp <值>  /set model <flash|pro>  /set thinking <on|off>  /set effort <low|high|max>  /set audit <1-4>  /set show[/yellow]")
             return
 
     def _show_config(self) -> None:
@@ -589,7 +589,7 @@ class InteractiveSession:
         set_cmds.add_row("/set temp <值>", "设置温度（0.0~2.0）")
         set_cmds.add_row("/set model <flash|pro>", "切换模型")
         set_cmds.add_row("/set thinking <on|off>", "开关思考模式")
-        set_cmds.add_row("/set effort <high|max>", "推理强度")
+        set_cmds.add_row("/set effort <low|high|max>", "推理强度")
         set_cmds.add_row("/set audit <1-4>", "审核层级（默认 1）")
         set_cmds.add_row("/set show", "显示当前配置")
 

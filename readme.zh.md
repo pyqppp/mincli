@@ -126,7 +126,7 @@ mincli chat --help
 |------|--------|------|
 | `-m` / `--model` | `flash` | 模型：`flash` \| `pro` |
 | `--thinking` | 关 | 开启思考模式 |
-| `--effort` | `high` | 推理强度：`high` \| `max` |
+| `--effort` | `high` | 推理强度：`low` \| `high` \| `max` |
 | `--temp` | `1.0` | 温度参数 |
 
 ---
@@ -141,7 +141,7 @@ mincli chat --help
 | `/set temp <数值>` | 修改温度 |
 | `/set model <flash\|pro>` | 切换模型 |
 | `/set thinking <on\|off>` | 开关思考模式 |
-| `/set effort <high\|max>` | 推理强度 |
+| `/set effort <low\|high\|max>` | 推理强度 |
 | `/set show` | 显示当前配置 |
 | `/mcp list` | 显示 MCP server 配置与连接状态 |
 | `/mcp add <名称> <命令> [参数...]` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加 |

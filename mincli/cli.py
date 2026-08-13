@@ -25,9 +25,12 @@ def chat(
     model: str = typer.Option("flash", "--model", "-m", help="模型: flash 或 pro"),
     temperature: float = typer.Option(1.0, "--temp", "-temp-opt", help="温度参数"),
     thinking: bool = typer.Option(False, "--thinking", "-r", help="开启思考模式（默认 high）"),
-    effort: str = typer.Option("high", "--effort", help="推理强度: high 或 max"),
+    effort: str = typer.Option("high", "--effort", help="推理强度: low, high 或 max"),
 ) -> None:
     """启动树状对话模式。"""
+    if effort not in ("low", "high", "max"):
+        console.print(f"[red]无效推理强度: {effort}，可选 low / high / max[/red]")
+        raise SystemExit(2)
     selected_model = MODEL_V4_PRO if model.lower() == "pro" else MODEL_V4_FLASH
 
     if thinking:
