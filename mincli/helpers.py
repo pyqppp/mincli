@@ -12,7 +12,6 @@ from mincli.config import (
     MODEL_V4_FLASH, TITLE_MAX_TOKENS, TITLE_MAX_LENGTH,
     SAVE_BASE_DIR, TEMPERATURE_MIN, TEMPERATURE_MAX,
 )
-from mincli.render import console
 
 
 def clear_screen() -> None:
@@ -92,7 +91,7 @@ def generate_conversation_title(client: OpenAI, user_msg: str) -> str:
             title = title[:TITLE_MAX_LENGTH]
         return title if title else f"对话_{datetime.datetime.now().strftime('%H%M%S')}"
     except Exception as e:
-        console.print(f"[red]⚠️ 生成标题失败: {e}[/red]")
+        print(f"⚠️ 生成标题失败: {e}")
         return f"对话_{datetime.datetime.now().strftime('%H%M%S')}"
 
 

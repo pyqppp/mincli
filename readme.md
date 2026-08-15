@@ -5,30 +5,32 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A tree-structured CLI AI assistant powered by DeepSeek V4 models.  
-Streaming output, Markdown rendering, branching conversations, full reasoning chain display.  
-Dynamically switch models, system prompts, temperature, and thinking mode.  
-AI can autonomously invoke tools: read/write/edit files, fetch web pages, list directories, search the web, and execute shell commands.
+A tree-structured chat AI assistant powered by DeepSeek V4 models, built on a **Textual TUI**.  
+Streaming Markdown output, branching conversations, full reasoning chain display.  
+Switch models / system prompts / temperature / thinking mode on the fly; the AI can autonomously invoke tools — file read/write/edit, web fetching, directory listing, and shell execution.
 
 ---
 
 ## Features
 
-- 🚀 **Streaming Output** — Real-time Markdown rendering, word-by-word display
-- 🌲 **Tree Conversations** — Main line + branch nodes with globally unique IDs; jump freely between nodes
-- 🧠 **Thinking Mode** — Full V4 reasoning chain display, toggleable on the fly
-- 🔧 **Tool Calling** — AI autonomously invokes 6 tools: read/write/edit files, fetch web pages, list directories, execute commands
-- 💾 **Auto-Save Session** — Saved on exit, restored on next launch
+- 🖥️ **Textual TUI** — sidebar conversation tree + streaming Markdown chat log + multi-line input box
+- 🚀 **Streaming Output** — real-time Markdown rendering; tables wrap to terminal width
+- 🌲 **Tree Conversations** — main line + branch nodes with globally unique IDs; click nodes to switch, jump with `/<id>`
+- 🧠 **Thinking Mode** — full V4 reasoning chain display, toggleable on the fly
+- 🔧 **Tool Calling** — AI autonomously invokes tools: read/write/edit files, fetch web pages, list directories, execute commands (user-confirmed)
+- ⌨️ **Command Completion** — type `/` to list commands; letters filter candidates; `Tab` cycles / completes; a completed command shows its usage help
+- 🛡️ **Confirm Dialogs** — destructive actions (`/delete`, `/mcp remove`) ask for confirmation; `←`/`→` switches buttons and the default is *Cancel*
+- 💾 **Auto-Save Session** — saved on exit, restored on next launch
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
-- ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking, reasoning effort mid-conversation
+- ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking mode, reasoning effort mid-conversation
 - 🧩 **Dual Model** — `deepseek-v4-flash` (fast) and `deepseek-v4-pro` (flagship)
 
 ---
 
 ## Recommended Terminal
 
-**macOS**: [iTerm2](https://iterm2.com/) recommended — clear screen also resets scrollback buffer.  
-Other terminals (Windows Terminal, Linux) work fully, just without scrollback reset on clear.
+**macOS**: [iTerm2](https://iterm2.com/) recommended — reliable keyboard protocol handling (Chinese IME and lock keys work correctly).  
+Other terminals (Windows Terminal, Linux) work too; IME behavior depends on the terminal.
 
 ---
 
@@ -73,8 +75,11 @@ Config load order (high → low):
 
 ### 4. Launch
 ```bash
-# Recommended
+# Recommended: Textual TUI
 mincli chat
+
+# Plain text fallback (no TUI, no extra dependencies)
+mincli chat --no-tui
 
 # Python module
 python -m mincli chat
@@ -88,7 +93,7 @@ python main.py chat
 ## Quick Start
 
 ```bash
-# Basic conversation
+# Basic conversation (TUI)
 mincli chat
 
 # Enable thinking mode
@@ -100,6 +105,16 @@ mincli chat --model pro --thinking --effort max
 # View all options
 mincli chat --help
 ```
+
+### TUI keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Send message |
+| `Ctrl+J` / `Alt+Enter` | Newline |
+| `Tab` | Complete / cycle command completion candidates |
+| `↑` / `↓` | Scroll the answer area (when the input is empty); double-press and hold for 2× speed |
+| `Ctrl+C` | Quit (copy wins when text is selected) |
 
 ### In-conversation examples
 ```
@@ -129,6 +144,7 @@ CLI flags:
 | `--thinking` | off | Enable thinking mode |
 | `--effort` | `high` | Reasoning effort: `low` \| `high` \| `max` |
 | `--temp` | `1.0` | Temperature |
+| `--no-tui` | off | Plain-text chat loop (no Textual TUI) |
 
 ---
 
@@ -146,7 +162,7 @@ CLI flags:
 | `/set show` | Show current config |
 | `/mcp list` | Show MCP server config & connection status |
 | `/mcp add <name> <command> [args...]` | Add a third-party MCP server (local command); a `http(s)://` second arg adds it as a remote server |
-| `/mcp remove <name>` | Remove a third-party MCP server |
+| `/mcp remove <name>` | Remove a third-party MCP server (confirmed) |
 | `/mcp reload` | Reload MCP server config |
 | `/import <path-or-URL>` | Import file (txt/md/py/csv/pdf/docx) or fetch web page |
 | `/<node-id>` (e.g. `/a3`) | Jump to node directly |
@@ -154,9 +170,13 @@ CLI flags:
 | `/info [node-id]` | Show node details |
 | `/up` | Go to parent node |
 | `/home` | Jump to root |
+| `/full` | Full-view mode: hide the answer area, tree takes full width (input stays; toggle again or switch a node to exit) |
+| `/reasoning` | Expand/collapse the current message's reasoning (auto-collapsed once the answer starts streaming; click the folded block too) |
 | `/save [node-id]` | Export node as Markdown |
-| `/delete <node-id>` | Delete node and children |
+| `/delete <node-id>` | Delete node and children (confirmed) |
 | `/view` | Open reply in editor |
+
+Type `/` in the input box to see the command list; keep typing to filter, `Tab` to complete, and a fully-typed command shows its usage help above the input.
 
 ---
 
@@ -215,10 +235,6 @@ Tools from third-party servers are merged into the AI tool list on startup; on n
 
 In chat you can also add a remote server directly with `/mcp add <name> <URL>`.
 
-### Packaging note
-
-When packaged with PyInstaller, mincli re-execs itself (`mincli --mcp-server`) to run the server — no separate Python environment needed.
-
 ---
 
 ## Project Structure
@@ -227,23 +243,26 @@ When packaged with PyInstaller, mincli re-execs itself (`mincli --mcp-server`) t
 .
 ├── main.py                  # Entry point (python main.py compat)
 ├── pyproject.toml           # Package metadata + dependencies
-├── mincli.spec              # PyInstaller build config
 ├── .env.example             # Config template
 ├── readme.md                # English docs
 ├── readme.zh.md             # Chinese docs
 │
-├── mincli/                  # Core package (16 modules)
+├── mincli/                  # Core package
 │   ├── __init__.py          # Version
 │   ├── __main__.py          # python -m mincli entry
-│   ├── cli.py               # Typer CLI commands
+│   ├── cli.py               # Typer CLI: chat (TUI / --no-tui), info
 │   ├── config.py            # Constants + config loading
-│   ├── models.py            # ConversationNode/Tree, StreamResult
-│   ├── helpers.py           # Utilities (balance, tokens, title gen)
-│   ├── render.py            # Rich theme + console
-│   ├── streaming.py         # Streaming API + live rendering
-│   ├── session.py           # InteractiveSession main loop
+│   ├── controller.py        # ChatController (logic + event stream)
+│   ├── models.py            # ConversationNode/Tree
+│   ├── helpers.py           # Utilities (tokens, title gen, formulas)
+│   ├── streaming.py         # Streaming API interaction
 │   ├── mcp_client.py        # MCP client (async bridge + bundled/third-party)
-│   ├── mcp_server.py        # Bundled MCP server (7 external tools)
+│   ├── mcp_server.py        # Bundled MCP server
+│   ├── tui/                 # Textual TUI
+│   │   ├── app.py           # ChatApp (layout, commands, events)
+│   │   ├── chat.tcss        # TUI styles
+│   │   ├── confirm.py       # Confirm dialog (←/→ switch, default cancel)
+│   │   └── widgets.py       # ChatInput (multi-line + completion)
 │   └── tools/
 │       ├── registry.py      # Local tool defs (conversation tree tools)
 │       ├── execute.py       # Command execution + AI audit
@@ -251,32 +270,8 @@ When packaged with PyInstaller, mincli re-execs itself (`mincli --mcp-server`) t
 │       ├── web_fetch.py     # Web scraping + search
 │       └── thinking.py      # Audit system prompt
 │
-└── venv/                    # Virtual env (untracked)
+└── tests/                   # Headless tests (test_controller / test_tui)
 ```
-
----
-
-## Building from Source (macOS)
-
-Build a standalone executable + `.dmg`:
-
-```bash
-# 1. Build executable
-pip install pyinstaller
-pyinstaller mincli.spec
-# dist/mincli
-
-# 2. Create DMG (needs Homebrew)
-brew install create-dmg
-create-dmg \
-  --volname "mincli" \
-  --window-pos 200 120 --window-size 600 400 \
-  --icon-size 100 --icon "mincli" 175 200 \
-  --hide-extension "mincli" --app-drop-link 425 200 \
-  "mincli.dmg" "dist/"
-```
-
-Users mount the `.dmg` and drag `mincli` into `/usr/local/bin`.
 
 ---
 
@@ -290,6 +285,9 @@ A: Make sure using `flash`/`pro` model with `--thinking` enabled.
 
 **Q: `/import` fails to import PDF/DOCX?**  
 A: Install deps: `pip install pdfminer.six python-docx`.
+
+**Q: TUI won't start (e.g. output is piped or terminal isn't supported)?**  
+A: Run `mincli chat --no-tui` for the plain-text fallback.
 
 ---
 

@@ -12,12 +12,11 @@ dependencies = [
     "typer",
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
-    "rich",
-    "prompt-toolkit",
     "trafilatura",
     "pdfminer.six",
     "python-docx",
     "mcp>=2.0.0",
+    "textual>=4.0",
 ]
 
 [project.scripts]

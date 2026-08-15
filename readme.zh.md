@@ -5,18 +5,21 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-基于 DeepSeek V4 模型的树状对话 CLI AI 助手。  
-流式输出、Markdown 渲染、树状对话分支、完整推理链显示。  
+基于 DeepSeek V4 模型、构建在 **Textual TUI** 之上的树状对话 AI 助手。  
+流式 Markdown 输出、树状对话分支、完整推理链显示。  
 支持动态切换模型/提示词/温度/思考模式，AI 可自主调用文件读写、网页抓取、目录浏览、Shell 执行等工具。
 
 ---
 
 ## 特性
 
-- 🚀 **流式输出** — 实时 Markdown 渲染，回答逐字呈现
-- 🌲 **树状对话** — 主线＋分支节点，全局唯一 ID，任意节点间自由跳转
+- 🖥️ **Textual TUI** — 左侧会话树 + 流式 Markdown 消息区 + 多行输入框
+- 🚀 **流式输出** — 实时 Markdown 渲染，表格按终端宽度自动换行
+- 🌲 **树状对话** — 主线＋分支节点，全局唯一 ID；点击节点切换，`/<id>` 直接跳转
 - 🧠 **思考模式** — 支持 DeepSeek V4 推理链，可随时开关
-- 🔧 **工具调用** — AI 自主调用 6 种工具：读文件、写文件、编辑文件、抓网页、列目录、执行命令
+- 🔧 **工具调用** — AI 自主调用工具：读/写/编辑文件、抓网页、列目录、执行命令（写/执行需用户确认）
+- ⌨️ **命令补全** — 输入 `/` 弹出命令列表；字母过滤候选；`Tab` 循环/补全；命令补全后自动显示用法帮助
+- 🛡️ **确认弹窗** — 破坏性操作（`/delete`、`/mcp remove`）需确认；`←`/`→` 切换按钮，默认选中"取消"
 - 💾 **会话自动保存** — 退出自动保存，下次启动恢复
 - 📄 **导出 Markdown** — `/save` 将节点对话导出为 `.md` 文件
 - ⚙️ **动态配置** — `/set` 命令随时修改系统提示词、温度、模型、思考开关、推理强度
@@ -26,8 +29,8 @@
 
 ## 推荐终端
 
-**macOS** 建议使用 [iTerm2](https://iterm2.com/)，清屏时自动重置滚动缓冲区。  
-其他终端（Windows Terminal、Linux 终端）功能完全正常，仅清屏时无滚动缓冲区重置。
+**macOS** 建议使用 [iTerm2](https://iterm2.com/)，键盘协议处理可靠（中文输入法、锁定键均正常）。  
+其他终端（Windows Terminal、Linux 终端）也可用，输入法表现取决于终端。
 
 ---
 
@@ -71,13 +74,16 @@ cp .env.example .env
 
 ### 4. 启动
 ```bash
-# 方式一：直接运行（推荐）
+# 推荐：Textual TUI
 mincli chat
 
-# 方式二：Python 模块
+# 纯文本回退（无 TUI、无额外依赖）
+mincli chat --no-tui
+
+# Python 模块方式
 python -m mincli chat
 
-# 方式三：传统方式（兼容）
+# 传统方式（兼容）
 python main.py chat
 ```
 
@@ -86,7 +92,7 @@ python main.py chat
 ## 快速开始
 
 ```bash
-# 基本对话
+# 基本对话（TUI）
 mincli chat
 
 # 开启思考模式
@@ -98,6 +104,16 @@ mincli chat --model pro --thinking --effort max
 # 查看所有选项
 mincli chat --help
 ```
+
+### TUI 快捷键
+
+| 按键 | 作用 |
+|------|------|
+| `Enter` | 发送消息 |
+| `Ctrl+J` / `Alt+Enter` | 换行 |
+| `Tab` | 命令补全 / 循环切换补全候选 |
+| `↑` / `↓` | 滚动回答区（输入框为空时）；双击按住为 2 倍速 |
+| `Ctrl+C` | 退出（选中文字时优先复制） |
 
 ### 对话中常用操作
 ```
@@ -128,6 +144,7 @@ mincli chat --help
 | `--thinking` | 关 | 开启思考模式 |
 | `--effort` | `high` | 推理强度：`low` \| `high` \| `max` |
 | `--temp` | `1.0` | 温度参数 |
+| `--no-tui` | 关 | 使用极简纯文本对话（不使用 Textual TUI） |
 
 ---
 
@@ -145,7 +162,7 @@ mincli chat --help
 | `/set show` | 显示当前配置 |
 | `/mcp list` | 显示 MCP server 配置与连接状态 |
 | `/mcp add <名称> <命令> [参数...]` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加 |
-| `/mcp remove <名称>` | 移除第三方 MCP server |
+| `/mcp remove <名称>` | 移除第三方 MCP server（需确认） |
 | `/mcp reload` | 重新加载 MCP server 配置 |
 | `/import <路径或URL>` | 导入文件（txt/md/py/csv/pdf/docx）或抓取网页 |
 | `/<节点ID>`（如 `/a3`） | 直接跳转到指定节点 |
@@ -153,9 +170,13 @@ mincli chat --help
 | `/info [节点ID]` | 查看节点详情 |
 | `/up` | 回到父节点 |
 | `/home` | 跳回根节点 |
+| `/full` | 全览模式：隐藏回答区，节点树全宽（输入框保留；再按一次或切换节点退出） |
+| `/reasoning` | 展开/折叠当前消息的思考过程（正文开始后自动折叠，也可点击折叠块展开） |
 | `/save [节点ID]` | 导出节点为 Markdown |
-| `/delete <节点ID>` | 删除节点及其子节点 |
+| `/delete <节点ID>` | 删除节点及其子节点（需确认） |
 | `/view` | 用编辑器打开当前回答 |
+
+在输入框输入 `/` 即可看到命令列表：继续输入字母过滤候选，`Tab` 补全；命令完整输入后输入框上方会自动显示用法帮助。
 
 ---
 
@@ -214,10 +235,6 @@ mincli 的工具执行基于标准 [MCP 协议](https://modelcontextprotocol.io/
 
 对话中也可直接 `/mcp add <名称> <URL>` 添加远程 server。
 
-### 打包说明
-
-PyInstaller 打包后，mincli 通过 re-exec 自举拉起 server（`mincli --mcp-server`），无需额外 Python 环境。
-
 ---
 
 ## 项目结构
@@ -226,23 +243,26 @@ PyInstaller 打包后，mincli 通过 re-exec 自举拉起 server（`mincli --mc
 .
 ├── main.py                  # 入口（兼容 python main.py）
 ├── pyproject.toml           # 项目元数据 + 依赖声明
-├── mincli.spec              # PyInstaller 构建配置
 ├── .env.example             # 配置模板
 ├── readme.md                # 英文文档
 ├── readme.zh.md             # 中文文档
 │
-├── mincli/                  # 核心包（16 个模块）
+├── mincli/                  # 核心包
 │   ├── __init__.py          # 版本号
 │   ├── __main__.py          # python -m mincli 入口
-│   ├── cli.py               # Typer CLI 命令
+│   ├── cli.py               # Typer CLI：chat（TUI / --no-tui）、info
 │   ├── config.py            # 常量 + 配置加载
-│   ├── models.py            # ConversationNode/Tree、StreamResult
-│   ├── helpers.py           # 工具函数（余额/标题/token估算）
-│   ├── render.py            # Rich 主题 + console
-│   ├── streaming.py         # 流式 API 交互 + 实时渲染
-│   ├── session.py           # InteractiveSession 主循环
+│   ├── controller.py        # ChatController（核心逻辑 + 事件流）
+│   ├── models.py            # ConversationNode/Tree
+│   ├── helpers.py           # 工具函数（token/标题/公式转换）
+│   ├── streaming.py         # 流式 API 交互
 │   ├── mcp_client.py        # MCP 客户端（异步桥 + 自建/第三方 server）
-│   ├── mcp_server.py        # 自建 MCP server（7 个外部工具）
+│   ├── mcp_server.py        # 自建 MCP server
+│   ├── tui/                 # Textual TUI
+│   │   ├── app.py           # ChatApp（布局、命令、事件处理）
+│   │   ├── chat.tcss        # TUI 样式
+│   │   ├── confirm.py       # 确认弹窗（←/→ 切换，默认取消）
+│   │   └── widgets.py       # ChatInput（多行输入 + 命令补全）
 │   └── tools/
 │       ├── registry.py      # 本地工具定义列表（对话树工具）
 │       ├── execute.py       # 命令执行 + AI 安全审计
@@ -250,32 +270,8 @@ PyInstaller 打包后，mincli 通过 re-exec 自举拉起 server（`mincli --mc
 │       ├── web_fetch.py     # 网页抓取 + 搜索
 │       └── thinking.py      # 审计系统提示词
 │
-└── venv/                    # 虚拟环境（未追踪）
+└── tests/                   # Headless 测试（test_controller / test_tui）
 ```
-
----
-
-## 从源码构建（macOS）
-
-构建独立可执行文件并打包 `.dmg`：
-
-```bash
-# 1. 构建可执行文件
-pip install pyinstaller
-pyinstaller mincli.spec
-# dist/mincli
-
-# 2. 制作 DMG（需 Homebrew）
-brew install create-dmg
-create-dmg \
-  --volname "mincli" \
-  --window-pos 200 120 --window-size 600 400 \
-  --icon-size 100 --icon "mincli" 175 200 \
-  --hide-extension "mincli" --app-drop-link 425 200 \
-  "mincli.dmg" "dist/"
-```
-
-用户挂载 `.dmg` 后将 `mincli` 拖入 `/usr/local/bin` 即可全局使用。
 
 ---
 
@@ -289,6 +285,9 @@ A：请确认使用 `flash` 或 `pro` 模型并已开启 `--thinking`。
 
 **Q：`/import` 导入 PDF/DOCX 报错？**  
 A：确保依赖已安装：`pip install pdfminer.six python-docx`。
+
+**Q：TUI 无法启动（如输出被重定向、终端不支持）？**  
+A：使用 `mincli chat --no-tui` 走纯文本回退模式。
 
 ---
 

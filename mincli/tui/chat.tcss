@@ -1,0 +1,187 @@
+/* mincli ChatApp 样式（阶段 1b 骨架） */
+
+Screen {
+    layout: vertical;
+}
+
+Horizontal {
+    height: 1fr;
+    width: 1fr;
+}
+
+#sidebar {
+    width: 34;
+    min-width: 24;
+    max-width: 60%;
+    height: 1fr;
+    border-right: solid $primary 30%;
+    background: $surface;
+}
+
+#sidebar-title {
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+    color: $text-muted;
+}
+
+/* 侧栏头部：标题 + 「全览/分栏」切换按钮 */
+#sidebar-header {
+    height: 3;
+    width: 1fr;
+    align: center middle;
+    border-bottom: solid $primary 30%;
+    background: $surface;
+}
+
+#sidebar-header #sidebar-title {
+    width: 1fr;
+}
+
+#fullview-btn {
+    width: auto;
+    min-width: 8;
+    height: 3;
+    margin: 0 1;
+}
+
+/* 全览模式：隐藏右侧回答区，节点树全宽显示（输入框保留） */
+#chat-log.overview-hidden {
+    display: none;
+}
+
+#sidebar.overview {
+    width: 1fr;
+    max-width: 100%;
+}
+
+#tree {
+    height: 1fr;
+}
+
+#chat-log {
+    height: 1fr;
+    width: 1fr;
+    padding: 0 2;
+    border: none;
+    background: $background;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+}
+
+/* 思考过程：灰色块引用（位于提问与回答之间，正文开始后折叠成一行） */
+#chat-log MarkdownBlockQuote {
+    color: $text-muted;
+}
+
+/* 代码块 / 工具调用块：橙色系（暖橙文字 + 橙色调底 + 橙色圆角边框） */
+#chat-log MarkdownFence {
+    color: #f2c694;
+    background: $warning 15%;
+    border: round $warning 40%;
+    padding: 0 1;
+}
+
+/* 表格：列按终端宽度等分并自动换行（默认 grid-columns: auto 按内容撑宽，
+   超宽表格会被横向截断，只能靠拉宽终端显示） */
+#chat-log MarkdownTableContent {
+    grid-columns: 1fr;
+}
+#chat-log MarkdownTableContent > .cell,
+#chat-log MarkdownTableContent > .header {
+    text-overflow: fold; /* 默认 ellipsis 会禁用换行（单行截断） */
+}
+
+/* 列表：防止 MarkdownList（expand=True + 行高 1fr）被拉伸成整屏高度，造成项目之间的大间隔 */
+#chat-log MarkdownList,
+#chat-log MarkdownBulletList,
+#chat-log MarkdownOrderedList {
+    height: auto;
+}
+#chat-log MarkdownOrderedList > Horizontal,
+#chat-log MarkdownBulletList > Horizontal {
+    height: auto;
+}
+
+ChatInput {
+    height: 3;
+    max-height: 8;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    border: tall $border-blurred;
+    background: $surface;
+
+    &:focus {
+        border: tall $accent;
+    }
+}
+
+/* 命令补全/提示弹窗（输入框上方，仅输入 "/" 开头命令时显示） */
+#cmd-popup {
+    display: none;
+    height: auto;
+    max-height: 45%;
+    margin: 0 1;
+    padding: 0 1;
+    border: round $accent 60%;
+    background: $surface;
+    overflow-y: auto;
+    scrollbar-size-vertical: 0;
+}
+
+#cmd-popup.visible {
+    display: block;
+}
+
+#cmd-popup-body {
+    height: auto;
+    color: $text;
+}
+
+Footer {
+    height: 1;
+}
+
+/* 确认对话框 */
+ConfirmScreen {
+    align: center middle;
+    background: $background 70%;
+}
+
+/* 关键：Vertical 默认 height:1fr，不显式覆盖会被拉伸到整个屏幕高度 */
+#confirm-box {
+    width: 60;
+    max-width: 80%;
+    height: auto;
+    padding: 1 2;
+    border: thick $accent;
+    background: $surface;
+    layout: vertical;
+}
+
+#confirm-title {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+#confirm-text {
+    max-height: 3;
+    overflow-y: auto;
+    margin-bottom: 1;
+    color: $text;
+}
+
+#confirm-buttons {
+    height: 3;
+    align: center middle;
+    & Button {
+        margin: 0 2;
+        /* 去掉按钮边框压缩高度：文字 1 行 + line-pad 1 上下各 1 行 = 3 行，
+           正好放进 height: 3 的按钮行（line-pad 最小值为 1，不能设为 0） */
+        border: none;
+    }
+    & Button#confirm-no {
+        background: $panel; /* “否”无边框后与盒子底色相同，给个浅底区分 */
+    }
+}

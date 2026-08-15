@@ -11,6 +11,7 @@ class StreamResult:
     input_tokens: int = 0
     output_tokens: int = 0
     tool_calls: Optional[List[Dict]] = None
+    error: str = ""
 
 
 @dataclass
@@ -183,6 +184,9 @@ class ConversationTree:
         for nid in to_delete:
             del self.nodes[nid]
 
+        if self.root and self.root.id in to_delete:
+            self.root = None
+
         if self.current_node and self.current_node.id in to_delete:
             if node.parent_id and node.parent_id in self.nodes:
                 self.current_node = self.nodes[node.parent_id]
@@ -234,12 +238,15 @@ class ConversationTree:
         return sorted(branches)
 
     def render_tree(self, highlight_id: Optional[str] = None,
-                    active_subtree: Optional[str] = None) -> Any:
-        from rich.tree import Tree as RichTree
-
+                    active_subtree: Optional[str] = None) -> str:
+        """渲染对话树为纯文本（无 Rich 依赖），返回多行字符串。"""
         if not self.root:
-            return RichTree("[空树]")
-        root_tree = RichTree(f"{self.root.id}: {self.root.title}")
+            return "[空树]"
+        lines: list[str] = []
+        root_label = f"main: {self.root.title}"
+        if self.root.id == highlight_id:
+            root_label = f"➤ {root_label}"
+        lines.append(root_label)
 
         if active_subtree:
             for child in self.root.children:
@@ -247,23 +254,25 @@ class ConversationTree:
                 if prefix == active_subtree:
                     label = f"{child.id}: {child.title}"
                     if child.id == highlight_id:
-                        label = f"[bold cyan]➤ {label}[/bold cyan]"
-                    child_tree = root_tree.add(label)
-                    self._add_node_to_rich_tree(child_tree, child, highlight_id)
+                        label = f"➤ {label}"
+                    lines.append("  " + label)
+                    self._add_node_lines(lines, child, highlight_id, 2)
                 elif prefix and prefix in self.subtree_titles:
                     branches = self.get_subtree_branches(prefix)
                     label = f"{prefix}：{self.subtree_titles[prefix]}"
                     if branches:
                         label += f"（{'，'.join(branches)}）"
-                    root_tree.add(label)
+                    lines.append("  " + label)
                 else:
                     label = f"{child.id}: {child.title}"
-                    child_tree = root_tree.add(label)
-                    self._add_node_to_rich_tree(child_tree, child, highlight_id)
+                    if child.id == highlight_id:
+                        label = f"➤ {label}"
+                    lines.append("  " + label)
+                    self._add_node_lines(lines, child, highlight_id, 2)
         else:
-            self._add_node_to_rich_tree(root_tree, self.root, highlight_id)
+            self._add_node_lines(lines, self.root, highlight_id, 1)
 
-        return root_tree
+        return "\n".join(lines)
 
     def _count_linear_chain(self, node: ConversationNode) -> int:
         count = 0
@@ -272,28 +281,27 @@ class ConversationTree:
             node = node.children[0]
         return count
 
-    def _add_node_to_rich_tree(self, rich_node, node: ConversationNode,
-                               highlight_id: Optional[str]):
+    def _add_node_lines(self, lines: list, node: ConversationNode,
+                        highlight_id: Optional[str], depth: int) -> None:
         for child in node.children:
             chain_len = self._count_linear_chain(child) + 1
             if chain_len >= 5:
-                lines = []
+                # 线性链折叠显示：链上各节点各自占一行（纯文本下更清晰）
                 last = child
                 for i in range(chain_len):
+                    label = f"{last.id}: {last.title}"
                     if last.id == highlight_id:
-                        lines.append(f"[bold cyan]➤ {last.id}: {last.title}[/bold cyan]")
-                    else:
-                        lines.append(f"{last.id}: {last.title}")
+                        label = f"➤ {label}"
+                    lines.append("  " * depth + label)
                     if i < chain_len - 1:
                         last = last.children[0]
-                child_tree = rich_node.add("\n".join(lines))
-                self._add_node_to_rich_tree(child_tree, last, highlight_id)
+                self._add_node_lines(lines, last, highlight_id, depth + 1)
             else:
                 label = f"{child.id}: {child.title}"
                 if child.id == highlight_id:
-                    label = f"[bold cyan]➤ {label}[/bold cyan]"
-                child_tree = rich_node.add(label)
-                self._add_node_to_rich_tree(child_tree, child, highlight_id)
+                    label = f"➤ {label}"
+                lines.append("  " * depth + label)
+                self._add_node_lines(lines, child, highlight_id, depth + 1)
 
 
 

@@ -9,7 +9,6 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from mincli.config import load_mcp_servers
-from mincli.render import console
 
 BUNDLED_NAME = "mincli"
 CONNECT_TIMEOUT = 15
@@ -29,7 +28,7 @@ def _bundled_params() -> StdioServerParameters:
 def _external_params(server_name: str, cfg: dict) -> Optional[StdioServerParameters]:
     command = cfg.get("command")
     if not command:
-        console.print(f"[yellow]⚠ MCP server「{server_name}」缺少 command 配置，已跳过[/yellow]")
+        print(f"⚠ MCP server「{server_name}」缺少 command 配置，已跳过")
         return None
     env = cfg.get("env") or {}
     return StdioServerParameters(
@@ -59,7 +58,7 @@ class McpToolClient:
             self._run_coro(self._connect_all())
             self.ok = bool(self._clients)
         except Exception as e:
-            console.print(f"[red]MCP 连接失败: {e}[/red]")
+            print(f"MCP 连接失败: {e}")
             self.ok = False
 
     def tools(self) -> List[dict]:
@@ -119,7 +118,7 @@ class McpToolClient:
             self._run_coro(self._connect_all())
             self.ok = bool(self._clients)
         except Exception as e:
-            console.print(f"[red]MCP 重连失败: {e}[/red]")
+            print(f"MCP 重连失败: {e}")
             self.ok = False
 
     def close(self) -> None:
@@ -160,9 +159,9 @@ class McpToolClient:
             try:
                 await asyncio.wait_for(self._connect_one(name, kind, target), timeout=CONNECT_TIMEOUT)
             except asyncio.TimeoutError:
-                console.print(f"[yellow]⚠ 连接 MCP server「{name}」超时，已跳过[/yellow]")
+                print(f"⚠ 连接 MCP server「{name}」超时，已跳过")
             except Exception as e:
-                console.print(f"[yellow]⚠ 连接 MCP server「{name}」失败: {e}，已跳过[/yellow]")
+                print(f"⚠ 连接 MCP server「{name}」失败: {e}，已跳过")
 
         await self._register_tools()
 
@@ -179,11 +178,11 @@ class McpToolClient:
             try:
                 result = await asyncio.wait_for(client.list_tools(), timeout=CONNECT_TIMEOUT)
             except Exception as e:
-                console.print(f"[yellow]⚠ 获取「{name}」工具列表失败: {e}[/yellow]")
+                print(f"⚠ 获取「{name}」工具列表失败: {e}")
                 continue
             for t in result.tools:
                 if t.name in self._tool_owner:
-                    console.print(f"[yellow]⚠ 工具「{t.name}」与已有工具重名，来自「{name}」的工具已忽略[/yellow]")
+                    print(f"⚠ 工具「{t.name}」与已有工具重名，来自「{name}」的工具已忽略")
                     continue
                 self._tool_owner[t.name] = name
                 self._tool_defs.append({
@@ -195,7 +194,7 @@ class McpToolClient:
                     },
                 })
         count = len(self._tool_defs)
-        console.print(f"[dim]MCP 就绪：{len(self._clients)} 个 server，{count} 个工具[/dim]")
+        print(f"MCP 就绪：{len(self._clients)} 个 server，{count} 个工具")
 
     async def _close_all(self) -> None:
         for client in self._clients.values():
