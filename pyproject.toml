@@ -24,3 +24,6 @@ mincli = "mincli.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mincli*"]
+
+[tool.setuptools.package-data]
+mincli = ["*.md"]

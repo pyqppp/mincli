@@ -15,6 +15,7 @@ from mincli.config import (
     MODEL_V4_PRO,
     SAVE_BASE_DIR,
     DEFAULT_SYSTEM_PROMPT,
+    SYSTEM_PROMPT_SOURCE,
 )
 
 app = typer.Typer(help="mincli - 树状对话 AI 助手")
@@ -59,11 +60,6 @@ def chat(
     if effort not in ("low", "high", "max"):
         print(f"无效推理强度: {effort}，可选 low / high / max")
         raise SystemExit(2)
-
-    if thinking:
-        print(f"🧠 开启思考模式 (effort: {effort})")
-    else:
-        print("🧠 思考模式关闭")
 
     if no_tui:
         _chat_plain(model, temperature, thinking, effort)
@@ -142,6 +138,7 @@ def info() -> None:
     print(f"  API Key: {'已配置 ✓' if api_key else '未配置 ✗'}")
     print(f"  模型: {MODEL_V4_FLASH} / {MODEL_V4_PRO}")
     print(f"  保存路径: {SAVE_BASE_DIR}")
+    print(f"  系统提示词: {SYSTEM_PROMPT_SOURCE or '内置兜底'}（{len(DEFAULT_SYSTEM_PROMPT)} 字符）")
     print("  模式: 树状对话 (Textual TUI)")
 
 

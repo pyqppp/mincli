@@ -135,6 +135,19 @@ What files are here?
 |----------|----------|---------|-------------|
 | `DEEPSEEK_API_KEY` | Yes | — | DeepSeek API key |
 | `MINCLI_SAVE_PATH` | No | `~/Documents/mincli_Conversations` | Export directory |
+| `MINCLI_SYSTEM_PROMPT_PATH` | No | Package `mincli/system_prompt.md` | Path to a custom system prompt file |
+
+### System prompt
+
+The system prompt lives in its own file and is auto-loaded on every startup. Resolution order (highest first):
+
+| Priority | Source |
+|----------|--------|
+| 1 | File pointed to by `MINCLI_SYSTEM_PROMPT_PATH` |
+| 2 | `~/.mincli/system_prompt.md` |
+| 3 | Package `mincli/system_prompt.md` (default, ships with the project) |
+
+Edit the matching file to customize the default prompt — it takes effect on the next launch. `mincli info` shows which prompt file is actually in use. If none of the files are available, a minimal built-in fallback prompt is used.
 
 CLI flags:
 
@@ -252,6 +265,7 @@ In chat you can also add a remote server directly with `/mcp add <name> <URL>`.
 │   ├── __main__.py          # python -m mincli entry
 │   ├── cli.py               # Typer CLI: chat (TUI / --no-tui), info
 │   ├── config.py            # Constants + config loading
+│   ├── system_prompt.md     # Default system prompt (auto-loaded on startup)
 │   ├── controller.py        # ChatController (logic + event stream)
 │   ├── models.py            # ConversationNode/Tree
 │   ├── helpers.py           # Utilities (tokens, title gen, formulas)

@@ -135,6 +135,19 @@ mincli chat --help
 |------|------|--------|------|
 | `DEEPSEEK_API_KEY` | 是 | 无 | DeepSeek API 密钥 |
 | `MINCLI_SAVE_PATH` | 否 | `~/Documents/mincli_Conversations` | 对话导出目录 |
+| `MINCLI_SYSTEM_PROMPT_PATH` | 否 | 包内 `mincli/system_prompt.md` | 自定义系统提示词文件路径 |
+
+### 系统提示词
+
+系统提示词独立存放在文件中，每次启动自动导入。加载优先级（高 → 低）：
+
+| 优先级 | 来源 |
+|--------|------|
+| 1 | `MINCLI_SYSTEM_PROMPT_PATH` 环境变量指定的文件 |
+| 2 | `~/.mincli/system_prompt.md` |
+| 3 | 包内 `mincli/system_prompt.md`（默认，随项目分发） |
+
+直接编辑对应文件即可自定义默认提示词，重启后生效；`mincli info` 可查看当前实际使用的提示词文件。若文件均不可用，则回退到内置兜底提示词。
 
 命令行参数：
 
@@ -252,6 +265,7 @@ mincli 的工具执行基于标准 [MCP 协议](https://modelcontextprotocol.io/
 │   ├── __main__.py          # python -m mincli 入口
 │   ├── cli.py               # Typer CLI：chat（TUI / --no-tui）、info
 │   ├── config.py            # 常量 + 配置加载
+│   ├── system_prompt.md     # 系统提示词（每次启动自动导入）
 │   ├── controller.py        # ChatController（核心逻辑 + 事件流）
 │   ├── models.py            # ConversationNode/Tree
 │   ├── helpers.py           # 工具函数（token/标题/公式转换）
