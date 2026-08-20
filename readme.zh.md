@@ -24,6 +24,7 @@
 - 📄 **导出 Markdown** — `/save` 将节点对话导出为 `.md` 文件
 - ⚙️ **动态配置** — `/set` 命令随时修改系统提示词、温度、模型、思考开关、推理强度
 - 🧩 **双模型** — `deepseek-v4-flash`（轻量快速）和 `deepseek-v4-pro`（旗舰性能）
+- 📊 **实时用量状态条** — 输入栏下方两分栏实时显示：缓存命中率、账户余额、下一次输入 token 估算与预计价格（按 DeepSeek 峰谷分时定价折算）
 
 ---
 
@@ -167,6 +168,8 @@ mincli chat --help
 |------|------|
 | `/exit`, `/quit` | 退出（自动保存会话） |
 | `/clear`, `/c` | 清空会话 |
+| `/compact [N]` | 压缩上下文：把当前分支早期对话压成**详细**摘要，保留最近 N 轮原文（默认 5，0=全部压缩；再次执行会按最新对话重新压缩） |
+| `/compact off` | 清除压缩摘要，恢复发送完整原始消息 |
 | `/set system <内容>` | 修改系统提示词 |
 | `/set temp <数值>` | 修改温度 |
 | `/set model <flash\|pro>` | 切换模型 |
@@ -174,7 +177,7 @@ mincli chat --help
 | `/set effort <low\|high\|max>` | 推理强度 |
 | `/set show` | 显示当前配置 |
 | `/mcp list` | 显示 MCP server 配置与连接状态 |
-| `/mcp add <名称> <命令> [参数...]` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加 |
+| `/mcp add <名称> <命令> [参数...] [--header 'K: V']` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加，`--header` 用于远程 server 的鉴权请求头 |
 | `/mcp remove <名称>` | 移除第三方 MCP server（需确认） |
 | `/mcp reload` | 重新加载 MCP server 配置 |
 | `/import <路径或URL>` | 导入文件（txt/md/py/csv/pdf/docx）或抓取网页 |
@@ -236,17 +239,61 @@ mincli 的工具执行基于标准 [MCP 协议](https://modelcontextprotocol.io/
 
 **支持两种类型的第三方 server：**
 - **本地命令（stdio）**：`command` + `args` + 可选 `env`，如上面的 filesystem 示例
-- **远程 HTTP（streamable-http）**：只写 `url` 即可，如：
+- **远程 HTTP（streamable-http）**：只写 `url` 即可；需要鉴权（如 Bearer Token）时用 `headers` 附加请求头，如：
 
 ```json
 {
   "mcpServers": {
-    "remote-tools": { "url": "https://example.com/mcp" }
+    "obsidian": {
+      "url": "http://localhost:3001/mcp",
+      "headers": { "Authorization": "Bearer <你的 Token>" }
+    }
   }
 }
 ```
 
-对话中也可直接 `/mcp add <名称> <URL>` 添加远程 server。
+对话中也可直接添加，例如：
+
+```
+/mcp add obsidian http://localhost:3001/mcp --header "Authorization: Bearer <你的 Token>"
+```
+
+`--header 'K: V'`（或 `-H`）可重复使用，仅对远程 server 生效；添加后运行 `/mcp reload` 生效。
+
+---
+
+## 上下文压缩（/compact）
+
+对话变长后上下文占用大量 token，可用 `/compact` 把**当前分支**的早期对话压缩成一份**详尽**的摘要（由模型生成，按主题组织、完整保留目标/约束/决定/命令/路径/数据/待办等关键信息，宁可长、不要短），之后发送消息时自动用摘要替代被压缩部分的原始消息，仅保留最近 N 轮原文：
+
+```
+/compact         # 压缩早期对话，保留最近 5 轮原文
+/compact 0       # 全部压缩，不保留原文
+/compact 3       # 保留最近 3 轮原文
+/compact off     # 清除压缩摘要，恢复发送完整原始消息
+```
+
+说明：
+
+- 压缩**不删除任何节点**：对话树、历史、导出均不受影响，随时可 `/compact off` 恢复原文；再次执行 `/compact` 会基于最新对话重新生成摘要。
+- 摘要与当前节点一起保存到会话文件，重启后仍生效。
+- 压缩走当前模型（`/set model` 指定的模型），摘要质量随模型而定。
+
+---
+
+## 实时用量状态条
+
+输入栏下方有两分栏状态条（仅适配 DeepSeek API），所有数据均来自 API 返回，实时更新：
+
+**左栏：缓存命中率 + 账户余额**
+- 缓存命中率 = `usage.prompt_cache_hit_tokens ÷ (prompt_cache_hit_tokens + prompt_cache_miss_tokens)`，取当前节点最近一次请求的累计值（DeepSeek 上下文缓存自动生效，命中部分按缓存命中价计费）
+- 账户余额来自 `GET /user/balance` 的 `total_balance`（优先 CNY），每 60 秒自动刷新
+
+**右栏：下次输入估算**
+- 下次输入 token：**未压缩**时 = 上次完整输入 + 本节点输出（DeepSeek API 真实 `usage` 口径，与对话结束显示的输入/输出直接对应）；**压缩后** = `/compact` 报告的 after_tokens（压缩时写入），与压缩报告数字严格一致，直观体现节省；用户新输入内容量小，忽略不计
+- 预计价格 = token 量 × 折算单价 ÷ 100 万，按当前时段（北京时间高峰 9-12、14-18 点）与缓存命中率折算（命中部分按缓存命中价、其余按未命中价），定价见 `config.DEEPSEEK_PRICING`
+
+> 口径说明：对话结束显示的「输入/输出 tokens」来自 DeepSeek API 真实 `usage`；压缩报告的 before/after 用 tiktoken 本地估算同一份消息（压缩前后无可用的新 API 请求），两者因 tokenizer 差异数字不等，但压缩后状态条与压缩报告严格一致、压缩前后状态条与 API 显示直接对应。
 
 ---
 

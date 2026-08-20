@@ -142,6 +142,27 @@ Footer {
     height: 1;
 }
 
+/* 输入栏下方状态条：左=缓存命中率+余额，右=下次输入估算（两分栏）
+   注意：border-top 占 1 行，内容区需留 1 行（height: 2），否则文字会被挤出与 Footer 重叠 */
+#usage-bar {
+    height: 2;
+    width: 1fr;
+    background: $surface;
+    border-top: solid $border-blurred;
+}
+
+#usage-left {
+    width: 1fr;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+#usage-right {
+    width: auto;
+    padding: 0 1;
+    color: $text-muted;
+}
+
 /* 确认对话框 */
 ConfirmScreen {
     align: center middle;

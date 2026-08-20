@@ -129,9 +129,14 @@ class FakeController(ChatController):
     def close(self):
         self.closed = True
 
+    def fetch_balance(self):
+        # 测试不联网：余额置空，避免真实请求 DeepSeek /user/balance
+        return None
+
 
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
+    test_markdown_safety()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -139,6 +144,13 @@ async def main() -> int:
         check("布局：输入框存在且聚焦", app.query_one("#chat-input", ChatInput) is not None)
         check("布局：消息流存在", bool(app.query_one("#chat-log", Markdown)))
         check("布局：会话树存在", bool(app.query_one("#tree", Tree)))
+        check("布局：状态条存在", bool(app.query_one("#usage-bar", Horizontal)))
+        check("布局：状态条两分栏", bool(app.query_one("#usage-left", Static))
+              and bool(app.query_one("#usage-right", Static)))
+        for _ in range(10):
+            await pilot.pause()
+        usage_left = str(app.query_one("#usage-left", Static).content)
+        check("状态条左栏显示缓存/余额", "缓存" in usage_left)
 
         # --- 2. 发送消息 → 流式渲染 ---
         inp = app.query_one("#chat-input", ChatInput)
@@ -278,6 +290,36 @@ async def main() -> int:
         await pilot.pause()
         check("未知命令不发送给 LLM", fake.client.chat.completions.script == [])
 
+        # --- 7.7 /compact 命令 ---
+        fake.tree.create_root("问题1", "回答1", "", "标题1", 1, 1)
+        n2 = fake.tree.add_child(fake.tree.root, "问题2", "回答2", "", "标题2", 1, 1)
+        n3 = fake.tree.add_child(n2, "问题3", "回答3", "", "标题3", 1, 1)
+        n4 = fake.tree.add_child(n3, "问题4", "回答4", "", "标题4", 1, 1)
+        fake.tree.current_node = n4
+        fake.client.chat.completions.script.append(_FakeChatResponse(content="【摘要】TUI 压缩测试内容"))
+        await type_command("/compact 0")
+        for _ in range(30):
+            await pilot.pause()
+            if "上下文已压缩" in app.query_one("#chat-log", Markdown).source:
+                break
+        chat = app.query_one("#chat-log", Markdown)
+        check(
+            "命令：/compact 显示压缩结果",
+            "上下文已压缩" in chat.source and "TUI 压缩测试内容" in chat.source,
+        )
+        check(
+            "命令：/compact 写入树",
+            fake.tree.compaction is not None and fake.tree.compaction["boundary_id"] == n4.id,
+        )
+        await type_command("/compact off")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/compact off 清除压缩", fake.tree.compaction is None)
+        await type_command("/compact 太多参数")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/compact 非法参数被拦截", fake.tree.compaction is None)
+
         # --- 8. Ctrl+C 退出 ---
         await pilot.press("ctrl+c")
 
@@ -286,6 +328,62 @@ async def main() -> int:
 
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 0 if FAIL == 0 else 1
+
+
+def test_markdown_safety():
+    """markdown_it 防御补丁：规则被包装、越界不崩、正常解析不变。"""
+    import markdown_it.main
+
+    from mincli.markdown_safe import _patch_markdown_it
+
+    _patch_markdown_it()  # 幂等
+    parser = markdown_it.main.MarkdownIt()
+    rules = parser.block.ruler.__rules__
+    by_name = {r.name: r.fn for r in rules}
+    safe = {
+        name
+        for name, fn in by_name.items()
+        if getattr(fn, "__name__", "") == "_safe"
+    }
+    check(
+        "补丁包装核心块规则",
+        {"html_block", "table", "blockquote", "fence"} <= safe,
+    )
+    # 正常 markdown 解析结果与未包装时一致（token 数）
+    md = "## 标题\n\n- 列表项\n\n```python\nprint(1)\n```\n\n| A | B |\n|:--:|:--:|\n| 1 | 2 |\n"
+    check("正常解析 token 数不变", len(parser.parse(md)) == 14)
+    # 极端破坏输入不崩溃（引用块内表格被截断等形态）
+    import random
+
+    random.seed(2026)
+    crashed = False
+    for _ in range(120):
+        lines = []
+        for ln in (
+            "用户补充了：",
+            "- 还有4道错题：22、23、24、25",
+            "| 题号 | 题型 | 失分原因 | 涉及知识点 | 模块 |",
+            "|:----:|:----:|:----:|:--------:|:----:|",
+            "| 6 | 选择 | 计算失误 | 解方程忘检验 | 代数 |",
+        ):
+            mode = random.random()
+            if mode < 0.3:
+                lines.append(f"> {ln}")
+            elif mode < 0.5:
+                lines.append(ln)
+            elif mode < 0.7:
+                cut = random.randint(1, max(1, len(ln) - 1))
+                lines.append(f"> {ln[:cut]}")
+                lines.append(ln[cut:])
+            else:
+                lines.append(f"> > {ln}")
+        src = "\n".join(lines) + ("\n" if random.random() < 0.5 else "")
+        try:
+            parser.parse(src)
+        except IndexError:
+            crashed = True
+            break
+    check("极端输入不触发 IndexError", not crashed)
 
 
 if __name__ == "__main__":

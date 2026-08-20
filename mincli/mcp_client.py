@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -9,6 +10,10 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from mincli.config import load_mcp_servers
+
+# 静默 MCP SDK 的会话终止告警（部分远程 server 不支持 DELETE 会话终止，
+# 关闭时会产生 "Session termination failed: 400/404" 噪音，不影响功能）
+logging.getLogger("mcp").setLevel(logging.ERROR)
 
 BUNDLED_NAME = "mincli"
 CONNECT_TIMEOUT = 15
@@ -45,6 +50,7 @@ class McpToolClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._clients: Dict[str, Client] = {}
+        self._http_clients: Dict[str, object] = {}  # name -> httpx2.AsyncClient（远程 server 专用）
         self._tool_owner: Dict[str, str] = {}
         self._tool_defs: List[dict] = []
 
@@ -112,6 +118,7 @@ class McpToolClient:
         except Exception:
             pass
         self._clients.clear()
+        self._http_clients.clear()
         self._tool_owner.clear()
         self._tool_defs.clear()
         try:
@@ -136,6 +143,7 @@ class McpToolClient:
             pass
         self._loop = None
         self._clients.clear()
+        self._http_clients.clear()
         self._tool_owner.clear()
         self._tool_defs.clear()
 
@@ -146,18 +154,20 @@ class McpToolClient:
         return fut.result(timeout=timeout)
 
     async def _connect_all(self) -> None:
-        servers = {"mincli": ("stdio", _bundled_params())}
+        servers = {"mincli": ("stdio", _bundled_params(), None)}
         for name, cfg in load_mcp_servers().items():
             if isinstance(cfg, dict) and cfg.get("url"):
-                servers[name] = ("http", cfg["url"])
+                servers[name] = ("http", cfg["url"], cfg.get("headers") or {})
             else:
                 params = _external_params(name, cfg)
                 if params:
-                    servers[name] = ("stdio", params)
+                    servers[name] = ("stdio", params, None)
 
-        for name, (kind, target) in servers.items():
+        for name, (kind, target, headers) in servers.items():
             try:
-                await asyncio.wait_for(self._connect_one(name, kind, target), timeout=CONNECT_TIMEOUT)
+                await asyncio.wait_for(
+                    self._connect_one(name, kind, target, headers), timeout=CONNECT_TIMEOUT
+                )
             except asyncio.TimeoutError:
                 print(f"⚠ 连接 MCP server「{name}」超时，已跳过")
             except Exception as e:
@@ -165,9 +175,22 @@ class McpToolClient:
 
         await self._register_tools()
 
-    async def _connect_one(self, name: str, kind: str, target) -> None:
+    async def _connect_one(
+        self, name: str, kind: str, target, headers: Optional[dict] = None
+    ) -> None:
         if kind == "http":
-            client = Client(streamable_http_client(target))
+            if headers:
+                try:
+                    import httpx2
+                except ImportError as e:
+                    raise RuntimeError(
+                        f"需要请求头但未安装 httpx2（请升级 mcp SDK）: {e}"
+                    ) from e
+                http_client = httpx2.AsyncClient(headers=headers)
+                self._http_clients[name] = http_client
+                client = Client(streamable_http_client(target, http_client=http_client))
+            else:
+                client = Client(streamable_http_client(target))
         else:
             client = Client(stdio_client(target))
         await client.__aenter__()
@@ -202,3 +225,10 @@ class McpToolClient:
                 await client.__aexit__(None, None, None)
             except Exception:
                 pass
+        # 释放远程 server 专用的 http 客户端（streamable_http_client 不接管外部传入的 client）
+        for http_client in self._http_clients.values():
+            try:
+                await http_client.aclose()
+            except Exception:
+                pass
+        self._http_clients.clear()

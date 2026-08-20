@@ -11,6 +11,7 @@ from openai import OpenAI
 from mincli.config import (
     MODEL_V4_FLASH, TITLE_MAX_TOKENS, TITLE_MAX_LENGTH,
     SAVE_BASE_DIR, TEMPERATURE_MIN, TEMPERATURE_MAX,
+    DEEPSEEK_PRICING,
 )
 
 
@@ -20,6 +21,36 @@ def clear_screen() -> None:
         sys.stdout.flush()
     else:
         os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def is_peak_hour(now: Optional[datetime.datetime] = None) -> bool:
+    """DeepSeek 峰谷定价：北京时间高峰时段 9:00-12:00、14:00-18:00。"""
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    h = now.hour
+    return (9 <= h < 12) or (14 <= h < 18)
+
+
+def estimate_input_price(
+    model: str,
+    tokens: int,
+    hit_ratio: Optional[float] = None,
+    peak: bool = False,
+) -> Optional[float]:
+    """估算输入价格（元）：命中部分按缓存命中单价、其余按未命中单价。
+
+    仅适配 DeepSeek 官方定价（config.DEEPSEEK_PRICING）；未知模型返回 None。
+    """
+    pricing = DEEPSEEK_PRICING.get(model)
+    if not pricing or tokens <= 0:
+        return None
+    idx = 1 if peak else 0
+    hit_price = pricing["hit"][idx]
+    miss_price = pricing["miss"][idx]
+    ratio = hit_ratio if hit_ratio is not None else 0.0
+    ratio = max(0.0, min(1.0, ratio))
+    avg_price = hit_price * ratio + miss_price * (1.0 - ratio)
+    return tokens * avg_price / 1_000_000
 
 
 def get_balance(client: OpenAI) -> Optional[List[Dict]]:

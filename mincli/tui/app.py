@@ -9,8 +9,15 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
+
+# 必须在 Textual Markdown 组件创建解析器之前执行：
+# 防御 markdown-it-py 解析极端输入（引用块内表格被流式截断等）时的越界崩溃
+from mincli.markdown_safe import _patch_markdown_it
+
+_patch_markdown_it()
 
 from textual import events
 from textual.app import App, ComposeResult
@@ -23,10 +30,16 @@ from textual.widgets._markdown import MarkdownBlockQuote
 from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
     MODEL_V4_FLASH,
+    COMPACT_DEFAULT_KEEP,
+    BALANCE_REFRESH_SECONDS,
     PREVIEW_ASSISTANT_MSG_LEN,
     PREVIEW_USER_MSG_LEN,
     TEMPERATURE_MAX,
     TEMPERATURE_MIN,
+    MODELS_AVAILABLE,
+    API_PROVIDERS,
+    load_models,
+    register_model,
     get_mcp_config_path,
     load_mcp_servers,
     save_mcp_servers,
@@ -51,11 +64,13 @@ DeepSeek 树状对话 TUI
 COMMAND_HELP: dict[str, str] = {
     "/exit": "退出程序（自动保存会话）",
     "/clear": "清空当前会话",
+    "/compact": f"用法: /compact [保留轮数] | /compact off\n把当前分支早期对话压缩成详细摘要（默认保留最近 {COMPACT_DEFAULT_KEEP} 轮原文，0=全部压缩；off 清除压缩恢复原文）",
     "/help": "显示此帮助",
     "/import": "用法: /import <文件路径或URL>\n导入文件或抓取网页，下次提问自动附加到上下文",
     "/view": "用编辑器打开当前回答",
-    "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server",
-    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set show\n修改运行配置",
+    "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
+    "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
+    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set show\n修改运行配置",
     "/tree": "显示完整对话树",
     "/info": "用法: /info [节点ID]\n查看节点详情（默认当前节点）",
     "/up": "返回父节点",
@@ -128,6 +143,8 @@ class ChatApp(App):
     TITLE = "mincli"
     SUB_TITLE = "DeepSeek Chat"
 
+    ALLOW_SELECT = False  # 禁用鼠标选区，避免流式渲染期间点击 Markdown 块触发 Textual 选区崩溃
+
     CSS_PATH = "chat.tcss"
 
     BINDINGS = [
@@ -157,6 +174,14 @@ class ChatApp(App):
         self._chat_lock = asyncio.Lock()  # 串行化聊天区 update/append（点击折叠 vs 流式）
         self._completion_matches: list[str] = []
         self._completion_index = 0
+        # 流式渲染节流：SSE 按 token 级产生事件，逐事件 append 会导致
+        # Markdown 组件反复 mount/布局/重绘，主线程跟不上 → 渲染卡顿。
+        # 这里把增量累积到缓冲，每 80ms 批量渲染一次，大幅降低渲染次数。
+        self._stream_buf_content = ""  # 待渲染的正文增量缓冲
+        self._stream_buf_reasoning = ""  # 待渲染的思考增量缓冲
+        self._flush_interval = 0.08  # 批量渲染间隔（秒）
+        self._flush_timer = None  # 批量渲染定时器（textual Timer）
+        self._balance_txt: Optional[str] = None  # 最近一次拉取的账户余额（字符串）
 
     def action_ignore_lock(self) -> None:
         """忽略锁定键（Caps Lock / Num Lock / Scroll Lock）。"""
@@ -176,6 +201,9 @@ class ChatApp(App):
         yield ChatInput(
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
+        with Horizontal(id="usage-bar"):
+            yield Static("", id="usage-left")
+            yield Static("", id="usage-right")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -200,11 +228,67 @@ class ChatApp(App):
         self.query_one("#chat-input", ChatInput).focus()
         if self.ctrl.session_loaded:
             self.notify("已加载上次会话记录", timeout=4)
+        self._start_balance_refresh()
+        self._refresh_usage_bar()
 
     def on_unmount(self) -> None:
+        self._cancel_flush()
         if self.ctrl is not None:
             self.ctrl.save_session()
             self.ctrl.close()
+
+    # ---------------- 输入栏状态条（缓存命中率 / 余额 / 下次输入估算） ----------------
+
+    def _start_balance_refresh(self) -> None:
+        """启动账户余额定时刷新（首次立即拉取一次）。"""
+        self._balance_txt = None
+        self.set_interval(BALANCE_REFRESH_SECONDS, self._refresh_balance)
+        self._refresh_balance()
+
+    def _refresh_balance(self) -> None:
+        """定时回调：后台线程拉取余额。"""
+        if self.ctrl is None:
+            return
+        self.run_worker(
+            self._fetch_balance_thread,
+            thread=True,
+            exit_on_error=False,
+            name="balance-fetch",
+        )
+
+    def _fetch_balance_thread(self) -> None:
+        try:
+            info = self.ctrl.fetch_balance()
+            total = info.get("total_balance") if info else None
+        except Exception:
+            total = None
+        self.call_from_thread(self._set_balance, total)
+
+    def _set_balance(self, total: Optional[str]) -> None:
+        self._balance_txt = total
+        self._refresh_usage_bar()
+
+    def _refresh_usage_bar(self) -> None:
+        """刷新输入栏下方状态条（左：缓存命中率+余额；右：下次输入估算）。"""
+        if self.ctrl is None:
+            return
+        stats = self.ctrl.usage_stats()
+        rate = stats["cache_hit_rate"]
+        rate_txt = f"{rate * 100:.0f}%" if rate is not None else "--"
+        if self._balance_txt is None:
+            bal_txt = "…"
+        else:
+            bal_txt = f"¥{self._balance_txt}"
+        self.query_one("#usage-left", Static).update(
+            f"🎯 缓存命中 {rate_txt}   💵 余额 {bal_txt}"
+        )
+        tokens = stats["next_input_tokens"]
+        price = stats["estimated_price"]
+        price_txt = f"≈ ¥{price:.4f}" if price is not None else "--"
+        peak_txt = "高峰" if stats["peak"] else "空闲"
+        self.query_one("#usage-right", Static).update(
+            f"⏭ 下次输入 {tokens:,} tok {price_txt}（{peak_txt}价）"
+        )
 
     # ---------------- 对话树侧栏 ----------------
 
@@ -401,6 +485,7 @@ class ChatApp(App):
         """切换到节点：设当前节点 + 刷新树 + 光标跟随 + 消息区显示节点内容。"""
         if self._full_view:
             self._set_full_view(False)  # 全览模式下切换节点 → 自动退出全览
+        self._cancel_flush()  # 丢弃未渲染的流式缓冲（视图将被整体重建）
         if not (self.ctrl and self.ctrl.tree.switch_to_node(node_id)):
             return False
         self._rebuild_tree()
@@ -416,6 +501,7 @@ class ChatApp(App):
         )
         self._reasoning_collapsed = False
         self._answer_started = True  # 节点视图已含 **mincli：** 头部
+        self._refresh_usage_bar()
         return True
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
@@ -548,6 +634,10 @@ class ChatApp(App):
             self._reasoning_collapsed = False
             self._answer_started = False
             self.notify("对话历史已清除")
+            self._refresh_usage_bar()
+            return True
+        if low.startswith("/compact"):
+            await self._cmd_compact(cmd)
             return True
         if low in ("/view",):
             self._cmd_view()
@@ -557,6 +647,9 @@ class ChatApp(App):
             return True
         if low.startswith("/set"):
             await self._cmd_set(cmd)
+            return True
+        if low.startswith("/model"):
+            await self._cmd_model(cmd)
             return True
         if low.startswith("/mcp"):
             await self._cmd_mcp(cmd)
@@ -583,7 +676,7 @@ class ChatApp(App):
                     self.notify(err, severity="error")
             return True
 
-        m = re.match(r"^/([a-z]+\d+|main)$", cmd)
+        m = re.match(r"^/([A-Za-z]+\d+|main)$", cmd)
         if m and ctrl.tree and m.group(1) in ctrl.tree.nodes:
             self._switch_to(m.group(1))
             return True
@@ -595,9 +688,20 @@ class ChatApp(App):
     async def _chat_append(self, markdown: str) -> None:
         """向消息区追加一段 Markdown（带分隔线并滚动到底）。"""
         chat = self.query_one("#chat-log", Markdown)
-        await chat.append(f"\n\n---\n\n{markdown}")
+        await self._safe_append(chat, f"\n\n---\n\n{markdown}")
         self._shrink_lists(chat)
         chat.scroll_end(animate=False)
+
+    async def _safe_append(self, chat: Markdown, md: str) -> None:
+        """chat.append 的防御版本：markdown 解析异常时降级为代码块原样显示。"""
+        try:
+            await chat.append(md)
+        except Exception:
+            try:
+                escaped = md.replace("```", "``")
+                await chat.append(f"```\n{escaped}\n```")
+            except Exception:
+                pass
 
     def _cmd_view(self) -> None:
         node = self.ctrl.tree.current_node
@@ -621,6 +725,8 @@ class ChatApp(App):
 **基本命令**
 - `/exit`, `/quit`, `/q` — 退出程序（自动保存会话）
 - `/clear`, `/c` — 清空当前会话
+- `/compact [N]` — 压缩上下文：把早期对话压成详细摘要，保留最近 N 轮原文（默认 5，0=全部压缩；再次执行会重新压缩）
+- `/compact off` — 清除压缩摘要，恢复发送完整原始消息
 - `/help`, `/h` — 显示此帮助
 - `/import <路径或URL>` — 导入文件或抓取网页
 - `/mcp <list|add|remove|reload>` — 管理第三方 MCP server
@@ -629,11 +735,15 @@ class ChatApp(App):
 **配置命令**
 - `/set system <提示词>` — 修改系统提示词
 - `/set temp <值>` — 设置温度（0.0~2.0）
-- `/set model <flash|pro>` — 切换模型
+- `/set model <flash|pro|模型名>` — 切换模型
 - `/set thinking <on|off>` — 开关思考模式
 - `/set effort <low|high|max>` — 推理强度
 - `/set audit <1-4>` — 审核层级
 - `/set show` — 显示当前配置
+
+**多模型**
+- `/model list` — 查看内置与已注册模型
+- `/model register <模型名> <URL> [-p provider] [-k key_var]` — 注册新模型（OpenAI 兼容 API）
 
 **树状命令**
 - `/<节点ID>`（如 /a3）— 直接跳转到指定节点
@@ -654,7 +764,7 @@ class ChatApp(App):
     async def _cmd_set(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         ctrl = self.ctrl
-        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set show"
+        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set show"
         if len(parts) < 2:
             self.notify(usage, severity="warning")
             return
@@ -675,7 +785,7 @@ class ChatApp(App):
             if ctrl.set_model(parts[2]):
                 self.notify(f"模型已切换为: {ctrl.current_model}")
             else:
-                self.notify("用法: /set model <flash|pro>", severity="warning")
+                self.notify("未找到该模型。可用 /model list 查看，或 /model register <模型名> <URL> 注册", severity="warning")
         elif sub == "thinking" and len(parts) == 3:
             arg = parts[2].lower()
             if arg in ("on", "1", "true"):
@@ -793,6 +903,70 @@ class ChatApp(App):
         else:
             self.notify(f"删除节点 {nid} 失败", severity="error")
 
+    async def _cmd_model(self, cmd: str) -> None:
+        """管理模型注册：/model list | /model register <模型名> <URL> [-p provider] [-k key_var]"""
+        parts = cmd.strip().split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub in ("", "list", "ls"):
+            await self._model_list()
+            return
+
+        if sub in ("register", "add"):
+            self._model_register(parts[2] if len(parts) > 2 else "")
+            return
+
+        self.notify(
+            "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]",
+            severity="warning",
+        )
+
+    async def _model_list(self) -> None:
+        """列出内置 + 已注册模型。"""
+        registered = load_models()
+        lines = ["**可用模型**", "", "| 模型 | API URL | Key 环境变量 | 来源 |", "|---|---|---|---|"]
+        for name, url in MODELS_AVAILABLE.items():
+            key = API_PROVIDERS.get("deepseek", "DEEPSEEK_API_KEY")
+            lines.append(f"| {name} | {url} | {key} | 内置 |")
+        for name, cfg in registered.items():
+            lines.append(
+                f"| {name} | {cfg.get('url', '—')} | {cfg.get('key_var', 'DEEPSEEK_API_KEY')} | 已注册 |"
+            )
+        lines.append("\n注册新模型: `/model register <模型名> <URL>`")
+        lines.append("切换模型: `/set model <模型名>`")
+        await self._chat_append("\n".join(lines))
+
+    def _model_register(self, rest: str) -> None:
+        """解析并注册模型：/model register <模型名> <URL> [-p provider] [-k key_var]"""
+        tokens = rest.split()
+        if len(tokens) < 2:
+            self.notify("用法: /model register <模型名> <URL> [-p provider] [-k key_var]", severity="warning")
+            return
+        model_name = tokens[0]
+        url = tokens[1]
+        provider = "deepseek"
+        key_var = None
+        i = 2
+        while i < len(tokens):
+            if tokens[i] in ("-p", "--provider") and i + 1 < len(tokens):
+                provider = tokens[i + 1]
+                i += 2
+            elif tokens[i] in ("-k", "--key-var") and i + 1 < len(tokens):
+                key_var = tokens[i + 1]
+                i += 2
+            else:
+                self.notify(f"无法识别的参数: {tokens[i]}", severity="warning")
+                return
+
+        if register_model(provider, model_name, url, key_var):
+            self.notify(f"✅ 已注册模型「{model_name}」→ {url}")
+            if self.ctrl is not None:
+                # 注册后立即可用
+                self.ctrl.set_model(model_name)
+                self.notify(f"已切换当前模型为: {model_name}")
+        else:
+            self.notify("注册失败（请检查 ~/.mincli 目录写权限）", severity="error")
+
     async def _cmd_mcp(self, cmd: str) -> None:
         parts = cmd.strip().split(maxsplit=2)
         sub = parts[1].lower() if len(parts) > 1 else ""
@@ -825,7 +999,7 @@ class ChatApp(App):
                 self.notify(f"MCP 重载失败: {e}", severity="error")
         else:
             self.notify(
-                "用法: /mcp list | add <名称> <命令|URL> [参数...] | remove <名称> | reload",
+                "用法: /mcp list | add <名称> <命令|URL> [参数...] [--header 'K: V'] | remove <名称> | reload",
                 severity="warning",
             )
 
@@ -856,6 +1030,8 @@ class ChatApp(App):
                 else:
                     cfg = servers.get(name, {})
                     cmd = cfg.get("url") or cfg.get("command", "")
+                    if cfg.get("headers"):
+                        cmd += f"（带 {len(cfg['headers'])} 个请求头）"
                 state = "✅ 已连接" if st["connected"] else "⚠ 未连接"
                 lines.append(f"| {name} | {cmd} | {st['tools']} | {state} |")
         if not servers:
@@ -865,28 +1041,90 @@ class ChatApp(App):
     def _mcp_add(self, rest: str) -> None:
         servers = load_mcp_servers()
         is_url = lambda s: bool(re.match(r"^https?://", s))
-        tokens = rest.split()
+        try:
+            tokens = shlex.split(rest)  # 支持带引号的参数与 --header 'K: V'
+        except ValueError:
+            self.notify("参数解析失败（引号不匹配）", severity="warning")
+            return
         if len(tokens) < 2:
             self.notify(
-                "用法: /mcp add <名称> <命令> [参数...] 或 /mcp add <名称> <URL>",
+                "用法: /mcp add <名称> <命令> [参数...] [--header 'K: V'] 或 /mcp add <名称> <URL> [--header 'K: V']",
                 severity="warning",
             )
             return
         name, target = tokens[0], tokens[1]
-        if not name or (not is_url(target) and len(tokens) < 2):
-            self.notify("缺少命令或 URL", severity="warning")
-            return
+        headers: dict = {}
+        extra: list = []
+        i = 2
+        while i < len(tokens):
+            t = tokens[i]
+            if t in ("--header", "-H"):
+                if i + 1 >= len(tokens):
+                    self.notify(f"缺少 {t} 的值，用法: {t} 'Key: Value'", severity="warning")
+                    return
+                hv = tokens[i + 1]
+                if ":" not in hv:
+                    self.notify(f"无效的 header「{hv}」（应为 'Key: Value'）", severity="warning")
+                    return
+                k, v = hv.split(":", 1)
+                headers[k.strip()] = v.strip()
+                i += 2
+            else:
+                extra.append(t)
+                i += 1
         if name in servers:
             self.notify(f"已存在同名 server「{name}」，将被覆盖", severity="warning")
         if is_url(target):
-            servers[name] = {"url": target}
+            entry: dict = {"url": target}
+            if headers:
+                entry["headers"] = headers
+            servers[name] = entry
         else:
             entry = {"command": target}
-            if len(tokens) > 2:
-                entry["args"] = tokens[2:]
+            if extra:
+                entry["args"] = extra
+            if headers:
+                self.notify("--header 仅对远程（http/https）server 生效，已忽略", severity="warning")
             servers[name] = entry
         path = save_mcp_servers(servers)
         self.notify(f"✅ 已保存到 {path}，运行 /mcp reload 生效")
+
+    # ---------------- 上下文压缩 ----------------
+
+    async def _cmd_compact(self, cmd: str) -> None:
+        """/compact [保留轮数] | /compact off —— 压缩当前分支早期对话。"""
+        parts = cmd.strip().split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        ctrl = self.ctrl
+        if sub in ("off", "reset", "clear", "undo"):
+            if ctrl.clear_compaction():
+                self.notify("已清除上下文压缩摘要，将恢复发送完整原始消息")
+            else:
+                self.notify("当前没有压缩摘要", severity="warning")
+            return
+        keep = COMPACT_DEFAULT_KEEP
+        if sub:
+            try:
+                keep = max(0, int(sub))
+            except ValueError:
+                self.notify("用法: /compact [保留轮数] | /compact off", severity="warning")
+                return
+        if not ctrl.tree or ctrl.tree.current_node is None:
+            self.notify("当前没有对话可压缩", severity="warning")
+            return
+        self.notify("正在压缩上下文…")
+        stats = await asyncio.to_thread(ctrl.compact_history, keep, emit=self._emit_from_thread)
+        if stats is None:
+            self.notify("无可压缩的对话（对话太短，或压缩失败）", severity="warning")
+            return
+        md = (
+            f"**📦 上下文已压缩**\n\n"
+            f"- 压缩 {stats['nodes_compressed']} 轮，保留最近 {stats['nodes_kept']} 轮原文\n"
+            f"- Token：{stats['before_tokens']} → {stats['after_tokens']}（节省 {stats['saved_tokens']}）\n"
+            f"- 摘要长度：{stats['summary_chars']} 字\n\n"
+            f"---\n\n{stats['summary']}"
+        )
+        await self._chat_append(md)
 
     # ---------------- 消息发送与流式渲染 ----------------
 
@@ -898,6 +1136,7 @@ class ChatApp(App):
             return  # 命令未输完：先补全，等再次 Enter 执行
         if await self._handle_command(event.text):
             return
+        self._cancel_flush()  # 新消息开始前丢弃上一轮残留的流式缓冲
         chat = self.query_one("#chat-log", Markdown)
         chat.append(f"\n\n---\n\n**你**\n\n{event.text}")
         chat.scroll_end(animate=False)
@@ -924,10 +1163,90 @@ class ChatApp(App):
         self.call_from_thread(self._handle_event, ev)
 
     async def _handle_event(self, ev: ControllerEvent) -> None:
-        """主线程处理控制器事件；加锁与用户操作（点击折叠等）串行化，
-        避免 update/append 并发导致 Markdown 内部状态错乱。"""
+        """主线程处理控制器事件。
+
+        stream 事件（SSE 按 token 级产生，频率极高）先累积到缓冲，由定时器
+        每 80ms 批量渲染一次，避免每个 token 都触发 Markdown 组件的
+        mount/布局/重绘 → 渲染卡顿、主线程事件积压。
+        低频事件（node_created/tool/status/done/error）先冲刷缓冲再即时处理，
+        保证渲染顺序正确。
+        """
+        if ev.kind == "stream":
+            if ev.content:
+                self._stream_buf_content += ev.content
+            if ev.reasoning:
+                self._stream_buf_reasoning += ev.reasoning
+            self._ensure_flush_timer()
+            return
+        if ev.kind == "node_created":
+            # 新节点视图整体重建，丢弃任何残留缓冲（防御：正常情况下缓冲为空）
+            self._cancel_flush()
+            async with self._chat_lock:
+                await self._handle_event_inner(ev)
+            return
+        await self._flush_stream_buffer()
         async with self._chat_lock:
             await self._handle_event_inner(ev)
+
+    def _ensure_flush_timer(self) -> None:
+        """确保批量渲染定时器已启动（未启动时才创建）。"""
+        if self._flush_timer is None:
+            self._flush_timer = self.set_timer(self._flush_interval, self._flush_stream_buffer)
+
+    def _cancel_flush(self) -> None:
+        """停止定时器并丢弃缓冲（切换节点/新消息/异常时调用）。"""
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        self._stream_buf_content = ""
+        self._stream_buf_reasoning = ""
+
+    async def _flush_stream_buffer(self) -> None:
+        """把缓冲中的流式增量一次性渲染（节流合并的核心）。"""
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        content, reasoning = self._stream_buf_content, self._stream_buf_reasoning
+        self._stream_buf_content = ""
+        self._stream_buf_reasoning = ""
+        if not content and not reasoning:
+            return
+        async with self._chat_lock:
+            await self._render_stream_chunk(content, reasoning)
+
+    async def _render_stream_chunk(self, content: str, reasoning: str) -> None:
+        """渲染一批流式增量（正文 + 思考），逻辑与原逐 chunk 渲染等价但按批执行。"""
+        chat = self.query_one("#chat-log", Markdown)
+        if not self._stream_active:
+            self._stream_active = True
+            self._answer_started = True
+            await chat.append("\n\n---\n\n**mincli**\n\n")
+        if reasoning:
+            # 思考过程：灰色块引用，位于提问之后、回答之前；
+            # 增量跨批次直接拼接（不按 token 断行）
+            if not self._reasoning_md:
+                md = (
+                    "\n\n> ▼ 思考过程（点击折叠）\n>\n> "
+                    + self._reasoning_chunk_md(reasoning)
+                )
+                self._reasoning_md = md
+                await self._safe_append(chat, md)
+            else:
+                md = self._reasoning_chunk_md(reasoning)
+                self._reasoning_md += md
+                await self._safe_append(chat, md)
+            self._reasoning_text += reasoning
+            self._reasoning_collapsed = False
+        if content:
+            if self._reasoning_md and not self._reasoning_collapsed:
+                # 正文开始 → 自动折叠思考过程
+                await self._collapse_reasoning()
+            if not self._answer_started:
+                self._answer_started = True
+                await self._safe_append(chat, "\n\n**mincli：**\n\n")
+            await self._safe_append(chat, content)
+        self._shrink_lists(chat)
+        chat.scroll_end(animate=False)
 
     async def _handle_event_inner(self, ev: ControllerEvent) -> None:
         chat = self.query_one("#chat-log", Markdown)
@@ -951,37 +1270,6 @@ class ChatApp(App):
                 self._reasoning_md = ""
                 self._reasoning_collapsed = False
                 self._answer_started = False
-        elif ev.kind == "stream":
-            if not self._stream_active:
-                self._stream_active = True
-                self._answer_started = True
-                await chat.append("\n\n---\n\n**mincli**\n\n")
-            if ev.reasoning:
-                # 思考过程：灰色块引用，位于提问之后、回答之前；
-                # 增量跨 chunk 直接拼接（不按 token 断行）
-                if not self._reasoning_md:
-                    md = (
-                        "\n\n> ▼ 思考过程（点击折叠）\n>\n> "
-                        + self._reasoning_chunk_md(ev.reasoning)
-                    )
-                    self._reasoning_md = md
-                    await chat.append(md)
-                else:
-                    md = self._reasoning_chunk_md(ev.reasoning)
-                    self._reasoning_md += md
-                    await chat.append(md)
-                self._reasoning_text += ev.reasoning
-                self._reasoning_collapsed = False
-            if ev.content:
-                if self._reasoning_md and not self._reasoning_collapsed:
-                    # 正文开始 → 自动折叠思考过程
-                    await self._collapse_reasoning()
-                if not self._answer_started:
-                    self._answer_started = True
-                    await chat.append("\n\n**mincli：**\n\n")
-                await chat.append(ev.content)
-            self._shrink_lists(chat)
-            chat.scroll_end(animate=False)
         elif ev.kind == "tool":
             if ev.tool_summary:
                 await chat.append(f"结果：{ev.tool_summary}\n```\n")
@@ -1010,8 +1298,10 @@ class ChatApp(App):
             self._rebuild_tree()
             if node is not None:
                 self._select_tree_node(node.id)
+            self._refresh_usage_bar()
 
     def _append_error(self, message: str) -> None:
+        self._cancel_flush()  # 出错后不再渲染残留流式缓冲
         chat = self.query_one("#chat-log", Markdown)
         chat.append(f"\n\n> ⚠️ {message}\n")
         self._shrink_lists(chat)

@@ -19,10 +19,21 @@ from openai import OpenAI
 from mincli.config import (
     MODEL_V4_FLASH,
     MODEL_V4_PRO,
+    MODELS_AVAILABLE,
+    COMPACT_DEFAULT_KEEP,
+    COMPACT_MAX_TOKENS,
+    COMPACT_SOURCE_MAX_CHARS,
+    COMPACT_REASONING_MAX_CHARS,
+    COMPACT_TOOL_RESULT_MAX_CHARS,
+    load_models,
 )
 from mincli.helpers import (
     convert_formulas,
+    estimate_input_price,
+    estimate_tokens,
     generate_conversation_title,
+    get_balance,
+    is_peak_hour,
     save_conversation_to_file,
 )
 from mincli.models import ConversationNode, ConversationTree
@@ -243,6 +254,11 @@ class ChatController:
         if arg in ("pro", "v4-pro", "p"):
             self.current_model = MODEL_V4_PRO
             return True
+        # 支持注册的自定义模型名 / 完整模型名（如 gpt-4o）
+        registered = load_models()
+        if arg in registered or arg in MODELS_AVAILABLE:
+            self.current_model = arg
+            return True
         return False
 
     def set_thinking(self, on: bool) -> None:
@@ -320,6 +336,202 @@ class ChatController:
         self.tree = ConversationTree(self.current_system)
         self.delete_session_file()
 
+    # ---------------- 上下文压缩 ----------------
+
+    _COMPACT_SYSTEM_INSTR = (
+        "你负责把对话历史压缩成一份详尽、信息密度高的上下文摘要。"
+        "这份摘要将替代原文作为后续对话的背景，因此必须尽可能完整地保留信息，宁可长、不要短。"
+    )
+
+    _COMPACT_PROMPT = """请把下面的对话历史压缩成一份【详尽】的上下文摘要，要求：
+
+1. 按主题组织，使用 Markdown 标题和列表，条理清晰，便于后续检索。
+2. 必须完整保留（不得省略）：
+   - 用户的总体目标、具体需求与每轮提出的问题
+   - 背景事实与关键约束
+   - 已做出的决定与结论
+   - 执行过的命令、涉及的代码/文件路径、关键代码片段要点
+   - 重要的数据、数字、编号、专有名词与 ID
+   - 用户的偏好与风格要求
+   - 尚未解决的问题、待办事项与当前进度
+3. 保留对话所使用的语言（中文对话用中文输出）。
+4. 目标长度约为原文的 1/3 到 1/2，不要刻意精简；信息密度优先，重复内容可合并。
+5. 只输出摘要本身，不要任何解释性开场白。
+
+对话历史：
+{source}"""
+
+    def compact_history(
+        self, keep: int = COMPACT_DEFAULT_KEEP, emit: Optional[EventSink] = None
+    ) -> Optional[dict]:
+        """把当前分支的早期对话压缩成详细摘要（/compact）。
+
+        keep=保留最近 N 轮（含当前节点）的原始内容；0=全部压缩。
+        摘要写入 self.tree.compaction，之后发送消息时自动用摘要替代
+        boundary 及之前节点的原始消息。返回统计信息 dict；无可压缩
+        内容或压缩失败时返回 None。
+
+        统计口径：before/after 均用 estimate_tokens 估算压缩前后「发送给模型
+        的完整消息列表」（与 usage_stats 的 next_input_tokens 同函数、同来源），
+        因此压缩后状态条的「下次输入」会自动等于 after_tokens。
+        """
+        if self.tree is None or self.tree.current_node is None:
+            return None
+        path = self._path_to_root(self.tree.current_node)
+        n = len(path)
+        if keep is None or keep < 0:
+            keep = COMPACT_DEFAULT_KEEP
+        if n - keep < 1:
+            return None  # 对话太短，没有可压缩的轮次
+        boundary = path[n - keep - 1]   # 最后一个被压缩进摘要的节点
+        to_compress = path[: n - keep]  # 被压缩进摘要的节点（含 boundary）
+
+        source = self._build_compact_source(to_compress)
+        if len(source) > COMPACT_SOURCE_MAX_CHARS:
+            half = COMPACT_SOURCE_MAX_CHARS // 2
+            source = (
+                source[:half]
+                + f"\n\n…（原文过长，中间 {len(source) - COMPACT_SOURCE_MAX_CHARS} 字符已省略）…\n\n"
+                + source[-half:]
+            )
+
+        if emit:
+            emit(ControllerEvent.status(
+                f"正在压缩上下文：{len(to_compress)} 轮 → 详细摘要（保留最近 {keep} 轮原文）…"
+            ))
+
+        summary = self._call_summarize(source)
+        if not summary:
+            return None
+
+        before_msgs = self.tree.get_messages_for_node(self.tree.current_node)
+        self.tree.compaction = {
+            "summary": summary,
+            "boundary_id": boundary.id,
+            "next_input_tokens": 0,  # 占位，下面填充
+        }
+        after_msgs = self.tree.get_messages_for_node(self.tree.current_node)
+        before_tok = estimate_tokens(before_msgs)
+        after_tok = estimate_tokens(after_msgs)
+        # 让状态条「下次输入」在压缩后直接采用压缩报告口径（与 after_tokens 严格一致）
+        self.tree.compaction["next_input_tokens"] = after_tok
+
+        return {
+            "summary": summary,
+            "boundary_id": boundary.id,
+            "nodes_compressed": len(to_compress),
+            "nodes_kept": keep,
+            "summary_chars": len(summary),
+            "before_tokens": before_tok,
+            "after_tokens": after_tok,
+            "saved_tokens": max(0, before_tok - after_tok),
+        }
+
+    def clear_compaction(self) -> bool:
+        """清除上下文压缩摘要（/compact off），恢复完整原始消息。"""
+        return self.tree.clear_compaction() if self.tree else False
+
+    # ---------------- 实时用量统计（输入栏状态条） ----------------
+
+    def usage_stats(self) -> dict:
+        """输入栏状态条数据（纯本地计算，不联网）。
+
+        缓存命中率取当前节点累计的 usage.prompt_cache_hit/miss_tokens。
+        「下一次输入」token 量采用与相邻数据直接对应的口径：
+        - 未压缩：= 本节点 input_tokens + output_tokens（API 真实口径，
+          即「上次完整输入 + 本节点输出」，与对话结束显示的输入/输出严格对应）；
+        - 已压缩：= 压缩报告 after_tokens（压缩时存储），与 /compact
+          报告的数字严格一致，直观体现压缩节省；
+        用户新输入内容量小，忽略不计。预计价格按 DeepSeek 峰谷分时定价
+        × 缓存命中率折算。
+        """
+        stats: dict = {
+            "cache_hit_rate": None,
+            "next_input_tokens": 0,
+            "estimated_price": None,
+            "peak": is_peak_hour(),
+            "model": self.current_model,
+        }
+        node = self.tree.current_node if self.tree else None
+        if node is None:
+            return stats
+        hit = node.cache_hit_tokens
+        miss = node.cache_miss_tokens
+        total = hit + miss
+        if total > 0:
+            stats["cache_hit_rate"] = hit / total
+        comp = self.tree.compaction
+        if comp and comp.get("next_input_tokens"):
+            next_in = comp["next_input_tokens"]
+        else:
+            next_in = node.input_tokens + node.output_tokens
+        stats["next_input_tokens"] = next_in
+        stats["estimated_price"] = estimate_input_price(
+            self.current_model, next_in, stats["cache_hit_rate"], stats["peak"]
+        )
+        return stats
+
+    def fetch_balance(self) -> Optional[dict]:
+        """拉取 DeepSeek 账户余额（网络请求，调用方应放入后台线程）。
+
+        返回 balance_infos 中的一项（优先 CNY）；失败返回 None。
+        """
+        infos = get_balance(self.client)
+        if not infos:
+            return None
+        for info in infos:
+            if info.get("currency") == "CNY":
+                return info
+        return infos[0]
+
+    def _path_to_root(self, node: ConversationNode) -> List[ConversationNode]:
+        path: List[ConversationNode] = []
+        cur: Optional[ConversationNode] = node
+        while cur is not None:
+            path.append(cur)
+            cur = self.tree.nodes.get(cur.parent_id) if cur.parent_id else None
+        path.reverse()
+        return path
+
+    def _build_compact_source(self, nodes: List[ConversationNode]) -> str:
+        parts = []
+        for i, node in enumerate(nodes, start=1):
+            title = (node.title or "").strip()
+            head = f"--- 第 {i} 轮（节点 {node.id}）{('：' + title) if title else ''} ---"
+            parts.append(head)
+            parts.append(f"用户: {node.user_msg}")
+            for tm in node.tool_messages:
+                if tm.get("role") == "tool":
+                    content = str(tm.get("content", ""))[:COMPACT_TOOL_RESULT_MAX_CHARS]
+                    parts.append(f"工具结果: {content}")
+            if node.reasoning:
+                parts.append(f"思考过程: {node.reasoning[:COMPACT_REASONING_MAX_CHARS]}")
+            if node.assistant_msg:
+                parts.append(f"回答: {node.assistant_msg}")
+        return "\n\n".join(parts)
+
+    def _call_summarize(self, source: str) -> str:
+        """调用模型生成详尽摘要；成功返回摘要文本，失败返回空串。"""
+        messages = [
+            {"role": "system", "content": self._COMPACT_SYSTEM_INSTR},
+            {"role": "user", "content": self._COMPACT_PROMPT.format(source=source)},
+        ]
+        for max_tokens in (COMPACT_MAX_TOKENS, 4096):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.current_model,
+                    messages=messages,
+                    temperature=0.4,
+                    max_tokens=max_tokens,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                if content:
+                    return content
+            except Exception:
+                continue
+        return ""
+
     def _cleanup_temp_files(self, keep_ids: Optional[set] = None) -> None:
         for nid, filepath in list(self.temp_files.items()):
             if keep_ids is None or nid not in keep_ids:
@@ -361,6 +573,8 @@ class ChatController:
         accumulated_reasoning = ""
         accumulated_in_tok = 0
         accumulated_out_tok = 0
+        accumulated_cache_hit = 0
+        accumulated_cache_miss = 0
         tool_messages: List[Dict] = []
 
         try:
@@ -386,6 +600,8 @@ class ChatController:
                     accumulated_reasoning += reasoning
                 accumulated_in_tok += sr.input_tokens
                 accumulated_out_tok += sr.output_tokens
+                accumulated_cache_hit += sr.cache_hit_tokens
+                accumulated_cache_miss += sr.cache_miss_tokens
 
                 if sr.tool_calls:
                     assistant_msg: Dict[str, Any] = {
@@ -450,6 +666,8 @@ class ChatController:
         node.reasoning = accumulated_reasoning
         node.input_tokens = accumulated_in_tok
         node.output_tokens = accumulated_out_tok
+        node.cache_hit_tokens = accumulated_cache_hit
+        node.cache_miss_tokens = accumulated_cache_miss
         node.title = title
         if tool_messages:
             node.tool_messages = tool_messages
@@ -515,7 +733,8 @@ class ChatController:
                 (
                     nid
                     for nid in self.tree.nodes
-                    if nid.startswith(root) and self.tree.nodes[nid].parent_id == "main"
+                    if self.tree._node_letter_prefix(nid) == root
+                    and self.tree.nodes[nid].parent_id == "main"
                 ),
                 None,
             )
@@ -653,7 +872,8 @@ class ChatController:
                 (
                     nid
                     for nid in self.tree.nodes
-                    if nid.startswith(prefix) and self.tree.nodes[nid].parent_id == "main"
+                    if self.tree._node_letter_prefix(nid) == prefix
+                    and self.tree.nodes[nid].parent_id == "main"
                 ),
                 None,
             )

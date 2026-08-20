@@ -38,13 +38,19 @@ def stream_response(
     reasoning_text = ""
     usage_input = 0
     usage_output = 0
+    usage_cache_hit = 0
+    usage_cache_miss = 0
     accumulated_tool_calls: Dict[int, Dict] = {}
 
     def _process_chunk(chunk):
         nonlocal full_content, reasoning_text, usage_input, usage_output
+        nonlocal usage_cache_hit, usage_cache_miss
         if getattr(chunk, "usage", None):
             usage_input = chunk.usage.prompt_tokens
             usage_output = chunk.usage.completion_tokens
+            # DeepSeek 上下文缓存统计（usage.prompt_cache_hit/miss_tokens）
+            usage_cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
+            usage_cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
         delta = chunk.choices[0].delta
         content_delta = delta.content or ""
         reasoning_delta = getattr(delta, "reasoning_content", None) or ""
@@ -98,6 +104,8 @@ def stream_response(
                 reasoning=reasoning_text,
                 input_tokens=usage_input,
                 output_tokens=usage_output,
+                cache_hit_tokens=usage_cache_hit,
+                cache_miss_tokens=usage_cache_miss,
             )
 
         if usage_input == 0 and usage_output == 0:
@@ -114,6 +122,8 @@ def stream_response(
             reasoning=reasoning_text,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_hit_tokens=usage_cache_hit,
+            cache_miss_tokens=usage_cache_miss,
         )
 
     except Exception as e:

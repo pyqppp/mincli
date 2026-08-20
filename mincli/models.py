@@ -1,7 +1,8 @@
 import re
+import itertools
 import datetime
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Iterator
 
 
 @dataclass
@@ -10,6 +11,9 @@ class StreamResult:
     reasoning: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
+    # DeepSeek usage：上下文缓存命中/未命中的输入 token 数
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     tool_calls: Optional[List[Dict]] = None
     error: str = ""
 
@@ -24,6 +28,9 @@ class ConversationNode:
     title: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    # 本节点各次 API 请求的上下文缓存统计（DeepSeek usage 字段）
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     children: List['ConversationNode'] = field(default_factory=list)
     cached_messages: Optional[List[Dict]] = None
     tool_messages: List[Dict] = field(default_factory=list)
@@ -60,6 +67,8 @@ class ConversationNode:
             "title": self.title,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cache_hit_tokens": self.cache_hit_tokens,
+            "cache_miss_tokens": self.cache_miss_tokens,
             "tool_messages": self.tool_messages,
         }
 
@@ -74,8 +83,27 @@ class ConversationNode:
             title=data["title"],
             input_tokens=data["input_tokens"],
             output_tokens=data["output_tokens"],
+            cache_hit_tokens=data.get("cache_hit_tokens", 0),
+            cache_miss_tokens=data.get("cache_miss_tokens", 0),
             tool_messages=data.get("tool_messages", []),
         )
+
+
+_ID_ALPHABET_LOWER = "abcdefghijklmnopqrstuvwxyz"
+_ID_ALPHABET_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# 压缩摘要注入消息时的固定前缀（标记该消息为历史摘要，便于模型理解）
+COMPACTION_PREFIX = "【以下是本对话早期内容的详细摘要，原文已压缩（如需某处细节可追问展开）】\n\n"
+
+
+def _iter_id_prefixes() -> Iterator[str]:
+    """节点字母前缀序列：a-z → A-Z → aa-az, ba-bz … za-zz → AA-ZZ → aaa …"""
+    length = 1
+    while True:
+        for alphabet in (_ID_ALPHABET_LOWER, _ID_ALPHABET_UPPER):
+            for combo in itertools.product(alphabet, repeat=length):
+                yield "".join(combo)
+        length += 1
 
 
 class ConversationTree:
@@ -86,12 +114,16 @@ class ConversationTree:
         self.root: Optional[ConversationNode] = None
         self.current_node: Optional[ConversationNode] = None
         self.subtree_titles: Dict[str, str] = {}
+        # 上下文压缩：{"summary": str, "boundary_id": str, "next_input_tokens": int}。
+        # boundary_id 为最后一个被压缩进摘要的节点；其后（含其后分支）仍按原文发送；
+        # next_input_tokens 为压缩报告 after_tokens（状态条「下次输入」压缩后采用）。
+        self.compaction: Optional[Dict[str, Any]] = None
 
     def _generate_child_id(self, parent: ConversationNode) -> str:
         used_ids = set(self.nodes.keys())
 
         if not parent.children:
-            match = re.match(r'^([a-z]+)(\d+)$', parent.id)
+            match = re.match(r'^([A-Za-z]+)(\d+)$', parent.id)
             if match:
                 prefix = match.group(1)
                 num = int(match.group(2)) + 1
@@ -107,24 +139,25 @@ class ConversationTree:
                     candidate = f"a{num}"
                 return candidate
 
-        used_letters = set()
+        used_prefixes = set()
         for nid in used_ids:
-            match = re.match(r'^([a-z]+)\d+$', nid)
+            match = re.match(r'^([A-Za-z]+)\d+$', nid)
             if match:
-                used_letters.add(match.group(1))
+                used_prefixes.add(match.group(1))
 
-        for letter in range(ord('a'), ord('z') + 1):
-            l = chr(letter)
-            if l not in used_letters:
-                candidate = f"{l}1"
-                if candidate not in used_ids:
-                    return candidate
-                num = 2
-                while f"{l}{num}" in used_ids:
+        for prefix in _iter_id_prefixes():
+            if prefix not in used_prefixes:
+                num = 1
+                while f"{prefix}{num}" in used_ids:
                     num += 1
-                return f"{l}{num}"
+                return f"{prefix}{num}"
 
         return f"z_{datetime.datetime.now().strftime('%H%M%S')}"
+
+    def _node_letter_prefix(self, node_id: str) -> Optional[str]:
+        """返回节点 ID 的字母前缀（如 'a1'→'a'、'ab1'→'ab'），非分支节点返回 None。"""
+        match = re.match(r'^([A-Za-z]+)\d+$', node_id)
+        return match.group(1) if match else None
 
     def create_root(self, user_msg: str, assistant_msg: str, reasoning: str,
                     title: str, input_tokens: int, output_tokens: int) -> ConversationNode:
@@ -160,8 +193,39 @@ class ConversationTree:
         return node
 
     def get_messages_for_node(self, node: ConversationNode) -> List[Dict]:
+        """构建发送给 LLM 的消息（含 system）。
+
+        若存在压缩摘要且 node 位于压缩边界（boundary）上或其后，
+        则用摘要替换 boundary 及之前全部节点的原始消息，仅保留 boundary
+        之后的原始消息，从而缩短上下文。
+        """
         msgs = node.get_messages(self)
+        comp = self.compaction
+        if comp and comp.get("boundary_id"):
+            boundary = self.nodes.get(comp["boundary_id"])
+            if boundary is not None and self._is_at_or_after(node, boundary.id):
+                raw_prefix = boundary.get_messages(self)
+                summary_block = [
+                    {"role": "user", "content": COMPACTION_PREFIX + comp["summary"]}
+                ]
+                msgs = summary_block + msgs[len(raw_prefix):]
         return [{"role": "system", "content": self.system_prompt}] + msgs
+
+    def _is_at_or_after(self, node: ConversationNode, ancestor_id: str) -> bool:
+        """node 是否位于 ancestor_id 所在节点上或其下游（含该节点自身）。"""
+        cur: Optional[ConversationNode] = node
+        while cur is not None:
+            if cur.id == ancestor_id:
+                return True
+            cur = self.nodes.get(cur.parent_id) if cur.parent_id else None
+        return False
+
+    def clear_compaction(self) -> bool:
+        """清除压缩摘要，恢复发送完整原始消息。返回是否真的清除了。"""
+        if self.compaction:
+            self.compaction = None
+            return True
+        return False
 
     def switch_to_node(self, node_id: str) -> bool:
         if node_id in self.nodes:
@@ -209,12 +273,12 @@ class ConversationTree:
             if not parent:
                 return None
             node = parent
-        match = re.match(r'^([a-z]+)', node.id)
+        match = re.match(r'^([A-Za-z]+)', node.id)
         return match.group(1) if match else None
 
     def count_subtree_nodes(self, prefix: str) -> int:
         root_id = next((nid for nid in self.nodes
-                        if nid.startswith(prefix)
+                        if self._node_letter_prefix(nid) == prefix
                         and self.nodes[nid].parent_id == "main"), None)
         if not root_id:
             return 0
@@ -224,7 +288,7 @@ class ConversationTree:
 
     def get_subtree_branches(self, prefix: str) -> List[str]:
         root_id = next((nid for nid in self.nodes
-                        if nid.startswith(prefix)
+                        if self._node_letter_prefix(nid) == prefix
                         and self.nodes[nid].parent_id == "main"), None)
         if not root_id:
             return []
@@ -232,9 +296,9 @@ class ConversationTree:
         self._collect_descendants(self.nodes[root_id], descendants)
         branches = set()
         for nid in descendants:
-            m = re.match(r'^([a-z]+)', nid)
-            if m and m.group(1) != prefix:
-                branches.add(m.group(1))
+            p = self._node_letter_prefix(nid)
+            if p and p != prefix:
+                branches.add(p)
         return sorted(branches)
 
     def render_tree(self, highlight_id: Optional[str] = None,
@@ -325,6 +389,7 @@ class ConversationTree:
             "root_id": self.root.id if self.root else None,
             "current_node_id": self.current_node.id if self.current_node else None,
             "subtree_titles": self.subtree_titles,
+            "compaction": self.compaction,
         }
 
     @classmethod
@@ -345,4 +410,5 @@ class ConversationTree:
         if current_id:
             tree.current_node = tree.nodes.get(current_id)
         tree.subtree_titles = data.get("subtree_titles", {})
+        tree.compaction = data.get("compaction")
         return tree
