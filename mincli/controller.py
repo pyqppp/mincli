@@ -25,6 +25,7 @@ from mincli.config import (
     COMPACT_SOURCE_MAX_CHARS,
     COMPACT_REASONING_MAX_CHARS,
     COMPACT_TOOL_RESULT_MAX_CHARS,
+    EXEC_DEFAULT_TIMEOUT,
     load_models,
 )
 from mincli.helpers import (
@@ -38,7 +39,7 @@ from mincli.helpers import (
 )
 from mincli.models import ConversationNode, ConversationTree
 from mincli.streaming import stream_response
-from mincli.tools.execute import audit_command, matches_dangerous
+from mincli.tools.execute import audit_command, is_safe_readonly, matches_dangerous
 from mincli.tools.file_ops import parse_file
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage
@@ -128,6 +129,8 @@ class ChatController:
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
         self.audit_level: int = 1
+        # 命令执行默认工作目录（/set workspace 设置；None 时用 mincli 启动目录）
+        self.workspace: Optional[str] = None
 
         self.tree = ConversationTree(default_system)
 
@@ -190,6 +193,7 @@ class ChatController:
                 "thinking_enabled": self.thinking_enabled,
                 "reasoning_effort": self.reasoning_effort,
                 "audit_level": self.audit_level,
+                "workspace": self.workspace,
                 "tree": self.tree.to_dict(),
                 "imported_content": self.imported_content,
             }
@@ -219,6 +223,7 @@ class ChatController:
         self.thinking_enabled = data.get("thinking_enabled", False)
         self.reasoning_effort = data.get("reasoning_effort", "high")
         self.audit_level = data.get("audit_level", 1)
+        self.workspace = data.get("workspace") or None
 
         tree_data = data.get("tree")
         if tree_data:
@@ -275,6 +280,16 @@ class ChatController:
             self.audit_level = level
             return True
         return False
+
+    def set_workspace(self, path: str) -> bool:
+        """设置命令执行默认工作目录（不存在则创建）。"""
+        path = os.path.expanduser(path.strip())
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            return False
+        self.workspace = os.path.abspath(path)
+        return True
 
     # ---------------- 导入 / 导出 ----------------
 
@@ -823,38 +838,67 @@ class ChatController:
 
     def _execute_command_tool(self, args: dict, emit: EventSink) -> str:
         command = args.get("command", "")
-        timeout = args.get("timeout", 30)
-        call_args = {"command": command, "timeout": timeout}
+        timeout = args.get("timeout", EXEC_DEFAULT_TIMEOUT)
+        # 工作目录优先级：模型显式 cwd > /set workspace > 启动目录（服务端兜底）
+        cwd = args.get("cwd") or self.workspace or None
+        call_args: Dict[str, Any] = {"command": command, "timeout": timeout}
+        for key in ("cwd", "env", "shell", "max_output"):
+            if args.get(key) is not None:
+                call_args[key] = args[key]
+        if self.workspace and not call_args.get("cwd"):
+            call_args["cwd"] = self.workspace
         mcp_call = (
             (lambda: self._mcp.call("execute_command", call_args))
             if self._mcp is not None and "execute_command" in self._mcp_tool_names
             else (lambda: "执行命令工具不可用")
         )
 
+        def _ctx_line() -> str:
+            parts = [f"工作目录: {cwd or '（启动目录）'}"]
+            if args.get("shell") and args["shell"] != "sh":
+                parts.append(f"shell: {args['shell']}")
+            return " | ".join(parts)
+
         if self.audit_level == 4:
             emit(ControllerEvent.status("▸ execute_command（无审核）"))
             return mcp_call()
-        if self.audit_level == 3:
-            if matches_dangerous(command):
-                if self.confirm("高危命令", f"命令: {command}\n\n⚠️ 匹配到高危命令模式，确认执行？"):
-                    return mcp_call()
-                return "用户未确认执行此命令"
-            emit(ControllerEvent.status("▸ execute_command（文本审核通过）"))
-            return mcp_call()
-        if self.audit_level == 2:
-            level, desc, risk, audit_reasoning = audit_command(self.client, command)
-            if level <= 2:
-                emit(ControllerEvent.status(f"▸ {desc}（等级{level}/5，自动执行）"))
-                return mcp_call()
-            risk_text = f"\n⚠️ {risk}" if risk else ""
-            if self.confirm("执行确认", f"命令: {command}\n\n审核: 等级 {level}/5 | {desc}{risk_text}"):
+
+        # 高危硬门：命中正则模式时，任何审核级别（除无审核）都强制用户确认
+        if matches_dangerous(command):
+            if self.confirm(
+                "高危命令",
+                f"命令: {command}\n\n⚠️ 匹配到高危命令模式，确认执行？\n{_ctx_line()}",
+            ):
                 return mcp_call()
             return "用户未确认执行此命令"
+
+        if self.audit_level == 3:
+            emit(ControllerEvent.status("▸ execute_command（文本审核通过）"))
+            return mcp_call()
+
+        # 只读快速通道：无副作用命令跳过 AI 审核（level-1 仍确认，level-2 自动执行）
+        if is_safe_readonly(command):
+            if self.audit_level == 2:
+                emit(ControllerEvent.status(f"▸ {command[:60]}（只读命令，自动执行）"))
+                return mcp_call()
+            if self.confirm(
+                "执行确认",
+                f"命令: {command}\n\n审核: 只读命令快速通道（无副作用）\n{_ctx_line()}",
+            ):
+                return mcp_call()
+            return "用户未确认执行此命令"
+
         level, desc, risk, audit_reasoning = audit_command(self.client, command)
         if audit_reasoning:
             emit(ControllerEvent.status(f"🧠 审核思考: {audit_reasoning}"))
         risk_text = f"\n⚠️ {risk}" if risk else ""
-        if self.confirm("执行确认", f"命令: {command}\n\n审核: 等级 {level}/5 | {desc}{risk_text}"):
+        if self.audit_level == 2 and level <= 2:
+            emit(ControllerEvent.status(f"▸ {desc}（等级{level}/5，自动执行）"))
+            return mcp_call()
+        if self.confirm(
+            "执行确认",
+            f"命令: {command}\n\n审核: 等级 {level}/5 | {desc}{risk_text}\n{_ctx_line()}",
+        ):
             return mcp_call()
         return "用户未确认执行此命令"
 

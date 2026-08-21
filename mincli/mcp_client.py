@@ -9,7 +9,7 @@ from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from mincli.config import load_mcp_servers
+from mincli.config import EXEC_MAX_TIMEOUT, load_mcp_servers
 
 # 静默 MCP SDK 的会话终止告警（部分远程 server 不支持 DELETE 会话终止，
 # 关闭时会产生 "Session termination failed: 400/404" 噪音，不影响功能）
@@ -17,7 +17,9 @@ logging.getLogger("mcp").setLevel(logging.ERROR)
 
 BUNDLED_NAME = "mincli"
 CONNECT_TIMEOUT = 15
-CALL_TIMEOUT = 120
+# 客户端调用超时须大于服务端 execute_command 的 timeout 上限（EXEC_MAX_TIMEOUT），
+# 否则命令的“超时返回部分输出”路径会被客户端提前截断成“工具调用失败”
+CALL_TIMEOUT = EXEC_MAX_TIMEOUT + 30
 
 
 def _frozen() -> bool:

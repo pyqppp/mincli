@@ -59,6 +59,13 @@ BALANCE_REFRESH_SECONDS = 60
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 2.0
 
+# 命令执行工具（execute_command）
+EXEC_DEFAULT_TIMEOUT = 30          # 未传 timeout 时的默认截止时间（秒）
+EXEC_MAX_TIMEOUT = 120             # timeout 上限（与 MCP 客户端调用超时对齐，见 mcp_client.CALL_TIMEOUT）
+EXEC_DEFAULT_MAX_OUTPUT = 8000     # 输出截断上限（字符），超出时保留首尾并落盘完整输出
+EXEC_MAX_OUTPUT = 50_000           # max_output 参数允许的最大值
+EXEC_ALLOWED_SHELLS = ("sh", "bash", "zsh")
+
 MCP_CONFIG_PATH = os.path.expanduser(
     os.getenv("MINCLI_MCP_CONFIG", "~/.mincli/mcp_servers.json")
 )

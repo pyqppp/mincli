@@ -1,7 +1,9 @@
 import asyncio
+from typing import Dict, Optional
 
 from mcp.server import MCPServer
 
+from mincli.config import EXEC_DEFAULT_MAX_OUTPUT, EXEC_DEFAULT_TIMEOUT
 from mincli.tools.file_ops import (
     parse_file, list_directory as _list_directory,
     write_file_content, edit_file_content,
@@ -67,14 +69,28 @@ async def edit_file(filepath: str, old_string: str, new_string: str) -> str:
 
 
 @mcp.tool()
-async def execute_command(command: str, timeout: int) -> str:
-    """在用户电脑上执行 shell 命令。每个命令在执行前会经过 AI 安全审核和用户确认。默认工作目录为用户家目录。注意：若预计输出很长，请在命令中关闭输出（如追加 >/dev/null 2>&1）以节省 token。必须设置 deadline（timeout 参数），超时后命令将被强制终止，但会返回已产生的部分输出
+async def execute_command(
+    command: str,
+    timeout: int = EXEC_DEFAULT_TIMEOUT,
+    cwd: str = "",
+    env: Optional[Dict[str, str]] = None,
+    shell: str = "sh",
+    max_output: int = EXEC_DEFAULT_MAX_OUTPUT,
+) -> str:
+    """在用户电脑上执行 shell 命令。每个命令在执行前会经过 AI 安全审核和用户确认；命中高危模式的命令（如 rm -rf /、dd 写磁盘、curl|bash 等）无论审核结果如何都会强制要求用户确认。命令以非交互方式运行（stdin 已关闭），交互式命令（vim、ssh、python REPL 等）会因无输入而立即结束。默认工作目录为 mincli 启动目录（可用 /set workspace 修改，也可用 cwd 参数临时指定）。若预计输出很长，请在命令中限制输出（如追加 | head、>/dev/null）以节省 token
 
     Args:
-        command: 要执行的 shell 命令
-        timeout: 执行截止时间（秒）。必须设置，超时后命令会被强制终止，已产生的部分输出仍会返回
+        command: 要执行的 shell 命令（可用 && 串联多条）
+        timeout: 执行截止时间（秒），默认 30，上限 120。超时后整个进程组会被强制终止，已产生的部分输出仍会返回
+        cwd: 可选。工作目录（绝对路径或 ~ 开头）；留空时使用 /set workspace 设置的目录，未设置则用 mincli 启动目录
+        env: 可选。额外环境变量字典，如 {"PATH": "/usr/local/bin:..."}，叠加到当前环境
+        shell: 可选。使用的 shell：sh、bash 或 zsh，默认 sh
+        max_output: 可选。输出截断上限（字符），默认 8000；超出时保留首尾并写入 /tmp 临时文件，路径随结果返回
     """
-    return await asyncio.to_thread(_execute_command, command, timeout)
+    return await asyncio.to_thread(
+        _execute_command, command, timeout,
+        cwd=cwd, env=env or None, shell=shell, max_output=max_output,
+    )
 
 
 def main() -> None:

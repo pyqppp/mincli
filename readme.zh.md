@@ -175,6 +175,8 @@ mincli chat --help
 | `/set model <flash\|pro>` | 切换模型 |
 | `/set thinking <on\|off>` | 开关思考模式 |
 | `/set effort <low\|high\|max>` | 推理强度 |
+| `/set audit <1-4>` | 命令审核层级（1=AI审核+确认 / 2=低风险自动 / 3=文本匹配 / 4=无审核） |
+| `/set workspace <路径>` | 命令执行默认工作目录（默认 mincli 启动目录） |
 | `/set show` | 显示当前配置 |
 | `/mcp list` | 显示 MCP server 配置与连接状态 |
 | `/mcp add <名称> <命令> [参数...] [--header 'K: V']` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加，`--header` 用于远程 server 的鉴权请求头 |
@@ -207,9 +209,21 @@ AI 在对话中视需要自主调用以下工具：
 | `list_directory` | 列出目录内容 | `directory`; `show_hidden`（可选） |
 | `write_file` | 写入/覆盖文件（需用户确认） | `filepath`; `content` |
 | `edit_file` | 搜索替换文件内容（需用户确认） | `filepath`; `old_string`; `new_string` |
-| `execute_command` | 执行 Shell 命令（AI 审核 + 用户确认） | `command`; `timeout` |
+| `execute_command` | 执行 Shell 命令（AI 审核 + 用户确认） | `command`; `timeout`; `cwd`; `env`; `shell`; `max_output`（除 `command` 外均可选） |
 | `query_conversation_tree` | 查询对话树结构（内存内，不走 MCP） | `root`; `search`（可选） |
 | `read_conversation_nodes` | 读取对话节点内容（内存内，不走 MCP） | `node_ids` |
+
+### 命令执行工具（execute_command）
+
+`execute_command` 让 AI 在你的电脑上执行 shell 命令，带多层安全与可用性设计：
+
+- **审核分级**（`/set audit <1-4>`）：默认 1 = AI 审核 + 用户确认；2 = AI 审核、低风险自动执行；3 = 仅文本匹配；4 = 直接执行。
+- **高危硬门**：命中高危模式（`rm -rf /`、`dd` 写磁盘、`curl|bash`、`git push --force`、`pkill` 等）时，除「无审核」外一律强制用户确认，不受 AI 评级影响。
+- **只读快速通道**：无 shell 元字符的纯只读命令（`ls`、`cat`、`pwd` 等）跳过 AI 审核（省时省 token）；level-1 仍会确认，level-2 自动执行。
+- **审核缓存**：同一命令在一次会话内只审核一次，重复执行直接复用结果。
+- **工作目录**：默认是 mincli 启动目录；可用 `/set workspace <路径>` 持久化修改，AI 也可用 `cwd` 参数临时指定。
+- **可调参数**：`timeout`（默认 30s、上限 120s，超时终止整个进程组并返回部分输出）、`shell`（sh/bash/zsh）、`env`（额外环境变量）、`max_output`（输出截断上限，默认 8000 字符，超限保留首尾并把完整输出写入 `/tmp/mincli_exec_*.txt` 供 `read_file` 读取）。
+- **非交互执行**：命令 stdin 已关闭（防止 vim/ssh 等交互命令破坏 TUI 或挂死）。
 
 ---
 

@@ -70,7 +70,7 @@ COMMAND_HELP: dict[str, str] = {
     "/view": "用编辑器打开当前回答",
     "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
     "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
-    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set show\n修改运行配置",
+    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set show\n修改运行配置",
     "/tree": "显示完整对话树",
     "/info": "用法: /info [节点ID]\n查看节点详情（默认当前节点）",
     "/up": "返回父节点",
@@ -739,6 +739,7 @@ class ChatApp(App):
 - `/set thinking <on|off>` — 开关思考模式
 - `/set effort <low|high|max>` — 推理强度
 - `/set audit <1-4>` — 审核层级
+- `/set workspace <路径>` — 命令执行默认工作目录（默认 mincli 启动目录）
 - `/set show` — 显示当前配置
 
 **多模型**
@@ -764,7 +765,7 @@ class ChatApp(App):
     async def _cmd_set(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         ctrl = self.ctrl
-        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set show"
+        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set show"
         if len(parts) < 2:
             self.notify(usage, severity="warning")
             return
@@ -810,6 +811,16 @@ class ChatApp(App):
                     self.notify("审核层级须为 1-4", severity="warning")
             except ValueError:
                 self.notify("审核层级须为数字 1-4", severity="warning")
+        elif sub == "workspace" and len(parts) == 3:
+            path = os.path.expanduser(parts[2])
+            if ctrl.set_workspace(path):
+                self.notify(f"命令工作目录已设置为: {ctrl.workspace}")
+            else:
+                self.notify(f"无法创建/访问目录: {path}", severity="error")
+        elif sub == "workspace" and len(parts) == 2:
+            self.notify(
+                f"当前命令工作目录: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}"
+            )
         elif sub == "show":
             ctrl = self.ctrl
             lines = [
@@ -820,6 +831,7 @@ class ChatApp(App):
                 f"- **模型**: {ctrl.current_model}",
                 f"- **思考模式**: {'开' if ctrl.thinking_enabled else '关'} | 推理强度: {ctrl.reasoning_effort}",
                 f"- **审核层级**: {ctrl.audit_level} - {AUDIT_LABELS[ctrl.audit_level]}",
+                f"- **命令工作目录**: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}",
             ]
             if ctrl.tree.current_node:
                 lines.append(f"- **当前节点**: {ctrl.tree.current_node.id} ({ctrl.tree.current_node.title})")
