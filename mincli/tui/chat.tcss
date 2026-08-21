@@ -116,6 +116,19 @@ ChatInput {
     }
 }
 
+/* 待发送图片提示行（输入框下方、状态条上方；有图时显示） */
+#pending-images {
+    display: none;
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: $surface;
+    border-top: solid $border-blurred;
+}
+#pending-images.visible {
+    display: block;
+}
+
 /* 命令补全/提示弹窗（输入框上方，仅输入 "/" 开头命令时显示） */
 #cmd-popup {
     display: none;

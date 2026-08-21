@@ -23,7 +23,8 @@
 - 💾 **会话自动保存** — 退出自动保存，下次启动恢复
 - 📄 **导出 Markdown** — `/save` 将节点对话导出为 `.md` 文件
 - ⚙️ **动态配置** — `/set` 命令随时修改系统提示词、温度、模型、思考开关、推理强度
-- 🧩 **双模型** — `deepseek-v4-flash`（轻量快速）和 `deepseek-v4-pro`（旗舰性能）
+- 🧩 **三模型** — `deepseek-v4-flash`（轻量快速）、`deepseek-v4-pro`（旗舰性能）、`deepseek-v4-flash-vision-exp`（多模态图像理解）
+- 🖼️ **多模态（图片理解）** — `/img` 或 `/import 图片` 附带图片提问（本地文件自动上传 Files API，跨轮复用 file_id；上传失败自动回退 base64 内联；图片消息自动切换视觉模型）
 - 📊 **实时用量状态条** — 输入栏下方两分栏实时显示：缓存命中率、账户余额、下一次输入 token 估算与预计价格（按 DeepSeek 峰谷分时定价折算）
 
 ---
@@ -172,17 +173,21 @@ mincli chat --help
 | `/compact off` | 清除压缩摘要，恢复发送完整原始消息 |
 | `/set system <内容>` | 修改系统提示词 |
 | `/set temp <数值>` | 修改温度 |
-| `/set model <flash\|pro>` | 切换模型 |
+| `/set model <flash\|pro\|vision\|模型名>` | 切换模型（vision = `deepseek-v4-flash-vision-exp` 图像理解模型） |
 | `/set thinking <on\|off>` | 开关思考模式 |
 | `/set effort <low\|high\|max>` | 推理强度 |
 | `/set audit <1-4>` | 命令审核层级（1=AI审核+确认 / 2=低风险自动 / 3=文本匹配 / 4=无审核） |
 | `/set workspace <路径>` | 命令执行默认工作目录（默认 mincli 启动目录） |
+| `/set detail <low\|auto\|high\|original>` | 图片清晰度（low 缩放 512² 更省 token；auto≈original 保留原图最清晰） |
 | `/set show` | 显示当前配置 |
 | `/mcp list` | 显示 MCP server 配置与连接状态 |
 | `/mcp add <名称> <命令> [参数...] [--header 'K: V']` | 添加第三方 MCP server（本地命令）；第二参数为 `http(s)://` 地址时按远程 server 添加，`--header` 用于远程 server 的鉴权请求头 |
 | `/mcp remove <名称>` | 移除第三方 MCP server（需确认） |
 | `/mcp reload` | 重新加载 MCP server 配置 |
-| `/import <路径或URL>` | 导入文件（txt/md/py/csv/pdf/docx）或抓取网页 |
+| `/import <路径或URL>` | 导入文件（txt/md/py/csv/pdf/docx）或抓取网页；**图片文件（jpg/png/gif/webp）自动转为待发送图片** |
+| `/img <路径或URL> [...]` | 添加待发送图片（多图可一次添加；`/img clear` 清除；发送时自动附带并切换视觉模型） |
+| `/files list` | 列出 Files API 已上传的图片文件（ID/文件名/大小/过期） |
+| `/files delete <ID>` | 删除一个已上传的图片文件 |
 | `/<节点ID>`（如 `/a3`） | 直接跳转到指定节点 |
 | `/tree` | 列出所有节点 |
 | `/info [节点ID]` | 查看节点详情 |
@@ -224,6 +229,49 @@ AI 在对话中视需要自主调用以下工具：
 - **工作目录**：默认是 mincli 启动目录；可用 `/set workspace <路径>` 持久化修改，AI 也可用 `cwd` 参数临时指定。
 - **可调参数**：`timeout`（默认 30s、上限 120s，超时终止整个进程组并返回部分输出）、`shell`（sh/bash/zsh）、`env`（额外环境变量）、`max_output`（输出截断上限，默认 8000 字符，超限保留首尾并把完整输出写入 `/tmp/mincli_exec_*.txt` 供 `read_file` 读取）。
 - **非交互执行**：命令 stdin 已关闭（防止 vim/ssh 等交互命令破坏 TUI 或挂死）。
+
+---
+
+## 多模态（图片理解）
+
+基于官方视觉模型 `deepseek-v4-flash-vision-exp`（实验性，与 flash 同价），支持在提问时附带图片：描述图片、识别截图文字、分析图表等。
+
+### 用法
+
+```text
+/img ~/截图.png "https://example.com/chart.jpg"     # 添加待发送图片（可多个）
+/img clear                                            # 清除待发送图片
+/import 图片.png                                      # 图片文件自动转为待发送图片
+发送消息                                              # 图片自动附带（自动切换视觉模型）
+```
+
+- 待发送图片会显示在输入框下方（`📷 待发送图片 N 张 …`），发送后绑定到该对话节点。
+- 图片消息会自动把模型切换到 `deepseek-v4-flash-vision-exp`（提示后生效；`/set model flash` 可切回）。
+- 聊天区以 `[图片: 文件名 (宽x高)]` 文本占位展示（不依赖终端图像协议，可选中/拷贝）。
+
+### 传图机制（Files API 优先）
+
+1. **上传一次，跨轮复用**：本地图片首次发送时上传到 DeepSeek Files API，得到 `file_id`（`file-api-...`），节点持久化该 ID；后续所有请求（含历史重放、分支追问）都通过 `file` 内容块引用，请求体极小、序列化稳定，**不破坏前缀缓存**。
+2. **自动回退**：上传失败时自动改用 base64 内联发送（单图 ≤32MiB、请求体 ≤48MiB 预检，超限报错提示）。
+3. **文件管理**：`/files list` 查看已上传文件，`/files delete <ID>` 删除；删除对话节点时会尽力清理其关联文件。
+4. **外部 URL**：直接传 `http(s)` 链接（≤8192 字符，API 下载）。
+
+### 图片 token 与成本（实测校准）
+
+- 图片按尺寸换算 token 与文本一并计费：**每图固定开销 ≈117 token**，尺寸附加额按面积增长、**封顶 ≈240**（单图合计最高 ~357 token）；`detail=low` 缩放 512²，可省约 60%。
+- **实测：图片部分不参与前缀缓存**（无论 base64 还是 file_id 均按未命中价计费）；文本前缀可正常缓存（同一前缀二次请求命中率 ~99%）。
+- 因此成本估算宜按未命中价（1.5 元/百万 token）计；具体以接口返回 `usage` 为准（状态条/对话结束显示均取真实 usage）。
+
+### 限制（官方）
+
+| 项 | 值 |
+|---|---|
+| 格式 | JPEG / PNG / GIF / WebP（**按文件内容识别**，不看扩展名） |
+| 内联单图 | ≤32 MiB（Files API 引用最大 64 MiB） |
+| 请求体 | ≤48 MiB |
+| 图片位置 | 仅 user 消息（system/assistant 带图会 400） |
+| 单请求图片数 | ≤600；单边 ≤8192px（≥15 张时 4096px） |
+| Files API | 单文件 ≤64 MiB、默认永久有效、存储 25 GiB / 1 万个文件 |
 
 ---
 
@@ -343,9 +391,11 @@ mincli 的工具执行基于标准 [MCP 协议](https://modelcontextprotocol.io/
 │       ├── execute.py       # 命令执行 + AI 安全审计
 │       ├── file_ops.py      # 文件读写/解析
 │       ├── web_fetch.py     # 网页抓取 + 搜索
+│       ├── images.py        # 图片附件：格式嗅探/尺寸解析/base64/token 估算
+│       ├── files.py         # Files API 客户端（上传/列表/删除）
 │       └── thinking.py      # 审计系统提示词
 │
-└── tests/                   # Headless 测试（test_controller / test_tui）
+└── tests/                   # Headless 测试（test_controller / test_tui / test_images）
 ```
 
 ---
@@ -363,6 +413,15 @@ A：确保依赖已安装：`pip install pdfminer.six python-docx`。
 
 **Q：TUI 无法启动（如输出被重定向、终端不支持）？**  
 A：使用 `mincli chat --no-tui` 走纯文本回退模式。
+
+**Q：图片消息报错 "This model does not support image"？**  
+A：图片必须使用视觉模型。mincli 在带图发送时会自动切换到 `deepseek-v4-flash-vision-exp`；若手动 `/set model` 切换回了非视觉模型，发送图片时会提示切换。
+
+**Q：上传图片失败？**  
+A：会自动回退为 base64 内联发送（仅影响请求体大小）；可通过 `/files list` 查看已上传文件。单文件超过 32 MiB 或格式不支持（仅 JPEG/PNG/GIF/WebP，按内容识别）会报错提示。
+
+**Q：图片 token 消耗大吗？**  
+A：实测每图约 117~357 token（尺寸相关，`/set detail low` 可省约 60%）；图片部分不参与前缀缓存（按未命中价计费），文本前缀可正常缓存。具体以接口返回 `usage` 为准。
 
 ---
 

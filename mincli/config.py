@@ -9,12 +9,14 @@ load_dotenv(os.path.expanduser("~/.mincli/.env"))
 
 MODEL_V4_FLASH = "deepseek-v4-flash"
 MODEL_V4_PRO = "deepseek-v4-pro"
+MODEL_V4_VISION = "deepseek-v4-flash-vision-exp"
 DEFAULT_MODEL = MODEL_V4_FLASH
 
 # 内置模型映射：model_name -> base_url（OpenAI 兼容 API）
 MODELS_AVAILABLE = {
     MODEL_V4_FLASH: "https://api.deepseek.com/v1",
     MODEL_V4_PRO: "https://api.deepseek.com/v1",
+    MODEL_V4_VISION: "https://api.deepseek.com/v1",
 }
 
 # API Provider 映射：provider_name -> 环境变量名
@@ -52,6 +54,8 @@ COMPACT_TOOL_RESULT_MAX_CHARS = 500  # 每个工具结果计入摘要源的长�
 DEEPSEEK_PRICING: dict = {
     MODEL_V4_FLASH: {"hit": (0.05, 0.10), "miss": (1.5, 3.0), "output": (4.5, 9.0)},
     MODEL_V4_PRO: {"hit": (0.15, 0.30), "miss": (4.5, 9.0), "output": (13.5, 27.0)},
+    # 视觉模型与 flash 同价（官方定价表）
+    MODEL_V4_VISION: {"hit": (0.05, 0.10), "miss": (1.5, 3.0), "output": (4.5, 9.0)},
 }
 
 # 账户余额轮询刷新间隔（秒）
@@ -65,6 +69,27 @@ EXEC_MAX_TIMEOUT = 120             # timeout 上限（与 MCP 客户端调用超
 EXEC_DEFAULT_MAX_OUTPUT = 8000     # 输出截断上限（字符），超出时保留首尾并落盘完整输出
 EXEC_MAX_OUTPUT = 50_000           # max_output 参数允许的最大值
 EXEC_ALLOWED_SHELLS = ("sh", "bash", "zsh")
+
+# ---------------- 多模态（图片理解，deepseek-v4-flash-vision-exp） ----------------
+# 官方限制：格式按文件内容识别（不看扩展名/声明 MIME）；图片仅限 user 消息；
+# 内联单图 32MiB、请求体 48MiB、URL ≤8192 字符、单请求 ≤600 图、单边 ≤8192px。
+VISION_SUPPORTED_FORMATS = ("jpeg", "png", "gif", "webp")
+VISION_IMAGE_MAX_BYTES = 32 * 1024 * 1024   # 内联（base64 / file_data）单图上限
+VISION_REQUEST_MAX_BYTES = 48 * 1024 * 1024  # 请求体上限（内联 base64 回退路径预检）
+VISION_URL_MAX_CHARS = 8192
+VISION_DEFAULT_DETAIL = "auto"   # low(512²缩放,省token) / auto≈original(最高清晰度)
+# 官方单图 token 上限（docs：缩放后单图 ≤384 token；估算值与实际以接口 usage 为准）
+VISION_IMAGE_TOKEN_CAP = 384
+# 实测校准（真实 API）：每张图片固定开销 117 token（1×1 图亦然）
+VISION_BASE_IMAGE_TOKENS = 117
+# 实测尺寸附加额（面积 px → 附加 token），线性插值、封顶 240：
+# 锚点: 410²=168100→0, 450²=202500→32, 500²=250000→44, 640×480=307200→92,
+#       1000×400=400000→140, 800²=640000→232, 1600×1200=1920000→240
+VISION_SIZE_EXTRA_CAP = 240
+VISION_SIZE_EXTRA_ANCHORS = (
+    (0, 0), (168_100, 0), (202_500, 32), (250_000, 44),
+    (307_200, 92), (400_000, 140), (640_000, 232), (1_920_000, 240),
+)
 
 MCP_CONFIG_PATH = os.path.expanduser(
     os.getenv("MINCLI_MCP_CONFIG", "~/.mincli/mcp_servers.json")

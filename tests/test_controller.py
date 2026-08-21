@@ -85,9 +85,40 @@ class FakeCompletions:
         return item
 
 
+class FakeFiles:
+    """Files API 模拟：可脚本化上传成功/失败。"""
+
+    def __init__(self, script=None, fail=False):
+        self.script = list(script or [])
+        self.calls = []
+        self.fail = fail
+        self.created = []
+
+    def create(self, file, purpose="user_data"):
+        self.calls.append(("create", file.name, purpose))
+        if self.fail:
+            raise RuntimeError("模拟上传失败")
+        fid = self.script.pop(0) if self.script else f"file-api-{len(self.created)}"
+        self.created.append({"id": fid, "name": os.path.basename(file.name)})
+        return SimpleNamespace(id=fid)
+
+    def list(self):
+        return SimpleNamespace(data=[
+            SimpleNamespace(
+                id=c["id"], filename=c["name"], bytes=100, created_at=1, expires_at=None
+            )
+            for c in self.created
+        ])
+
+    def delete(self, file_id):
+        self.calls.append(("delete", file_id))
+        return SimpleNamespace(deleted=True)
+
+
 class FakeClient:
-    def __init__(self, script):
+    def __init__(self, script, files_script=None, files_fail=False):
         self.chat = SimpleNamespace(completions=FakeCompletions(script))
+        self.files = FakeFiles(files_script, fail=files_fail)
 
 
 # ---------------- 测试用控制器 ----------------
@@ -312,6 +343,165 @@ def test_compact():
     check("太短返回 None", ctrl2.compact_history() is None)
 
 
+def _make_png(path: str, w: int = 800, h: int = 600) -> str:
+    """构造最小合法 PNG（前 24 字节足够嗅探+尺寸）。"""
+    with open(path, "wb") as f:
+        f.write(
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\x0dIHDR"
+            + w.to_bytes(4, "big")
+            + h.to_bytes(4, "big")
+            + b"\x08\x06\x00\x00\x00"
+        )
+    return path
+
+
+def test_multimodal():
+    print("== 多模态：上传 / 守卫 / 回退 / 历史重放 / 文件管理 ==")
+    png = _make_png(os.path.join(_TMP, "m.png"))
+
+    # 1) 上传成功 → file 块 + 模型自动切换
+    script = [
+        [FakeChunk(content="图", usage=SimpleNamespace(prompt_tokens=100, completion_tokens=5))],
+        FakeChatResponse(content="图题"),
+    ]
+    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    events = []
+    added, errors = ctrl.add_pending_images([png])
+    check("添加图片成功", added == 1 and not errors)
+    node = ctrl.send_message("描述图片", events.append)
+    check("发送成功", node is not None)
+    check("file_id 已写入节点", node.user_images[0].file_id == "file-api-0")
+    check("模型自动切换 vision", ctrl.current_model == "deepseek-v4-flash-vision-exp")
+    check("上传调用 1 次", len(ctrl.client.files.calls) == 1)
+    sent = ctrl.client.chat.completions.calls[0]["messages"]
+    blocks = sent[-1]["content"]
+    check("消息为块数组", isinstance(blocks, list) and blocks[0]["type"] == "text")
+    check("图片为 file 块", any(
+        b.get("type") == "file" and b.get("file_id") == "file-api-0" for b in blocks
+    ))
+    check("无 error 事件", "error" not in [e.kind for e in events])
+
+    # 2) 上传失败 → base64 内联回退
+    script2 = [
+        [FakeChunk(content="ok", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
+        FakeChatResponse(content="标题2"),
+    ]
+    ctrl2 = TestController(FakeClient(script2, files_fail=True), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    events2 = []
+    ctrl2.add_pending_images([png])
+    node2 = ctrl2.send_message("看图", events2.append)
+    check("回退发送成功", node2 is not None and node2.user_images[0].file_id is None)
+    sent2 = ctrl2.client.chat.completions.calls[0]["messages"]
+    blocks2 = sent2[-1]["content"]
+    check("回退为 data URL", any(
+        b.get("type") == "image_url"
+        and str(b.get("image_url", {}).get("url", "")).startswith("data:image/png;base64,")
+        for b in blocks2
+    ))
+    check("回退提示发出", any(e.kind == "status" and "内联" in e.message for e in events2))
+
+    # 3) 自定义模型（非 flash/pro）→ 报错 + 图片放回待发送
+    script3 = [
+        [FakeChunk(content="x", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="t"),
+    ]
+    ctrl3 = TestController(FakeClient(script3), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3.current_model = "gpt-4o"
+    events3 = []
+    ctrl3.add_pending_images([png])
+    node3 = ctrl3.send_message("看图", events3.append)
+    check("自定义模型被拒", node3 is None)
+    check("图片放回待发送", len(ctrl3.pending_images) == 1)
+    check("发出 error 事件", any(e.kind == "error" and "vision" in e.message for e in events3))
+    check("节点已回滚", ctrl3.tree.root is None)
+
+    # 4) 历史重放：第一轮回退 base64，第二轮补传 → file 块
+    script4 = [
+        [FakeChunk(content="a", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
+        FakeChatResponse(content="题A"),
+    ]
+    c4 = TestController(FakeClient(script4, files_fail=True), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c4.add_pending_images([png])
+    n1 = c4.send_message("图一", lambda e: None)
+    check("第一轮回退成功", n1 is not None)
+    c4.client.files.fail = False
+    c4.client.chat.completions.script = [
+        [FakeChunk(content="b", usage=SimpleNamespace(prompt_tokens=20, completion_tokens=3))],
+        FakeChatResponse(content="题B"),
+    ]
+    n2 = c4.send_message("继续", lambda e: None)
+    check("第二轮发送成功", n2 is not None)
+    hist = c4.client.chat.completions.calls[2]["messages"]  # 第 2 轮流式请求
+    check("历史消息含 file 块", any(
+        isinstance(m.get("content"), list)
+        and any(b.get("type") == "file" for b in m["content"] if isinstance(b, dict))
+        for m in hist if m.get("role") == "user"
+    ))
+    check("补传后 file_id 写入", n1.user_images[0].file_id == "file-api-0")
+
+    # 5) import_target 图片路由
+    c5 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    check("import 图片 → 待发送", c5.import_target(png) is None
+          and len(c5.pending_images) == 1 and c5.imported_content is None)
+    check("import 缺失文件报错", c5.import_target("/nonexistent/x.md") is not None)
+
+    # 6) 文件管理 + 节点删除清理
+    script6 = [
+        [FakeChunk(content="a", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="题A"),
+        [FakeChunk(content="b", usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1))],
+        FakeChatResponse(content="题B"),
+    ]
+    c6 = TestController(FakeClient(script6, files_script=["file-api-abc"]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    n6a = c6.send_message("第一问", lambda e: None)
+    c6.add_pending_images([png])
+    n6b = c6.send_message("看图", lambda e: None)
+    check("上传取脚本 id", n6b.user_images[0].file_id == "file-api-abc")
+    files = c6.files_list()
+    check("files_list 返回文件", len(files) == 1 and files[0]["id"] == "file-api-abc")
+    check("files_delete 调用删除", c6.files_delete("file-api-abc"))
+    check("删除 API 已调用", c6.client.files.calls[-1] == ("delete", "file-api-abc"))
+    check("删除子节点清理关联文件", c6.delete_node(n6b.id))
+    check("节点文件已删除", any(c[0] == "delete" for c in c6.client.files.calls))
+    check("根节点不能删", not c6.delete_node("main"))
+    check("子节点已从树移除", n6b.id not in c6.tree.nodes)
+
+    # 7) 压缩源图片占位
+    script7 = [
+        [FakeChunk(content="x", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="题"),
+    ]
+    c7 = TestController(FakeClient(script7), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c7.add_pending_images([png])
+    n7 = c7.send_message("图", lambda e: None)
+    check("压缩用例发送成功", n7 is not None)
+    src = c7._build_compact_source([n7])
+    check("压缩源含图片占位", "[图片: m.png (800x600)]" in src)
+
+    # 8) 会话持久化保留附件（路径与 file_id，不含 base64）
+    if os.path.exists(TestController.SAVE_FILE):
+        os.remove(TestController.SAVE_FILE)
+    c8 = TestController(FakeClient(script6, files_script=["file-api-persist"]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c8.add_pending_images([png])
+    n8 = c8.send_message("图", lambda e: None)
+    check("持久化前 file_id", n8.user_images[0].file_id == "file-api-persist")
+    c8.save_session()
+    c8b = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    check("重载后附件保留", c8b.session_loaded
+          and c8b.tree.current_node is not None
+          and c8b.tree.current_node.user_images
+          and c8b.tree.current_node.user_images[0].file_id == "file-api-persist")
+    if os.path.exists(TestController.SAVE_FILE):
+        os.remove(TestController.SAVE_FILE)
+
+    # 9) set_detail 校验
+    c9 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    check("set_detail low", c9.set_detail("low") and c9.image_detail == "low")
+    check("set_detail 非法拒绝", not c9.set_detail("huge"))
+    check("set_model vision 别名", c9.set_model("vision") and c9.current_model == "deepseek-v4-flash-vision-exp")
+
+
 def test_usage_stats():
     print("== 输入栏状态条 usage_stats ==")
     script = [
@@ -370,6 +560,7 @@ if __name__ == "__main__":
     test_import_target()
     test_settings()
     test_compact()
+    test_multimodal()
     test_usage_stats()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

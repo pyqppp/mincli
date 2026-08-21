@@ -11,7 +11,7 @@ from openai import OpenAI
 from mincli.config import (
     MODEL_V4_FLASH, TITLE_MAX_TOKENS, TITLE_MAX_LENGTH,
     SAVE_BASE_DIR, TEMPERATURE_MIN, TEMPERATURE_MAX,
-    DEEPSEEK_PRICING,
+    DEEPSEEK_PRICING, VISION_IMAGE_TOKEN_CAP,
 )
 
 
@@ -94,6 +94,16 @@ def estimate_tokens(messages: list) -> int:
         for key, value in msg.items():
             if isinstance(value, str):
                 tokens += len(encoding.encode(value))
+            elif key == "content" and isinstance(value, list):
+                # 多模态：content 为内容块数组（text 走 tiktoken，图片按上限估算）
+                for block in value:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        tokens += len(encoding.encode(block.get("text") or ""))
+                    elif btype in ("image_url", "file"):
+                        tokens += VISION_IMAGE_TOKEN_CAP
             if key == "name":
                 tokens += 1
     tokens += 3

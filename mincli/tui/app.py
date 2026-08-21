@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -75,6 +76,8 @@ from mincli.config import (
     save_mcp_servers,
 )
 from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
+from mincli.tools.files import FilesAPIError
+from mincli.tools.images import image_placeholder_text
 from mincli.tui.confirm import ConfirmScreen
 from mincli.tui.widgets import ChatInput
 
@@ -96,11 +99,11 @@ COMMAND_HELP: dict[str, str] = {
     "/clear": "清空当前会话",
     "/compact": f"用法: /compact [保留轮数] | /compact off\n把当前分支早期对话压缩成详细摘要（默认保留最近 {COMPACT_DEFAULT_KEEP} 轮原文，0=全部压缩；off 清除压缩恢复原文）",
     "/help": "显示此帮助",
-    "/import": "用法: /import <文件路径或URL>\n导入文件或抓取网页，下次提问自动附加到上下文",
+    "/import": "用法: /import <文件路径或URL>\n导入文件或抓取网页，下次提问自动附加到上下文；图片文件自动转为待发送图片",
     "/view": "用编辑器打开当前回答",
     "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
     "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
-    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set show\n修改运行配置",
+    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|vision|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show\n修改运行配置",
     "/tree": "显示完整对话树",
     "/info": "用法: /info [节点ID]\n查看节点详情（默认当前节点）",
     "/up": "返回父节点",
@@ -109,6 +112,8 @@ COMMAND_HELP: dict[str, str] = {
     "/reasoning": "展开/折叠当前消息的思考过程\n正文开始后思考过程会自动折叠成一行，点击灰色折叠块也可展开",
     "/save": "用法: /save [节点ID]\n导出节点为 Markdown 文件",
     "/delete": "用法: /delete <节点ID>\n删除节点及其所有子节点（需确认）",
+    "/img": "用法: /img <路径或URL> [路径或URL...] | /img clear\n添加待发送图片（多图可一次添加；发送时自动附带，需视觉模型）",
+    "/files": "用法: /files list | /files delete <ID>\n管理已上传的 Files API 图片文件（/img 上传的图片可在此查看/删除）",
 }
 
 # 思考过程折叠后的一行占位（块引用，灰色、可点击展开）
@@ -248,6 +253,7 @@ class ChatApp(App):
         yield ChatInput(
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
+        yield Static("", id="pending-images")
         with Horizontal(id="usage-bar"):
             yield Static("", id="usage-left")
             yield Static("", id="usage-right")
@@ -277,6 +283,7 @@ class ChatApp(App):
             self.notify("已加载上次会话记录", timeout=4)
         self._start_balance_refresh()
         self._refresh_usage_bar()
+        self._refresh_pending_images()
 
     def on_unmount(self) -> None:
         self._cancel_flush()
@@ -336,6 +343,28 @@ class ChatApp(App):
         self.query_one("#usage-right", Static).update(
             f"⏭ 下次输入 {tokens:,} tok {price_txt}（{peak_txt}价）"
         )
+
+    def _refresh_pending_images(self) -> None:
+        """刷新输入框上方的待发送图片提示行（无图时隐藏）。"""
+        if self.ctrl is None:
+            return
+        hint = self.query_one("#pending-images", Static)
+        text = self.ctrl.pending_images_summary()
+        if text:
+            hint.update(text)
+            hint.add_class("visible")
+        else:
+            hint.update("")
+            hint.remove_class("visible")
+
+    def _pending_images_md(self) -> str:
+        """待发送图片在聊天区里的 Markdown 占位行（提交回显用）。"""
+        if self.ctrl is None or not self.ctrl.pending_images:
+            return ""
+        marks = "\n".join(
+            f"- {image_placeholder_text(a)}" for a in self.ctrl.pending_images
+        )
+        return f"\n\n{marks}"
 
     # ---------------- 对话树侧栏 ----------------
 
@@ -716,11 +745,76 @@ class ChatApp(App):
                 self.notify("用法: /import <文件路径或URL>", severity="warning")
             else:
                 self.notify("正在导入…")
+                before = len(ctrl.pending_images)
                 err = ctrl.import_target(parts[1].strip())
                 if err is None:
-                    self.notify("✅ 内容已导入，将在下一次提问时自动附加")
+                    after = len(ctrl.pending_images)
+                    self._refresh_pending_images()
+                    if after > before:
+                        self.notify(f"✅ 已添加 {after - before} 张图片，将在发送时自动附带")
+                    else:
+                        self.notify("✅ 内容已导入，将在下一次提问时自动附加")
                 else:
                     self.notify(err, severity="error")
+            return True
+
+        if low.startswith("/img"):
+            parts = cmd.split()
+            if len(parts) < 2:
+                self.notify("用法: /img <路径或URL> [路径或URL...] | /img clear", severity="warning")
+            elif parts[1].lower() in ("clear", "c"):
+                n = ctrl.clear_pending_images()
+                self._refresh_pending_images()
+                self.notify(f"已清除 {n} 张待发送图片")
+            else:
+                targets = parts[1:]
+                added, errors = ctrl.add_pending_images(targets)
+                self._refresh_pending_images()
+                if added:
+                    self.notify(f"✅ 已添加 {added} 张图片（发送时自动附带）")
+                for err in errors[:2]:
+                    self.notify(err, severity="warning")
+                if len(errors) > 2:
+                    self.notify(f"…共 {len(errors)} 个失败", severity="warning")
+            return True
+
+        if low.startswith("/files"):
+            parts = cmd.split(maxsplit=2)
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            try:
+                if sub in ("list", "ls", ""):
+                    files = ctrl.files_list()
+                    if not files:
+                        await self._chat_append("**已上传图片文件（Files API）**\n\n（空）")
+                    else:
+                        lines = [
+                            "**已上传图片文件（Files API）**",
+                            "",
+                            "| ID | 文件名 | 大小 | 创建时间 | 过期 |",
+                            "|---|---|---|---|---|",
+                        ]
+                        for f in files:
+                            created = (
+                                datetime.datetime.fromtimestamp(f.get("created_at", 0)).strftime("%m-%d %H:%M")
+                                if f.get("created_at") else "—"
+                            )
+                            expires = (
+                                datetime.datetime.fromtimestamp(f["expires_at"]).strftime("%m-%d %H:%M")
+                                if f.get("expires_at") else "永久"
+                            )
+                            size = f"{f.get('bytes', 0) / 1024 / 1024:.2f} MiB"
+                            lines.append(
+                                f"| `{f.get('id', '')}` | {f.get('name', '')} | {size} | {created} | {expires} |"
+                            )
+                        lines.append("\n删除: `/files delete <ID>`")
+                        await self._chat_append("\n".join(lines))
+                elif sub in ("delete", "rm", "del") and len(parts) == 3:
+                    ctrl.files_delete(parts[2])
+                    self.notify(f"✅ 已删除文件 {parts[2]}")
+                else:
+                    self.notify("用法: /files list | /files delete <ID>", severity="warning")
+            except FilesAPIError as e:
+                self.notify(str(e), severity="error")
             return True
 
         m = re.match(r"^/([A-Za-z]+\d+|main)$", cmd)
@@ -782,12 +876,18 @@ class ChatApp(App):
 **配置命令**
 - `/set system <提示词>` — 修改系统提示词
 - `/set temp <值>` — 设置温度（0.0~2.0）
-- `/set model <flash|pro|模型名>` — 切换模型
+- `/set model <flash|pro|vision|模型名>` — 切换模型
 - `/set thinking <on|off>` — 开关思考模式
 - `/set effort <low|high|max>` — 推理强度
 - `/set audit <1-4>` — 审核层级
 - `/set workspace <路径>` — 命令执行默认工作目录（默认 mincli 启动目录）
+- `/set detail <low|auto|high|original>` — 图片清晰度（low 省 token，auto≈original 最清晰）
 - `/set show` — 显示当前配置
+
+**多模态（图片理解）**
+- `/img <路径或URL> [...]` — 添加待发送图片（发送时自动附带；图片消息自动切换视觉模型 deepseek-v4-flash-vision-exp）
+- `/import 图片文件` — 图片文件自动转为待发送图片
+- `/files list|delete <ID>` — 查看/删除 Files API 已上传的图片文件
 
 **多模型**
 - `/model list` — 查看内置与已注册模型
@@ -812,7 +912,7 @@ class ChatApp(App):
     async def _cmd_set(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         ctrl = self.ctrl
-        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set show"
+        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|vision|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show"
         if len(parts) < 2:
             self.notify(usage, severity="warning")
             return
@@ -868,6 +968,11 @@ class ChatApp(App):
             self.notify(
                 f"当前命令工作目录: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}"
             )
+        elif sub == "detail" and len(parts) == 3:
+            if ctrl.set_detail(parts[2].lower()):
+                self.notify(f"图片 detail 已设置为: {ctrl.image_detail}")
+            else:
+                self.notify("用法: /set detail <low|auto|high|original>", severity="warning")
         elif sub == "show":
             ctrl = self.ctrl
             lines = [
@@ -879,6 +984,7 @@ class ChatApp(App):
                 f"- **思考模式**: {'开' if ctrl.thinking_enabled else '关'} | 推理强度: {ctrl.reasoning_effort}",
                 f"- **审核层级**: {ctrl.audit_level} - {AUDIT_LABELS[ctrl.audit_level]}",
                 f"- **命令工作目录**: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}",
+                f"- **图片 detail**: {ctrl.image_detail}",
             ]
             if ctrl.tree.current_node:
                 lines.append(f"- **当前节点**: {ctrl.tree.current_node.id} ({ctrl.tree.current_node.title})")
@@ -953,12 +1059,12 @@ class ChatApp(App):
             self.notify("已取消删除")
             return
         tree = self.ctrl.tree
-        if tree.delete_node(nid):
+        if self.ctrl.delete_node(nid):
             self.ctrl._cleanup_temp_files(keep_ids=set(tree.nodes.keys()))
             self._rebuild_tree()
             if tree.current_node:
                 self._select_tree_node(tree.current_node.id)
-            self.notify(f"节点 {nid} 及其所有子节点已删除")
+            self.notify(f"节点 {nid} 及其所有子节点已删除（含关联图片文件）")
         else:
             self.notify(f"删除节点 {nid} 失败", severity="error")
 
@@ -1197,8 +1303,10 @@ class ChatApp(App):
             return
         self._cancel_flush()  # 新消息开始前丢弃上一轮残留的流式缓冲
         chat = self.query_one("#chat-log", Markdown)
-        chat.append(f"\n\n---\n\n**你**\n\n{event.text}")
+        img_md = self._pending_images_md()
+        chat.append(f"\n\n---\n\n**你**\n\n{event.text}{img_md}")
         chat.scroll_end(animate=False)
+        self._refresh_pending_images()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False
         self._reasoning_text = ""
         self._reasoning_md = ""
@@ -1318,12 +1426,16 @@ class ChatApp(App):
                 # （不输出 **mincli：** 头部——思考过程在提问之后、头部与正文之前）
                 self._rebuild_tree()
                 self._select_tree_node(node.id)
-                await chat.update(
-                    f"# {node.id}: {node.title}\n\n"
-                    f"**你：**\n\n{node.user_msg}"
-                )
+                view = f"# {node.id}: {node.title}\n\n" f"**你：**\n\n{node.user_msg}"
+                if node.user_images:
+                    marks = "\n".join(
+                        f"- {image_placeholder_text(a)}" for a in node.user_images
+                    )
+                    view += f"\n\n{marks}"
+                await chat.update(view)
                 self._shrink_lists(chat)
                 chat.scroll_end(animate=False)
+                self._refresh_pending_images()  # 图片已绑定到节点，隐藏待发送提示行
                 self._stream_active = True  # 视图已含节点头部，后续流式内容直接追加
                 self._reasoning_text = ""
                 self._reasoning_md = ""
@@ -1346,6 +1458,7 @@ class ChatApp(App):
             self._shrink_lists(chat)
             chat.scroll_end(animate=False)
             self._rebuild_tree()  # 出错时节点已被回滚，刷新树移除空节点
+            self._refresh_pending_images()  # 发送失败时图片已放回待发送队列，恢复提示行
         elif ev.kind == "done":
             node = ev.node
             if node is not None:

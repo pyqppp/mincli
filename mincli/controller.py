@@ -19,6 +19,7 @@ from openai import OpenAI
 from mincli.config import (
     MODEL_V4_FLASH,
     MODEL_V4_PRO,
+    MODEL_V4_VISION,
     MODELS_AVAILABLE,
     COMPACT_DEFAULT_KEEP,
     COMPACT_MAX_TOKENS,
@@ -26,6 +27,8 @@ from mincli.config import (
     COMPACT_REASONING_MAX_CHARS,
     COMPACT_TOOL_RESULT_MAX_CHARS,
     EXEC_DEFAULT_TIMEOUT,
+    VISION_DEFAULT_DETAIL,
+    VISION_REQUEST_MAX_BYTES,
     load_models,
 )
 from mincli.helpers import (
@@ -41,6 +44,16 @@ from mincli.models import ConversationNode, ConversationTree
 from mincli.streaming import stream_response
 from mincli.tools.execute import audit_command, is_safe_readonly, matches_dangerous
 from mincli.tools.file_ops import parse_file
+from mincli.tools.files import FilesAPIError, delete_file, list_files, upload_image
+from mincli.tools.images import (
+    ImageAttachment,
+    collect_inline_bytes,
+    image_placeholder_text,
+    is_image_path,
+    looks_like_image_target,
+    make_path_attachment,
+    make_url_attachment,
+)
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage
 
@@ -131,6 +144,11 @@ class ChatController:
         self.audit_level: int = 1
         # 命令执行默认工作目录（/set workspace 设置；None 时用 mincli 启动目录）
         self.workspace: Optional[str] = None
+
+        # 多模态：待发送图片（/img、/import 图片填充；发送后绑定到节点并清空）
+        self.pending_images: List[ImageAttachment] = []
+        # 图片 detail 全局默认（/set detail 可调；low 省 token，auto≈original 最清晰）
+        self.image_detail: str = VISION_DEFAULT_DETAIL
 
         self.tree = ConversationTree(default_system)
 
@@ -259,10 +277,20 @@ class ChatController:
         if arg in ("pro", "v4-pro", "p"):
             self.current_model = MODEL_V4_PRO
             return True
+        if arg in ("vision", "v-flash-vision", "v4-vision"):
+            self.current_model = MODEL_V4_VISION
+            return True
         # 支持注册的自定义模型名 / 完整模型名（如 gpt-4o）
         registered = load_models()
         if arg in registered or arg in MODELS_AVAILABLE:
             self.current_model = arg
+            return True
+        return False
+
+    def set_detail(self, detail: str) -> bool:
+        """设置图片 detail 全局默认（low/auto/high/original）。"""
+        if detail in ("low", "auto", "high", "original"):
+            self.image_detail = detail
             return True
         return False
 
@@ -303,15 +331,66 @@ class ChatController:
     )
 
     def import_target(self, target: str) -> Optional[str]:
-        """导入文件或网页为上下文，成功返回 None，失败返回错误信息。"""
+        """导入文件/网页为上下文；图片路径/URL 转为待发送图片附件。
+
+        成功返回 None，失败返回错误信息（图片附件成功时也返回 None）。
+        """
         if re.match(r"^https?://", target):
+            # 网页 URL：图片扩展名 → 图片附件；否则抓取网页文本
+            if looks_like_image_target(target):
+                added, errors = self.add_pending_images([target])
+                if added:
+                    return None
+                return errors[0] if errors else f"无法读取: {target}"
             result = fetch_webpage(target)
         else:
+            # 本地文件：按内容嗅探是否为受支持图片（不依赖扩展名）
+            if os.path.isfile(target) and is_image_path(target):
+                added, errors = self.add_pending_images([target])
+                if added:
+                    return None
+                return errors[0] if errors else f"无法读取: {target}"
             result = parse_file(target)
         if result and not result.startswith(self._IMPORT_FAIL_PREFIXES):
             self.imported_content = result
             return None
         return result or f"无法读取: {target}"
+
+    # ---------------- 多模态：待发送图片 ----------------
+
+    def add_pending_images(self, targets: List[str]) -> tuple:
+        """把路径/URL 添加为待发送图片。返回 (成功数, 错误信息列表)。"""
+        added = 0
+        errors: List[str] = []
+        for t in targets:
+            try:
+                if t.startswith(("http://", "https://")):
+                    att = make_url_attachment(t, self.image_detail)
+                else:
+                    att = make_path_attachment(t, self.image_detail)
+                self.pending_images.append(att)
+                added += 1
+            except ValueError as e:
+                errors.append(str(e))
+        return added, errors
+
+    def clear_pending_images(self) -> int:
+        """清空待发送图片，返回清除数量。"""
+        n = len(self.pending_images)
+        self.pending_images = []
+        return n
+
+    def pending_images_summary(self) -> str:
+        """待发送图片的提示文本（输入栏上方显示）；无图返回空串。"""
+        if not self.pending_images:
+            return ""
+        total = sum(a.size_bytes for a in self.pending_images)
+        names = "、".join(a.name for a in self.pending_images[:3])
+        extra = "…" if len(self.pending_images) > 3 else ""
+        return (
+            f"📷 待发送图片 {len(self.pending_images)} 张（共 {total / 1024 / 1024:.1f} MiB）"
+            f"：{names}{extra} · /img clear 清除"
+        )
 
     def save_node(self, node_id: str) -> Optional[str]:
         """导出节点为 Markdown 文件，返回文件路径；节点不存在返回 None。"""
@@ -323,6 +402,9 @@ class ChatController:
         reasoning = convert_formulas(node.reasoning)
         content = f"# {node.title}\n\n"
         content += f"---\n\n**你：**\n\n{user_msg}\n\n"
+        if node.user_images:
+            marks = "；".join(image_placeholder_text(att) for att in node.user_images)
+            content += f"（附图：{marks}）\n\n"
         if node.reasoning:
             content += f"---\n\n**DeepSeek 思考过程：**\n\n{reasoning}\n\n"
         content += f"---\n\n**DeepSeek：**\n\n{assistant_msg}\n\n"
@@ -514,7 +596,14 @@ class ChatController:
             title = (node.title or "").strip()
             head = f"--- 第 {i} 轮（节点 {node.id}）{('：' + title) if title else ''} ---"
             parts.append(head)
-            parts.append(f"用户: {node.user_msg}")
+            user_line = node.user_msg
+            if node.user_images:
+                # 图片不进压缩请求（避免 base64 撑爆）；以占位符说明图片存在
+                img_marks = "；".join(
+                    image_placeholder_text(att) for att in node.user_images
+                )
+                user_line = f"{user_line}\n（附图：{img_marks}）"
+            parts.append(f"用户: {user_line}")
             for tm in node.tool_messages:
                 if tm.get("role") == "tool":
                     content = str(tm.get("content", ""))[:COMPACT_TOOL_RESULT_MAX_CHARS]
@@ -566,23 +655,54 @@ class ChatController:
         节点在流式输出前即创建并设为当前节点（UI 可立即“进入”新节点进行
         流式输出）；出错时回滚该节点。emit 会收到 node_created / stream /
         tool / status / done / error 事件。API 错误或无回答时返回 None。
+
+        多模态：待发送图片先上传为 Files API file_id（请求体极小、序列化稳定、
+        不破坏前缀缓存），上传失败回退 base64 内联；图片消息自动切换视觉模型。
         """
         if self.imported_content:
             user_input = self.imported_content + "\n\n" + user_input
             self.imported_content = None
 
-        if self.tree.current_node is None:
-            messages: List[Dict] = [
-                {"role": "system", "content": self.current_system},
-                {"role": "user", "content": user_input},
-            ]
-        else:
-            messages = self.tree.get_messages_for_node(self.tree.current_node)
-            messages.append({"role": "user", "content": user_input})
+        # 待发送图片：先上传为 file_id（成功后历史重放/后续请求体保持极小）
+        if self.pending_images:
+            emit(ControllerEvent.status(
+                f"正在上传图片（{len(self.pending_images)} 张）…"
+            ))
+            self._upload_attachments(self.pending_images, emit)
+        this_turn_images = list(self.pending_images)
+        self.pending_images = []
 
         # 前置创建节点并设为当前节点：UI 立即进入新节点，流式输出归属该节点
         node = self._begin_node(user_input)
+        node.user_images = this_turn_images
         emit(ControllerEvent.node_created(node))
+
+        # 历史节点的本地图片若未上传过（file_id 缺失），补传一次（尽力而为）
+        self._ensure_chain_uploads(node, emit)
+
+        # 构建发送消息（历史链 + 本轮；图片构造为 OpenAI 兼容内容块）
+        messages = self.tree.get_messages_for_node(node)
+
+        # 图片消息必须使用视觉模型（flash/pro 自动切换，其他模型报错）
+        if self._messages_contain_images(messages):
+            guard_err = self._ensure_vision_model(emit)
+            if guard_err:
+                self.pending_images = this_turn_images + self.pending_images
+                emit(ControllerEvent.error(guard_err))
+                self._discard_node(node)
+                return None
+
+        # 请求体大小预检（仅内联 base64 回退路径会产生大请求体）
+        inline_bytes = collect_inline_bytes(messages)
+        if inline_bytes > VISION_REQUEST_MAX_BYTES:
+            self.pending_images = this_turn_images + self.pending_images
+            emit(ControllerEvent.error(
+                f"图片 base64 总量超限（约 {inline_bytes // 1024 // 1024} MiB "
+                f"> {VISION_REQUEST_MAX_BYTES // 1024 // 1024} MiB），"
+                "请减少图片数量或压缩后重试"
+            ))
+            self._discard_node(node)
+            return None
 
         final_answer: Optional[str] = None
         accumulated_reasoning = ""
@@ -591,6 +711,11 @@ class ChatController:
         accumulated_cache_hit = 0
         accumulated_cache_miss = 0
         tool_messages: List[Dict] = []
+
+        def _restore_pending() -> None:
+            """发送失败时把本轮图片放回待发送队列（下次发送自动重试上传）。"""
+            if this_turn_images:
+                self.pending_images = this_turn_images + self.pending_images
 
         try:
             while True:
@@ -606,6 +731,7 @@ class ChatController:
                     on_chunk=lambda c, r: emit(ControllerEvent.stream(c, r)),
                 )
                 if sr.error:
+                    _restore_pending()
                     emit(ControllerEvent.error(sr.error))
                     self._discard_node(node)
                     return None
@@ -668,11 +794,13 @@ class ChatController:
                     final_answer = sr.content
                     break
 
+                _restore_pending()
                 emit(ControllerEvent.error("回答生成失败，请重试"))
                 self._discard_node(node)
                 return None
         except Exception:
             # 未预期的异常：回滚前置创建的节点后重新抛出（由调用方显示错误）
+            _restore_pending()
             self._discard_node(node)
             raise
 
@@ -686,10 +814,80 @@ class ChatController:
         node.title = title
         if tool_messages:
             node.tool_messages = tool_messages
+        # 本节点消息是在 assistant 输出前构建并缓存的（缺本节点回答/工具消息），
+        # 失效缓存让下一次发送重建完整消息链（含本节点 assistant/tool 消息）。
+        node.cached_messages = None
         self.tree.current_node = node
         self._auto_title_subtree(node, emit)
         emit(ControllerEvent.done(node))
         return node
+
+    # ---------------- 多模态：图片上传与模型守卫 ----------------
+
+    def _upload_attachments(
+        self, attachments: List[ImageAttachment], emit: EventSink
+    ) -> None:
+        """尽力上传 path 附件为 Files API file_id；失败保留 file_id=None。
+
+        发送时对无 file_id 的 path 附件回退 base64 内联（见 images.build_image_block）。
+        """
+        for i, att in enumerate(attachments, start=1):
+            if att.file_id or att.is_url:
+                continue
+            emit(ControllerEvent.status(
+                f"正在上传图片 {i}/{len(attachments)}：{att.name}…"
+            ))
+            try:
+                att.file_id = upload_image(self.client, att.source)
+            except FilesAPIError as e:
+                emit(ControllerEvent.status(f"⚠️ {e}（将以内联 base64 发送）"))
+
+    def _ensure_chain_uploads(self, node: ConversationNode, emit: EventSink) -> None:
+        """历史节点的本地图片若缺 file_id 则补传（尽力而为，静默失败）。
+
+        上传成功会使该节点消息序列化改变（base64 → file 块），因此失效其
+        cached_messages 以便下次构建时使用 file_id。
+        """
+        for n in self._path_to_root(node):
+            changed = False
+            for att in n.user_images:
+                if (
+                    att.file_id is None
+                    and not att.is_url
+                    and os.path.exists(os.path.expanduser(att.source))
+                ):
+                    try:
+                        att.file_id = upload_image(self.client, att.source)
+                        changed = True
+                    except FilesAPIError:
+                        pass
+            if changed:
+                n.cached_messages = None
+
+    @staticmethod
+    def _messages_contain_images(messages: List[Dict]) -> bool:
+        """消息列表中是否存在图片内容块（image_url / file）。"""
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") in ("image_url", "file"):
+                        return True
+        return False
+
+    def _ensure_vision_model(self, emit: EventSink) -> Optional[str]:
+        """图片消息要求视觉模型：flash/pro 自动切换；其他模型返回错误信息。"""
+        if self.current_model == MODEL_V4_VISION:
+            return None
+        if self.current_model in (MODEL_V4_FLASH, MODEL_V4_PRO):
+            self.current_model = MODEL_V4_VISION
+            emit(ControllerEvent.status(
+                f"已自动切换到视觉模型 {MODEL_V4_VISION}（图片消息）"
+            ))
+            return None
+        return (
+            f"当前模型 {self.current_model} 不支持图片，请先 /set model vision 切换"
+        )
 
     def _begin_node(self, user_input: str) -> ConversationNode:
         """在流式输出前前置创建新节点并设为当前节点（UI 立即进入新节点）。"""
@@ -707,6 +905,45 @@ class ChatController:
         """出错时回滚前置创建的节点（连带重置当前节点）。"""
         if node.id in self.tree.nodes:
             self.tree.delete_node(node.id)
+
+    # ---------------- 多模态：Files API 文件管理 ----------------
+
+    def files_list(self) -> List[Dict]:
+        """列出已上传的图片文件（/files list）。"""
+        return list_files(self.client)
+
+    def files_delete(self, file_id: str) -> bool:
+        """删除一个已上传的图片文件（/files delete）。"""
+        delete_file(self.client, file_id)
+        return True
+
+    def delete_node(self, node_id: str) -> bool:
+        """删除节点及其子节点，并尽力删除其关联的 Files API 文件。
+
+        比 tree.delete_node 多了文件清理；失败静默（文件可 /files list 手工清理）。
+        """
+        node = self.tree.nodes.get(node_id)
+        if node is None:
+            return False
+        if node_id == "main" or (self.tree.root and node_id == self.tree.root.id):
+            return False
+        to_delete: set = set()
+        self.tree._collect_descendants(node, to_delete)
+        file_ids: List[str] = []
+        for nid in to_delete:
+            n = self.tree.nodes.get(nid)
+            if n:
+                for att in n.user_images:
+                    if att.file_id:
+                        file_ids.append(att.file_id)
+        if not self.tree.delete_node(node_id):
+            return False
+        for fid in file_ids:
+            try:
+                delete_file(self.client, fid)
+            except FilesAPIError:
+                pass
+        return True
 
     def _run_tool(self, name: str, args: dict, emit: EventSink) -> str:
         """执行一个工具，返回文本结果。"""

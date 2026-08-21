@@ -4,6 +4,8 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any, Iterator
 
+from mincli.tools.images import ImageAttachment, build_image_block
+
 
 @dataclass
 class StreamResult:
@@ -34,6 +36,8 @@ class ConversationNode:
     children: List['ConversationNode'] = field(default_factory=list)
     cached_messages: Optional[List[Dict]] = None
     tool_messages: List[Dict] = field(default_factory=list)
+    # 本节点用户消息附带的图片（多模态；发送时构造为 OpenAI 兼容内容块）
+    user_images: List[ImageAttachment] = field(default_factory=list)
 
     def get_messages(self, tree: 'ConversationTree') -> List[Dict]:
         if self.cached_messages is not None:
@@ -45,7 +49,13 @@ class ConversationNode:
             if parent:
                 msgs = parent.get_messages(tree).copy()
 
-        msgs.append({"role": "user", "content": self.user_msg})
+        if self.user_images:
+            # 多模态：content 为块数组（图片仅允许出现在 user 消息）
+            blocks: List[Dict] = [{"type": "text", "text": self.user_msg}]
+            blocks.extend(build_image_block(img) for img in self.user_images)
+            msgs.append({"role": "user", "content": blocks})
+        else:
+            msgs.append({"role": "user", "content": self.user_msg})
         for tm in self.tool_messages:
             msgs.append(tm)
         if self.assistant_msg:
@@ -70,6 +80,7 @@ class ConversationNode:
             "cache_hit_tokens": self.cache_hit_tokens,
             "cache_miss_tokens": self.cache_miss_tokens,
             "tool_messages": self.tool_messages,
+            "user_images": [img.to_dict() for img in self.user_images],
         }
 
     @classmethod
@@ -86,6 +97,10 @@ class ConversationNode:
             cache_hit_tokens=data.get("cache_hit_tokens", 0),
             cache_miss_tokens=data.get("cache_miss_tokens", 0),
             tool_messages=data.get("tool_messages", []),
+            user_images=[
+                ImageAttachment.from_dict(d)
+                for d in data.get("user_images", [])
+            ],
         )
 
 

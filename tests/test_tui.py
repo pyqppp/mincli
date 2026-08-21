@@ -81,6 +81,11 @@ class _FakeCompletions:
 class _FakeClient:
     def __init__(self, script):
         self.chat = SimpleNamespace(completions=_FakeCompletions(script))
+        self.files = SimpleNamespace(
+            create=lambda file, purpose: SimpleNamespace(id="file-api-tui"),
+            list=lambda: SimpleNamespace(data=[]),
+            delete=lambda file_id: SimpleNamespace(deleted=True),
+        )
 
 
 class FakeController(ChatController):
@@ -286,6 +291,54 @@ async def main() -> int:
             if "当前配置" in app.query_one("#chat-log", Markdown).source:
                 break
         check("命令：/set show 显示配置", "当前配置" in app.query_one("#chat-log", Markdown).source)
+
+        # --- 7.6 多模态：/img、/files、/set detail、/set model vision、节点视图占位 ---
+        from mincli.tools.images import ImageAttachment
+        _tpng = os.path.join(tempfile.mkdtemp(prefix="mincli_tui_img_"), "t.png")
+        with open(_tpng, "wb") as f:
+            f.write(
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\x0dIHDR"
+                + (800).to_bytes(4, "big")
+                + (600).to_bytes(4, "big")
+                + b"\x08\x06\x00\x00\x00"
+            )
+
+        await type_command(f"/img {_tpng}")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/img 添加待发送图片", len(fake.pending_images) == 1)
+        hint = app.query_one("#pending-images", Static)
+        check("待发送图片提示行显示", "待发送图片" in str(hint.content) and hint.has_class("visible"))
+
+        await type_command("/img clear")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/img clear 清空", len(fake.pending_images) == 0
+              and not app.query_one("#pending-images", Static).has_class("visible"))
+
+        await type_command("/set detail low")
+        await pilot.pause()
+        check("命令：/set detail low", fake.image_detail == "low")
+
+        await type_command("/set model vision")
+        await pilot.pause()
+        check("命令：/set model vision", fake.current_model == "deepseek-v4-flash-vision-exp")
+
+        await type_command("/files list")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/files list 显示空列表", "已上传图片文件" in app.query_one("#chat-log", Markdown).source)
+
+        # 节点视图：带图片的节点渲染占位（直接驱动 node_created 事件）
+        node = fake.tree.create_root("看图", "", "", "图题", 0, 0)
+        node.user_images = [ImageAttachment(source=_tpng, name="t.png", width=800, height=600)]
+        fake.tree.current_node = node
+        await app._handle_event(ControllerEvent.node_created(node))
+        for _ in range(10):
+            await pilot.pause()
+        check("节点视图含图片占位", "[图片: t.png (800x600)]" in app.query_one("#chat-log", Markdown).source)
+        await type_command("/clear")
 
         await type_command("/unknown_cmd")
         await pilot.pause()

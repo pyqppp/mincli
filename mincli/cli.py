@@ -10,9 +10,12 @@ import sys
 import typer
 from openai import OpenAI
 
+from mincli.tools.files import FilesAPIError
+
 from mincli.config import (
     MODEL_V4_FLASH,
     MODEL_V4_PRO,
+    MODEL_V4_VISION,
     COMPACT_DEFAULT_KEEP,
     SAVE_BASE_DIR,
     DEFAULT_SYSTEM_PROMPT,
@@ -39,12 +42,14 @@ def resolve_api_key(provider: str, model: str) -> str:
 
 
 def resolve_model_name(model: str) -> str:
-    """把简写 flash/pro 映射为完整模型名。"""
+    """把简写 flash/pro/vision 映射为完整模型名。"""
     arg = (model or "").lower()
     if arg in ("flash", "v4-flash", "f"):
         return MODEL_V4_FLASH
     if arg in ("pro", "v4-pro", "p"):
         return MODEL_V4_PRO
+    if arg in ("vision", "v-flash-vision", "v4-vision"):
+        return MODEL_V4_VISION
     return model
 
 
@@ -165,7 +170,39 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             if low in ("/exit", "/quit", "/q"):
                 break
             if low in ("/help", "/h"):
-                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文 | /tree 显示对话树 | /info 节点详情")
+                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文 | /tree 显示对话树 | /info 节点详情 | /img 添加图片 | /files 管理图片文件")
+                continue
+            if low in ("/img",) or low.startswith("/img "):
+                parts = text.split()
+                if len(parts) < 2:
+                    print("用法: /img <路径或URL> [...] | /img clear")
+                elif parts[1].lower() in ("clear", "c"):
+                    n = ctrl.clear_pending_images()
+                    print(f"已清除 {n} 张待发送图片")
+                else:
+                    added, errors = ctrl.add_pending_images(parts[1:])
+                    print(f"✅ 已添加 {added} 张图片（发送时自动附带）" if added else "未添加图片")
+                    for err in errors:
+                        print(f"⚠️ {err}")
+                continue
+            if low.startswith("/files"):
+                parts = text.split(maxsplit=2)
+                sub = parts[1].lower() if len(parts) > 1 else "list"
+                try:
+                    if sub in ("list", "ls", ""):
+                        files = ctrl.files_list()
+                        if not files:
+                            print("（无已上传图片文件）")
+                        else:
+                            for f in files:
+                                print(f"{f['id']}  {f['name']}  {f['bytes'] / 1024 / 1024:.2f} MiB")
+                    elif sub in ("delete", "rm", "del") and len(parts) == 3:
+                        ctrl.files_delete(parts[2])
+                        print(f"✅ 已删除文件 {parts[2]}")
+                    else:
+                        print("用法: /files list | /files delete <ID>")
+                except FilesAPIError as e:
+                    print(f"⚠️ {e}")
                 continue
             if low == "/clear":
                 ctrl.reset()
@@ -222,7 +259,7 @@ def info() -> None:
     registered = load_models()
     print("mincli 配置")
     print(f"  API Key: {'已配置 ✓' if api_key else '未配置 ✗'} (DEEPSEEK_API_KEY)")
-    print(f"  模型: {MODEL_V4_FLASH} / {MODEL_V4_PRO}")
+    print(f"  模型: {MODEL_V4_FLASH} / {MODEL_V4_PRO} / {MODEL_V4_VISION}")
     if registered:
         print(f"  已注册模型: {', '.join(registered.keys())}")
     print(f"  保存路径: {SAVE_BASE_DIR}")
