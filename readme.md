@@ -71,7 +71,7 @@ Config load order (high → low):
 |----------|--------|
 | 1 | Shell environment variables |
 | 2 | `~/.mincli/.env` |
-| 3 | Local `.env` |
+| 3 | Project Directory `.env` |
 
 ### 4. Launch
 ```bash
