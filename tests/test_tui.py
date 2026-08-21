@@ -335,11 +335,10 @@ async def main() -> int:
 
         copied: list[str] = []
         app.copy_to_clipboard = lambda t: copied.append(t)  # 记录而非真复制
-        copy_key = "super+c" if sys.platform == "darwin" else "ctrl+c"
-        await pilot.press(copy_key)  # 平台对应拷贝键（macOS ⌘C / 其他 Ctrl+C）
+        await pilot.press("ctrl+c")  # 有选区 → 复制而非退出（所有平台统一）
         for _ in range(8):
             await pilot.pause()
-        check(f"复制：{copy_key} 复制选中文本而非退出", bool(copied) and copied[0] == sel_text)
+        check("复制：Ctrl+C 复制选中文本而非退出", bool(copied) and copied[0] == sel_text)
         check("复制：有选区时未退出", app.screen is not None)
         del app.copy_to_clipboard  # 恢复为类方法
         app.screen.clear_selection()

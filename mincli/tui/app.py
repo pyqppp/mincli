@@ -176,11 +176,9 @@ class ChatApp(App):
     CSS_PATH = "chat.tcss"
 
     BINDINGS = [
-        # 拷贝快捷键按平台适配：
-        # - macOS：拷贝用 ⌘C（super+c，Textual 屏幕级绑定），Ctrl+C 固定为退出
-        #   → 这里把 ctrl+c 设为 priority 绑定，在复制绑定之前拦截；
-        # - Windows/Linux：Ctrl+C 在有选中文本时复制（屏幕级绑定优先），无选中时退出
-        Binding("ctrl+c", "quit", "退出", priority=(sys.platform == "darwin")),
+        # Ctrl+C 在所有平台统一：有选中文字时先复制（Textual 屏幕级绑定
+        # 优先，ChatInput/输入框选区、聊天区选区均可复制），无选中时退出
+        Binding("ctrl+c", "quit", "退出"),
         Binding(
             "caps_lock,num_lock,scroll_lock",
             "ignore_lock",
@@ -225,8 +223,7 @@ class ChatApp(App):
         Textual 默认通过 OSC52 转义序列写剪贴板，macOS 的 Terminal.app
         不支持该序列（这也是历史版本"能选择但不能拷贝"的原因）；这里在
         macOS 上额外调用 pbcopy 写入系统剪贴板，其他平台走 Textual 默认。
-        复制快捷键：macOS 按 ⌘C；Windows/Linux 按 Ctrl+C（无选中时
-        Ctrl+C 仍是退出）。
+        复制快捷键：所有平台统一按 Ctrl+C（有选中文本时复制，无选中时退出）。
         """
         super().copy_to_clipboard(text)
         if sys.platform == "darwin":

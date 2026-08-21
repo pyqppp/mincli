@@ -26,8 +26,6 @@ class ChatInput(TextArea):
         Alt+Enter  插入换行（仅限能区分该按键的终端；iTerm2 传统模式下
                     Alt+Enter 会被当作 Enter 处理，见键盘协议说明）
         Ctrl+C     无选区时退出应用；输入框内有选区时先复制（TextArea 默认）
-                   注意：macOS 上 Ctrl+C 由 App 级优先绑定固定为退出，
-                   复制统一用 ⌘C
     """
 
     BINDINGS = [
