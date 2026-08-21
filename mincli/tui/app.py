@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 
 # 必须在 Textual Markdown 组件创建解析器之前执行：
@@ -26,6 +27,35 @@ from textual.containers import Horizontal, Vertical
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Markdown, Static, Tree
 from textual.widgets._markdown import MarkdownBlockQuote
+
+# 防御 Textual 选区提取越界：流式渲染会重建 Markdown 块，拖选跨越重建
+# 瞬间时，锚点行号可能等于/超过新内容行数 → Selection.extract 直接索引
+# 越界崩溃（这也是历史版本用 ALLOW_SELECT=False 禁用整个选区的根本原因；
+# 现在从源头修掉，选区可正常使用）。
+from textual.selection import Selection as _TextualSelection
+
+
+def _patch_textual_selection() -> None:
+    """把 Selection.extract 包一层安全钳制（幂等）。"""
+    if getattr(_TextualSelection, "_mincli_safe_extract", False):
+        return
+    _orig_extract = _TextualSelection.extract
+
+    def _safe_extract(selection, text: str) -> str:
+        try:
+            return _orig_extract(selection, text)
+        except IndexError:
+            # 内容在选中期间被重建/缩短：退化为返回当前全部文本，而不是崩溃
+            try:
+                return "\n".join(text.splitlines())
+            except Exception:
+                return ""
+
+    _TextualSelection.extract = _safe_extract
+    _TextualSelection._mincli_safe_extract = True
+
+
+_patch_textual_selection()
 
 from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
@@ -143,12 +173,14 @@ class ChatApp(App):
     TITLE = "mincli"
     SUB_TITLE = "DeepSeek Chat"
 
-    ALLOW_SELECT = False  # 禁用鼠标选区，避免流式渲染期间点击 Markdown 块触发 Textual 选区崩溃
-
     CSS_PATH = "chat.tcss"
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "退出"),
+        # 拷贝快捷键按平台适配：
+        # - macOS：拷贝用 ⌘C（super+c，Textual 屏幕级绑定），Ctrl+C 固定为退出
+        #   → 这里把 ctrl+c 设为 priority 绑定，在复制绑定之前拦截；
+        # - Windows/Linux：Ctrl+C 在有选中文本时复制（屏幕级绑定优先），无选中时退出
+        Binding("ctrl+c", "quit", "退出", priority=(sys.platform == "darwin")),
         Binding(
             "caps_lock,num_lock,scroll_lock",
             "ignore_lock",
@@ -186,6 +218,24 @@ class ChatApp(App):
     def action_ignore_lock(self) -> None:
         """忽略锁定键（Caps Lock / Num Lock / Scroll Lock）。"""
         pass
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """复制文本到系统剪贴板。
+
+        Textual 默认通过 OSC52 转义序列写剪贴板，macOS 的 Terminal.app
+        不支持该序列（这也是历史版本"能选择但不能拷贝"的原因）；这里在
+        macOS 上额外调用 pbcopy 写入系统剪贴板，其他平台走 Textual 默认。
+        复制快捷键：macOS 按 ⌘C；Windows/Linux 按 Ctrl+C（无选中时
+        Ctrl+C 仍是退出）。
+        """
+        super().copy_to_clipboard(text)
+        if sys.platform == "darwin":
+            try:
+                subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+            except Exception:
+                pass
+        if text:
+            self.notify(f"已复制 {len(text)} 字符")
 
     def compose(self) -> ComposeResult:
         yield Header()

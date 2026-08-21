@@ -137,6 +137,7 @@ class FakeController(ChatController):
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
     test_markdown_safety()
+    test_selection_safety()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -320,6 +321,31 @@ async def main() -> int:
             await pilot.pause()
         check("命令：/compact 非法参数被拦截", fake.tree.compaction is None)
 
+        # --- 7.9 文字选择 + 复制 ---
+        chat = app.query_one("#chat-log", Markdown)
+        check("选区：ALLOW_SELECT 已开启", app.ALLOW_SELECT)
+        await pilot.mouse_down("#chat-log", offset=(10, 4))
+        await pilot.pause()
+        await pilot.mouse_up("#chat-log", offset=(45, 14))
+        for _ in range(8):
+            await pilot.pause()
+        check("选区：拖选后产生选区", bool(app.screen.selections))
+        sel_text = app.screen.get_selected_text()
+        check("选区：可提取选中文本", bool(sel_text))
+
+        copied: list[str] = []
+        app.copy_to_clipboard = lambda t: copied.append(t)  # 记录而非真复制
+        copy_key = "super+c" if sys.platform == "darwin" else "ctrl+c"
+        await pilot.press(copy_key)  # 平台对应拷贝键（macOS ⌘C / 其他 Ctrl+C）
+        for _ in range(8):
+            await pilot.pause()
+        check(f"复制：{copy_key} 复制选中文本而非退出", bool(copied) and copied[0] == sel_text)
+        check("复制：有选区时未退出", app.screen is not None)
+        del app.copy_to_clipboard  # 恢复为类方法
+        app.screen.clear_selection()
+        await pilot.pause()
+        check("选区：清除后无选区", not app.screen.selections)
+
         # --- 8. Ctrl+C 退出 ---
         await pilot.press("ctrl+c")
 
@@ -328,6 +354,24 @@ async def main() -> int:
 
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 0 if FAIL == 0 else 1
+
+
+def test_selection_safety():
+    """Textual 选区提取越界防御：拖选跨越流式重建时锚点越界不崩溃。"""
+    from textual.selection import Selection
+    from textual.geometry import Offset
+
+    # 崩溃路径：start/end 行号 == 内容行数（内容在选中期间被重建/缩短）
+    sel = Selection.from_offsets(Offset(0, 3), Offset(0, 3))
+    try:
+        result = sel.extract("line1\nline2\nline3")
+        ok = True
+    except IndexError:
+        ok = False
+    check("选区提取越界不崩溃", ok and result == "line1\nline2\nline3")
+    # 正常路径不受影响
+    sel2 = Selection.from_offsets(Offset(0, 0), Offset(5, 0))
+    check("选区提取正常路径不变", sel2.extract("hello world") == "hello")
 
 
 def test_markdown_safety():
