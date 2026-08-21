@@ -72,7 +72,7 @@ cp .env.example .env
 |--------|------|
 | 1 | Shell 环境变量 |
 | 2 | `~/.mincli/.env` |
-| 3 | 当前目录 `.env` |
+| 3 | 项目目录 `.env` |
 
 ### 4. 启动
 ```bash
