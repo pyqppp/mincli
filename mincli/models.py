@@ -129,9 +129,9 @@ class ConversationTree:
         self.root: Optional[ConversationNode] = None
         self.current_node: Optional[ConversationNode] = None
         self.subtree_titles: Dict[str, str] = {}
-        # 上下文压缩：{"summary": str, "boundary_id": str, "next_input_tokens": int}。
-        # boundary_id 为最后一个被压缩进摘要的节点；其后（含其后分支）仍按原文发送；
-        # next_input_tokens 为压缩报告 after_tokens（状态条「下次输入」压缩后采用）。
+        # 上下文压缩：{"summary": str, "boundary_id": str}。
+        # boundary_id 为 /compact 新建的「摘要节点」；只有摘要节点及其子节点
+        # 发送消息时用摘要替代全部历史，其余节点仍发送完整原始消息。
         self.compaction: Optional[Dict[str, Any]] = None
 
     def _generate_child_id(self, parent: ConversationNode) -> str:
@@ -233,13 +233,6 @@ class ConversationTree:
             if cur.id == ancestor_id:
                 return True
             cur = self.nodes.get(cur.parent_id) if cur.parent_id else None
-        return False
-
-    def clear_compaction(self) -> bool:
-        """清除压缩摘要，恢复发送完整原始消息。返回是否真的清除了。"""
-        if self.compaction:
-            self.compaction = None
-            return True
         return False
 
     def switch_to_node(self, node_id: str) -> bool:

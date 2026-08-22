@@ -134,6 +134,7 @@ def test_attachments():
     png = write("a.png", png_bytes(800, 600))
     att = make_path_attachment(png, detail="low")
     check("路径附件字段", att.name == "a.png" and att.size_bytes > 0)
+    check("路径附件保存绝对路径", os.path.isabs(att.source) and att.source == os.path.abspath(png))
     check("尺寸已解析", (att.width, att.height) == (800, 600))
     check("detail 生效", att.detail == "low")
     check("token 估算写入", att.tokens_est == 144)  # low: 512×384 → 117 + 27

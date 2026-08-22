@@ -5,6 +5,7 @@ prompt_toolkit / 无流式渲染依赖）。
 """
 
 import os
+import shlex
 import sys
 
 import typer
@@ -16,7 +17,6 @@ from mincli.config import (
     MODEL_V4_FLASH,
     MODEL_V4_PRO,
     MODEL_V4_VISION,
-    COMPACT_DEFAULT_KEEP,
     SAVE_BASE_DIR,
     DEFAULT_SYSTEM_PROMPT,
     SYSTEM_PROMPT_SOURCE,
@@ -170,19 +170,29 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             if low in ("/exit", "/quit", "/q"):
                 break
             if low in ("/help", "/h"):
-                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文 | /tree 显示对话树 | /info 节点详情 | /img 添加图片 | /files 管理图片文件")
+                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文（新建摘要节点） | /tree 显示对话树 | /info 节点详情 | /import 导入文件/图片 | /files 管理图片文件")
                 continue
-            if low in ("/img",) or low.startswith("/img "):
-                parts = text.split()
-                if len(parts) < 2:
-                    print("用法: /img <路径或URL> [...] | /img clear")
-                elif parts[1].lower() in ("clear", "c"):
-                    n = ctrl.clear_pending_images()
-                    print(f"已清除 {n} 张待发送图片")
+            if low.startswith("/import"):
+                try:
+                    parts = shlex.split(text)
+                except ValueError:
+                    print("参数解析失败（引号不匹配）")
+                    continue
+                targets = parts[1:]
+                if not targets:
+                    print("用法: /import <路径或URL> [...] | /import clear")
+                elif targets[0].lower() in ("clear", "c"):
+                    n = ctrl.clear_imports()
+                    print(f"已清除 {n} 个待导入文件")
                 else:
-                    added, errors = ctrl.add_pending_images(parts[1:])
-                    print(f"✅ 已添加 {added} 张图片（发送时自动附带）" if added else "未添加图片")
-                    for err in errors:
+                    res = ctrl.import_targets(targets)
+                    bits = []
+                    if res["images_added"]:
+                        bits.append(f"{res['images_added']} 张图片")
+                    if res["text_added"]:
+                        bits.append(f"{res['text_added']} 个文本/网页")
+                    print(f"✅ 已导入 {'、'.join(bits)}（发送时自动附带）" if bits else "未导入任何内容")
+                    for err in res["errors"]:
                         print(f"⚠️ {err}")
                 continue
             if low.startswith("/files"):
@@ -209,31 +219,23 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                 print("已清空当前会话")
                 continue
             if low.startswith("/compact"):
-                parts = text.split()
-                sub = parts[1].lower() if len(parts) > 1 else ""
-                if sub in ("off", "reset", "clear", "undo"):
-                    if ctrl.clear_compaction():
-                        print("已清除上下文压缩摘要，恢复发送完整原始消息")
-                    else:
-                        print("当前没有压缩摘要")
+                if not ctrl.tree or ctrl.tree.current_node is None:
+                    print("当前没有对话可压缩")
                     continue
-                keep = COMPACT_DEFAULT_KEEP
-                if sub:
-                    try:
-                        keep = max(0, int(sub))
-                    except ValueError:
-                        print("用法: /compact [保留轮数] | /compact off")
-                        continue
+                if ctrl.tree.compaction and ctrl.tree.compaction.get("boundary_id") == ctrl.tree.current_node.id:
+                    print("当前节点已是压缩摘要节点（切换回其他节点仍使用完整历史）")
+                    continue
                 print("正在压缩上下文…")
-                stats = ctrl.compact_history(keep)
+                stats = ctrl.compact_history()
                 if stats is None:
-                    print("无可压缩的对话（对话太短，或压缩失败）")
+                    print("无可压缩的对话（或压缩失败）")
+                elif stats.get("blocked"):
+                    print("当前节点已是压缩摘要节点")
                 else:
                     print(
-                        f"✅ 已压缩 {stats['nodes_compressed']} 轮，保留最近 {stats['nodes_kept']} 轮原文；"
+                        f"✅ 已压缩 {stats['nodes_compressed']} 轮 → 新节点 {stats['node_id']}（摘要）；"
                         f"Token {stats['before_tokens']} → {stats['after_tokens']}（节省 {stats['saved_tokens']}）"
                     )
-                    print(f"📦 摘要（{stats['summary_chars']} 字）：\n{stats['summary']}")
                 continue
             if low == "/tree":
                 print(ctrl.tree.render_tree(

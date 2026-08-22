@@ -169,7 +169,8 @@ async def main() -> int:
                 break
         chat = app.query_one("#chat-log", Markdown)
         check("流式内容已追加", "你好，世界！" in chat.source)
-        check("思考已显示", "思考中" in chat.source)
+        # 正文开始后思考块自动折叠为「思考过程」占位（思考全文已不在源文本中）
+        check("思考已显示（折叠占位）", "思考过程" in chat.source)
         check("token 统计已显示", "tokens" in chat.source)
 
         # --- 3. 会话树更新 + 光标跟随新节点 ---
@@ -292,9 +293,10 @@ async def main() -> int:
                 break
         check("命令：/set show 显示配置", "当前配置" in app.query_one("#chat-log", Markdown).source)
 
-        # --- 7.6 多模态：/img、/files、/set detail、/set model vision、节点视图占位 ---
+        # --- 7.6 多模态：/import、/files、/set detail、/set model vision、节点视图占位 ---
         from mincli.tools.images import ImageAttachment
-        _tpng = os.path.join(tempfile.mkdtemp(prefix="mincli_tui_img_"), "t.png")
+        _tmp_img = tempfile.mkdtemp(prefix="mincli_tui_img_")
+        _tpng = os.path.join(_tmp_img, "t.png")
         with open(_tpng, "wb") as f:
             f.write(
                 b"\x89PNG\r\n\x1a\n"
@@ -303,19 +305,82 @@ async def main() -> int:
                 + (600).to_bytes(4, "big")
                 + b"\x08\x06\x00\x00\x00"
             )
+        _txt = os.path.join(_tmp_img, "note.txt")
+        with open(_txt, "w", encoding="utf-8") as f:
+            f.write("hello")
 
-        await type_command(f"/img {_tpng}")
+        await type_command(f"/import {_tpng}")
         for _ in range(10):
             await pilot.pause()
-        check("命令：/img 添加待发送图片", len(fake.pending_images) == 1)
-        hint = app.query_one("#pending-images", Static)
-        check("待发送图片提示行显示", "待发送图片" in str(hint.content) and hint.has_class("visible"))
+        check("命令：/import 添加待发送图片", len(fake.pending_images) == 1)
+        hint = app.query_one("#import-status", Static)
+        check("导入状态栏显示", "已导入 1 个文件" in str(hint.content) and hint.has_class("visible"))
 
-        await type_command("/img clear")
+        # 一次导入多个文件（图片 + 文本）+ 悬停弹窗（完整文件名列表）
+        await type_command("/import clear")
         for _ in range(10):
             await pilot.pause()
-        check("命令：/img clear 清空", len(fake.pending_images) == 0
-              and not app.query_one("#pending-images", Static).has_class("visible"))
+        await type_command(f"/import {_tpng} {_txt}")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/import 多文件", len(fake.pending_images) == 1 and len(fake.imported_files) == 1)
+        check("状态栏数量与前2文件名", "已导入 2 个文件" in str(hint.content) and "note.txt" in str(hint.content))
+        popup = app.query_one("#import-popup", Static)
+        sr = hint.region
+        app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
+                                          screen_x=sr.x + 1, screen_y=sr.y))
+        for _ in range(5):
+            await pilot.pause()
+        check("悬停显示完整列表", popup.has_class("visible") and "note.txt" in str(popup.content))
+        app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
+                                          screen_x=sr.x + 1, screen_y=max(0, sr.y - 5)))
+        for _ in range(5):
+            await pilot.pause()
+        check("移开鼠标自动消失", not popup.has_class("visible"))
+
+        await type_command("/import clear")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/import clear 清空", len(fake.pending_images) == 0 and len(fake.imported_files) == 0
+              and not app.query_one("#import-status", Static).has_class("visible"))
+
+        # --- 7.6b 拖入文件直接导入（终端把路径粘贴进输入框） ---
+        inp.clear()
+        await pilot.pause()
+        app.post_message(events.Paste(f'"{_tpng}" "{_txt}"'))
+        for _ in range(20):
+            await pilot.pause()
+        check("拖入：多文件自动导入", len(fake.pending_images) == 1 and len(fake.imported_files) == 1)
+        check("拖入：输入框未残留路径文本", inp.text == "")
+        check("拖入：状态栏显示数量", "已导入 2 个文件" in str(hint.content) and hint.has_class("visible"))
+
+        await type_command("/import clear")
+        for _ in range(10):
+            await pilot.pause()
+
+        # 普通文本粘贴不触发导入、照常插入
+        inp.clear()
+        await pilot.pause()
+        app.post_message(events.Paste("这是一段普通粘贴的文本"))
+        for _ in range(10):
+            await pilot.pause()
+        check("普通粘贴不导入", len(fake.pending_images) == 0 and len(fake.imported_files) == 0)
+        check("普通粘贴照常插入（仅一次）", inp.text == "这是一段普通粘贴的文本")
+
+        # 焦点不在输入框时（如在对话树），路径粘贴仍兜底导入
+        inp.clear()
+        app.set_focus(app.query_one("#tree", Tree))
+        await pilot.pause()
+        app.post_message(events.Paste(_tpng))
+        for _ in range(20):
+            await pilot.pause()
+        check("焦点在树时拖入也导入", len(fake.pending_images) == 1)
+        inp.focus()
+        await pilot.pause()
+        await type_command("/import clear")
+        for _ in range(10):
+            await pilot.pause()
+        check("拖入后 clear 清空", len(fake.pending_images) == 0 and len(fake.imported_files) == 0)
 
         await type_command("/set detail low")
         await pilot.pause()
@@ -344,35 +409,60 @@ async def main() -> int:
         await pilot.pause()
         check("未知命令不发送给 LLM", fake.client.chat.completions.script == [])
 
-        # --- 7.7 /compact 命令 ---
+        # --- 7.7 /compact 命令（全部压缩 + 新建摘要节点） ---
         fake.tree.create_root("问题1", "回答1", "", "标题1", 1, 1)
         n2 = fake.tree.add_child(fake.tree.root, "问题2", "回答2", "", "标题2", 1, 1)
         n3 = fake.tree.add_child(n2, "问题3", "回答3", "", "标题3", 1, 1)
         n4 = fake.tree.add_child(n3, "问题4", "回答4", "", "标题4", 1, 1)
         fake.tree.current_node = n4
         fake.client.chat.completions.script.append(_FakeChatResponse(content="【摘要】TUI 压缩测试内容"))
+
+        # 带参数被拦截
         await type_command("/compact 0")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/compact 带参数被拦截", fake.tree.compaction is None)
+
+        await type_command("/compact")
         for _ in range(30):
             await pilot.pause()
-            if "上下文已压缩" in app.query_one("#chat-log", Markdown).source:
+            if fake.tree.compaction and fake.tree.current_node.id == fake.tree.compaction["boundary_id"]:
                 break
         chat = app.query_one("#chat-log", Markdown)
+        check("命令：/compact 新建摘要节点", fake.tree.compaction is not None)
+        node_id = fake.tree.compaction["boundary_id"]
         check(
-            "命令：/compact 显示压缩结果",
-            "上下文已压缩" in chat.source and "TUI 压缩测试内容" in chat.source,
+            "命令：/compact 显示摘要",
+            "上下文压缩摘要" in chat.source and "TUI 压缩测试内容" in chat.source,
         )
-        check(
-            "命令：/compact 写入树",
-            fake.tree.compaction is not None and fake.tree.compaction["boundary_id"] == n4.id,
-        )
-        await type_command("/compact off")
+        check("命令：/compact 摘要节点为当前", fake.tree.current_node.id == node_id)
+
+        # 当前已是摘要节点 → 再次 /compact 被拦截
+        await type_command("/compact")
         for _ in range(10):
             await pilot.pause()
-        check("命令：/compact off 清除压缩", fake.tree.compaction is None)
-        await type_command("/compact 太多参数")
+        check("命令：/compact 禁止重复压缩",
+              fake.tree.compaction["boundary_id"] == node_id and len(fake.tree.nodes) == 5)
+
+        # --- 7.8 /delete 多节点 ---
+        await type_command("/clear")
+        fake.tree.create_root("根", "回", "", "根", 1, 1)
+        da1 = fake.tree.add_child(fake.tree.root, "q", "a", "", "t", 1, 1)
+        db1 = fake.tree.add_child(fake.tree.root, "q", "a", "", "t", 1, 1)
+        db2 = fake.tree.add_child(db1, "q", "a", "", "t", 1, 1)
+        fake.tree.current_node = db2
+        await type_command(f"/delete {da1.id} {db1.id} {db2.id}")
+        for _ in range(30):
+            await pilot.pause()
+            if app.screen.query("#confirm-yes"):
+                break
+        check("删除：多节点确认弹窗", bool(app.screen.query("#confirm-yes")))
+        app.screen.query_one("#confirm-yes", Button).press()
         for _ in range(10):
             await pilot.pause()
-        check("命令：/compact 非法参数被拦截", fake.tree.compaction is None)
+        check("删除：父节点级联删除子节点",
+              da1.id not in fake.tree.nodes and db1.id not in fake.tree.nodes and db2.id not in fake.tree.nodes)
+        check("删除：根节点保留", fake.tree.root is not None and fake.tree.current_node is not None)
 
         # --- 7.9 文字选择 + 复制 ---
         chat = app.query_one("#chat-log", Markdown)

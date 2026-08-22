@@ -61,7 +61,6 @@ _patch_textual_selection()
 from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
     MODEL_V4_FLASH,
-    COMPACT_DEFAULT_KEEP,
     BALANCE_REFRESH_SECONDS,
     PREVIEW_ASSISTANT_MSG_LEN,
     PREVIEW_USER_MSG_LEN,
@@ -97,9 +96,9 @@ DeepSeek 树状对话 TUI
 COMMAND_HELP: dict[str, str] = {
     "/exit": "退出程序（自动保存会话）",
     "/clear": "清空当前会话",
-    "/compact": f"用法: /compact [保留轮数] | /compact off\n把当前分支早期对话压缩成详细摘要（默认保留最近 {COMPACT_DEFAULT_KEEP} 轮原文，0=全部压缩；off 清除压缩恢复原文）",
+    "/compact": "用法: /compact\n把当前分支全部对话压缩成详细摘要并新建摘要节点；在摘要节点（及其子节点）输入使用摘要，其他节点仍用完整历史",
     "/help": "显示此帮助",
-    "/import": "用法: /import <文件路径或URL>\n导入文件或抓取网页，下次提问自动附加到上下文；图片文件自动转为待发送图片",
+    "/import": "用法: /import <文件路径或URL> [...] | /import clear\n导入文件/网页（图片自动转为待发送图片；可一次导入多个；clear 清除待导入内容）。也可以直接把文件拖进终端窗口（粘贴的路径会自动识别并导入）",
     "/view": "用编辑器打开当前回答",
     "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
     "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
@@ -111,9 +110,8 @@ COMMAND_HELP: dict[str, str] = {
     "/full": "切换全览模式：节点树全宽显示（切换节点自动退出）\n隐藏右侧回答区、输入框保留；再按一次 /full 恢复分栏",
     "/reasoning": "展开/折叠当前消息的思考过程\n正文开始后思考过程会自动折叠成一行，点击灰色折叠块也可展开",
     "/save": "用法: /save [节点ID]\n导出节点为 Markdown 文件",
-    "/delete": "用法: /delete <节点ID>\n删除节点及其所有子节点（需确认）",
-    "/img": "用法: /img <路径或URL> [路径或URL...] | /img clear\n添加待发送图片（多图可一次添加；发送时自动附带，需视觉模型）",
-    "/files": "用法: /files list | /files delete <ID>\n管理已上传的 Files API 图片文件（/img 上传的图片可在此查看/删除）",
+    "/delete": "用法: /delete <节点ID> [...]\n删除一个或多个节点及其所有子节点（需确认；子节点随父节点级联删除）",
+    "/files": "用法: /files list | /files delete <ID>\n管理已上传的 Files API 图片文件（/import 导入的图片可在此查看/删除）",
 }
 
 # 思考过程折叠后的一行占位（块引用，灰色、可点击展开）
@@ -253,7 +251,8 @@ class ChatApp(App):
         yield ChatInput(
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
-        yield Static("", id="pending-images")
+        yield Static("", id="import-popup")
+        yield Static("", id="import-status")
         with Horizontal(id="usage-bar"):
             yield Static("", id="usage-left")
             yield Static("", id="usage-right")
@@ -277,13 +276,16 @@ class ChatApp(App):
             )
         self.ctrl.confirm = self._confirm
         self.query_one("#tree", Tree).auto_expand = False  # 点击节点名只切换节点，不收起/展开
+        # 导入状态栏与悬停弹窗（缓存引用，on_mouse_move 高频使用）
+        self._import_status_w = self.query_one("#import-status", Static)
+        self._import_popup_w = self.query_one("#import-popup", Static)
         self._rebuild_tree()
         self.query_one("#chat-input", ChatInput).focus()
         if self.ctrl.session_loaded:
             self.notify("已加载上次会话记录", timeout=4)
         self._start_balance_refresh()
         self._refresh_usage_bar()
-        self._refresh_pending_images()
+        self._refresh_import_status()
 
     def on_unmount(self) -> None:
         self._cancel_flush()
@@ -344,18 +346,19 @@ class ChatApp(App):
             f"⏭ 下次输入 {tokens:,} tok {price_txt}（{peak_txt}价）"
         )
 
-    def _refresh_pending_images(self) -> None:
-        """刷新输入框上方的待发送图片提示行（无图时隐藏）。"""
+    def _refresh_import_status(self) -> None:
+        """刷新输入框下方状态栏的「已导入文件」提示行（无导入时隐藏）。"""
         if self.ctrl is None:
             return
-        hint = self.query_one("#pending-images", Static)
-        text = self.ctrl.pending_images_summary()
+        hint = self._import_status_w
+        text = self.ctrl.import_summary()
         if text:
             hint.update(text)
             hint.add_class("visible")
         else:
             hint.update("")
             hint.remove_class("visible")
+            self._import_popup_w.remove_class("visible")
 
     def _pending_images_md(self) -> str:
         """待发送图片在聊天区里的 Markdown 占位行（提交回显用）。"""
@@ -365,6 +368,91 @@ class ChatApp(App):
             f"- {image_placeholder_text(a)}" for a in self.ctrl.pending_images
         )
         return f"\n\n{marks}"
+
+    # ---------------- 导入状态栏悬停弹窗（完整文件名列表） ----------------
+
+    _IMPORT_KIND_MARKS = {"image": "📷", "text": "📄", "web": "🌐"}
+
+    def _show_import_popup(self) -> None:
+        """在导入状态栏上方显示完整文件名列表弹窗（悬停时）。"""
+        if self.ctrl is None:
+            return
+        items = self.ctrl.import_file_list()
+        if not items:
+            return
+        lines = []
+        for item in items:
+            name = item.get("name", "")
+            if len(name) > 100:
+                name = name[:97] + "…"
+            lines.append(f"{self._IMPORT_KIND_MARKS.get(item.get('kind', ''), '•')} {name}")
+        popup = self._import_popup_w
+        popup.update("\n".join(lines))
+        sr = self._import_status_w.region
+        if sr.width <= 0 or sr.height <= 0:
+            return
+        # 绝对定位（offset 相对屏幕左上角）：弹窗紧贴状态栏上方。
+        # 高度按内容行数估算（内容 + 圆角边框 1 行，封顶屏幕 40%）。
+        max_h = int(self.screen.size.height * 0.4)
+        h = min(len(lines), max_h) + 1
+        top = max(0, sr.y - h - 1)
+        popup.styles.position = "absolute"
+        popup.styles.offset = (sr.x, top)
+        popup.add_class("visible")
+
+    def _hide_import_popup(self) -> None:
+        self._import_popup_w.remove_class("visible")
+
+    def on_mouse_move(self, event) -> None:
+        """鼠标在导入状态栏上悬停 → 显示完整文件列表；移出 → 自动消失。"""
+        status = getattr(self, "_import_status_w", None)
+        if status is None or event.screen_x is None or event.screen_y is None:
+            return
+        region = status.region
+        if region.width <= 0 or region.height <= 0:
+            return
+        if region.contains(int(event.screen_x), int(event.screen_y)):
+            if not self._import_popup_w.has_class("visible"):
+                self._show_import_popup()
+        else:
+            if self._import_popup_w.has_class("visible"):
+                self._import_popup_w.remove_class("visible")
+
+    # ---------------- 拖入文件直接导入（终端路径粘贴） ----------------
+
+    def _notify_import_result(self, res: dict) -> None:
+        """统一展示 import_targets 的导入结果通知。"""
+        bits = []
+        if res["images_added"]:
+            bits.append(f"{res['images_added']} 张图片")
+        if res["text_added"]:
+            bits.append(f"{res['text_added']} 个文本/网页")
+        if bits:
+            self.notify(f"✅ 已导入 {'、'.join(bits)}，发送时自动附带")
+        for err in res["errors"][:2]:
+            self.notify(err, severity="warning")
+        if len(res["errors"]) > 2:
+            self.notify(f"…共 {len(res['errors'])} 个失败", severity="warning")
+
+    async def on_chat_input_files_dropped(self, message: ChatInput.FilesDropped) -> None:
+        """输入框内拖入文件：终端把路径粘贴进输入框 → 直接导入。"""
+        if self.ctrl is None:
+            return
+        res = self.ctrl.import_targets(message.paths)
+        self._refresh_import_status()
+        self._notify_import_result(res)
+        self.query_one("#chat-input", ChatInput).focus()
+
+    async def on_paste(self, event: events.Paste) -> None:
+        """兜底：焦点不在输入框时，粘贴内容若为文件路径也直接导入。"""
+        if self.ctrl is None:
+            return
+        paths = ChatInput._paths_from_paste(event.text)
+        if paths is None:
+            return
+        res = self.ctrl.import_targets(paths)
+        self._refresh_import_status()
+        self._notify_import_result(res)
 
     # ---------------- 对话树侧栏 ----------------
 
@@ -421,6 +509,19 @@ class ChatApp(App):
 
     def _node_content(self, node) -> str:
         """把节点渲染为消息区 Markdown 内容（思考过程内联在提问与回答之间）。"""
+        comp = (
+            self.ctrl.tree.compaction
+            if self.ctrl is not None and self.ctrl.tree is not None
+            else None
+        )
+        if comp and comp.get("boundary_id") == node.id:
+            # 摘要节点：直接显示压缩后的信息
+            return (
+                f"# {node.id}: {node.title}\n\n"
+                f"**📦 已压缩上下文**\n\n"
+                f"在此节点输入将基于以下摘要继续对话；切换到其他节点仍使用完整历史。\n\n"
+                f"---\n\n{node.user_msg}"
+            )
         content = f"# {node.id}: {node.title}\n\n**你：**\n\n{node.user_msg}\n\n"
         if node.reasoning:
             content += "\n\n" + self._build_reasoning_md(node.reasoning) + "\n\n"
@@ -740,42 +841,24 @@ class ChatApp(App):
         if await self._cmd_tree(cmd):
             return True
         if low.startswith("/import"):
-            parts = cmd.split(maxsplit=1)
-            if len(parts) < 2:
-                self.notify("用法: /import <文件路径或URL>", severity="warning")
-            else:
-                self.notify("正在导入…")
-                before = len(ctrl.pending_images)
-                err = ctrl.import_target(parts[1].strip())
-                if err is None:
-                    after = len(ctrl.pending_images)
-                    self._refresh_pending_images()
-                    if after > before:
-                        self.notify(f"✅ 已添加 {after - before} 张图片，将在发送时自动附带")
-                    else:
-                        self.notify("✅ 内容已导入，将在下一次提问时自动附加")
-                else:
-                    self.notify(err, severity="error")
-            return True
-
-        if low.startswith("/img"):
-            parts = cmd.split()
-            if len(parts) < 2:
-                self.notify("用法: /img <路径或URL> [路径或URL...] | /img clear", severity="warning")
-            elif parts[1].lower() in ("clear", "c"):
-                n = ctrl.clear_pending_images()
-                self._refresh_pending_images()
-                self.notify(f"已清除 {n} 张待发送图片")
-            else:
-                targets = parts[1:]
-                added, errors = ctrl.add_pending_images(targets)
-                self._refresh_pending_images()
-                if added:
-                    self.notify(f"✅ 已添加 {added} 张图片（发送时自动附带）")
-                for err in errors[:2]:
-                    self.notify(err, severity="warning")
-                if len(errors) > 2:
-                    self.notify(f"…共 {len(errors)} 个失败", severity="warning")
+            try:
+                parts = shlex.split(cmd)
+            except ValueError:
+                self.notify("参数解析失败（引号不匹配）", severity="warning")
+                return True
+            targets = parts[1:]
+            if not targets:
+                self.notify("用法: /import <路径或URL> [...] | /import clear", severity="warning")
+                return True
+            if targets[0].lower() in ("clear", "c"):
+                n = ctrl.clear_imports()
+                self._refresh_import_status()
+                self.notify(f"已清除 {n} 个待导入文件")
+                return True
+            self.notify("正在导入…")
+            res = ctrl.import_targets(targets)
+            self._refresh_import_status()
+            self._notify_import_result(res)
             return True
 
         if low.startswith("/files"):
@@ -866,10 +949,9 @@ class ChatApp(App):
 **基本命令**
 - `/exit`, `/quit`, `/q` — 退出程序（自动保存会话）
 - `/clear`, `/c` — 清空当前会话
-- `/compact [N]` — 压缩上下文：把早期对话压成详细摘要，保留最近 N 轮原文（默认 5，0=全部压缩；再次执行会重新压缩）
-- `/compact off` — 清除压缩摘要，恢复发送完整原始消息
+- `/compact` — 压缩上下文：把当前分支全部对话压成详细摘要并新建摘要节点（在摘要节点输入用摘要，其他节点仍用完整历史）
 - `/help`, `/h` — 显示此帮助
-- `/import <路径或URL>` — 导入文件或抓取网页
+- `/import <路径或URL> [...]` — 导入文件/网页/图片（可一次多个；`/import clear` 清除待导入内容）
 - `/mcp <list|add|remove|reload>` — 管理第三方 MCP server
 - `/view` — 用编辑器打开当前回答
 
@@ -885,8 +967,7 @@ class ChatApp(App):
 - `/set show` — 显示当前配置
 
 **多模态（图片理解）**
-- `/img <路径或URL> [...]` — 添加待发送图片（发送时自动附带；图片消息自动切换视觉模型 deepseek-v4-flash-vision-exp）
-- `/import 图片文件` — 图片文件自动转为待发送图片
+- `/import <路径或URL> [...]` — 图片文件/图片 URL 自动转为待发送图片（发送时自动附带；图片消息自动切换视觉模型 deepseek-v4-flash-vision-exp）
 - `/files list|delete <ID>` — 查看/删除 Files API 已上传的图片文件
 
 **多模型**
@@ -902,7 +983,7 @@ class ChatApp(App):
 - `/full` — 全览模式：隐藏回答区，节点树全宽（再按一次或切换节点自动退出）
 - `/reasoning` — 展开/折叠当前消息的思考过程（正文开始后自动折叠，也可点击折叠块）
 - `/save [节点ID]` — 导出节点为 Markdown
-- `/delete <节点ID>` — 删除节点及其子节点
+- `/delete <节点ID> [...]` — 删除一个或多个节点及其子节点（需确认；子节点随父节点级联删除）
 
 **快捷键**
 - **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行 · **Ctrl+C** 退出
@@ -1035,38 +1116,44 @@ class ChatApp(App):
                 self.notify("节点不存在", severity="error")
             return True
         if low.startswith("/delete"):
-            nid = parts[1] if len(parts) > 1 else None
-            if nid is None:
-                self.notify("用法: /delete <节点ID>", severity="warning")
+            nids = parts[1:]
+            if not nids:
+                self.notify("用法: /delete <节点ID> [...]", severity="warning")
                 return True
-            if nid not in tree.nodes:
-                self.notify(f"未找到节点 {nid}", severity="error")
+            missing = [n for n in nids if n not in tree.nodes]
+            if missing:
+                self.notify(f"未找到节点: {'、'.join(missing)}", severity="error")
                 return True
-            if nid == "main" or (tree.root and nid == tree.root.id):
-                self.notify("不能删除根节点", severity="warning")
-                return True
+            roots = [n for n in nids if n == "main" or (tree.root and n == tree.root.id)]
+            if roots:
+                if len(roots) == len(nids):
+                    self.notify("不能删除根节点", severity="warning")
+                    return True
+                self.notify(f"根节点不可删除，已忽略: {'、'.join(roots)}", severity="warning")
+                nids = [n for n in nids if n not in roots]
             self._ask_confirm(
                 "删除节点",
-                f"确定要删除节点 {nid} 及其所有子节点吗？",
-                lambda ok: self._on_delete_confirmed(nid, ok),
+                f"确定要删除节点 {'、'.join(nids)} 及其所有子节点吗？",
+                lambda ok, ids=nids: self._on_delete_confirmed(ids, ok),
             )
             return True
         return False
 
-    def _on_delete_confirmed(self, nid: str, ok: bool) -> None:
-        """确认弹窗回调：ok=True 时执行删除（App 消息泵空闲时才被调用）。"""
+    def _on_delete_confirmed(self, nids: list, ok: bool) -> None:
+        """确认弹窗回调：ok=True 时批量删除（App 消息泵空闲时才被调用）。"""
         if not ok:
             self.notify("已取消删除")
             return
         tree = self.ctrl.tree
-        if self.ctrl.delete_node(nid):
-            self.ctrl._cleanup_temp_files(keep_ids=set(tree.nodes.keys()))
-            self._rebuild_tree()
-            if tree.current_node:
-                self._select_tree_node(tree.current_node.id)
-            self.notify(f"节点 {nid} 及其所有子节点已删除（含关联图片文件）")
+        result = self.ctrl.delete_nodes(nids)
+        self.ctrl._cleanup_temp_files(keep_ids=set(tree.nodes.keys()))
+        self._rebuild_tree()
+        if tree.current_node:
+            self._select_tree_node(tree.current_node.id)
+        if result["deleted"]:
+            self.notify(f"已删除 {len(result['deleted'])} 个节点（含其子节点及关联图片文件）")
         else:
-            self.notify(f"删除节点 {nid} 失败", severity="error")
+            self.notify("没有可删除的节点", severity="warning")
 
     async def _cmd_model(self, cmd: str) -> None:
         """管理模型注册：/model list | /model register <模型名> <URL> [-p provider] [-k key_var]"""
@@ -1257,39 +1344,39 @@ class ChatApp(App):
     # ---------------- 上下文压缩 ----------------
 
     async def _cmd_compact(self, cmd: str) -> None:
-        """/compact [保留轮数] | /compact off —— 压缩当前分支早期对话。"""
+        """/compact —— 压缩当前分支全部对话，新建摘要节点。"""
         parts = cmd.strip().split()
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        ctrl = self.ctrl
-        if sub in ("off", "reset", "clear", "undo"):
-            if ctrl.clear_compaction():
-                self.notify("已清除上下文压缩摘要，将恢复发送完整原始消息")
-            else:
-                self.notify("当前没有压缩摘要", severity="warning")
+        if len(parts) > 1:
+            self.notify("用法: /compact（不支持参数）", severity="warning")
             return
-        keep = COMPACT_DEFAULT_KEEP
-        if sub:
-            try:
-                keep = max(0, int(sub))
-            except ValueError:
-                self.notify("用法: /compact [保留轮数] | /compact off", severity="warning")
-                return
+        ctrl = self.ctrl
         if not ctrl.tree or ctrl.tree.current_node is None:
             self.notify("当前没有对话可压缩", severity="warning")
             return
-        self.notify("正在压缩上下文…")
-        stats = await asyncio.to_thread(ctrl.compact_history, keep, emit=self._emit_from_thread)
-        if stats is None:
-            self.notify("无可压缩的对话（对话太短，或压缩失败）", severity="warning")
+        if (
+            ctrl.tree.compaction
+            and ctrl.tree.compaction.get("boundary_id") == ctrl.tree.current_node.id
+        ):
+            self.notify(
+                "当前节点已是压缩摘要节点（切换回其他节点仍使用完整历史）",
+                severity="warning",
+            )
             return
-        md = (
-            f"**📦 上下文已压缩**\n\n"
-            f"- 压缩 {stats['nodes_compressed']} 轮，保留最近 {stats['nodes_kept']} 轮原文\n"
-            f"- Token：{stats['before_tokens']} → {stats['after_tokens']}（节省 {stats['saved_tokens']}）\n"
-            f"- 摘要长度：{stats['summary_chars']} 字\n\n"
-            f"---\n\n{stats['summary']}"
+        self.notify("正在压缩上下文…")
+        stats = await asyncio.to_thread(ctrl.compact_history, emit=self._emit_from_thread)
+        if stats is None:
+            self.notify("无可压缩的对话（或压缩失败）", severity="warning")
+            return
+        if stats.get("blocked"):
+            self.notify("当前节点已是压缩摘要节点", severity="warning")
+            return
+        # 切换到新建的摘要节点：聊天区直接显示压缩后的信息
+        self._switch_to(stats["node_id"])
+        self.notify(
+            f"✅ 已压缩 {stats['nodes_compressed']} 轮 → 新节点 {stats['node_id']}（摘要）；"
+            f"Token {stats['before_tokens']:,} → {stats['after_tokens']:,}"
+            f"（节省 {stats['saved_tokens']:,}）"
         )
-        await self._chat_append(md)
 
     # ---------------- 消息发送与流式渲染 ----------------
 
@@ -1306,7 +1393,7 @@ class ChatApp(App):
         img_md = self._pending_images_md()
         chat.append(f"\n\n---\n\n**你**\n\n{event.text}{img_md}")
         chat.scroll_end(animate=False)
-        self._refresh_pending_images()  # 待发送图片随消息进入发送流程，先隐藏提示行
+        self._refresh_import_status()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False
         self._reasoning_text = ""
         self._reasoning_md = ""
@@ -1435,7 +1522,7 @@ class ChatApp(App):
                 await chat.update(view)
                 self._shrink_lists(chat)
                 chat.scroll_end(animate=False)
-                self._refresh_pending_images()  # 图片已绑定到节点，隐藏待发送提示行
+                self._refresh_import_status()  # 图片已绑定到节点，隐藏提示行
                 self._stream_active = True  # 视图已含节点头部，后续流式内容直接追加
                 self._reasoning_text = ""
                 self._reasoning_md = ""
@@ -1458,7 +1545,7 @@ class ChatApp(App):
             self._shrink_lists(chat)
             chat.scroll_end(animate=False)
             self._rebuild_tree()  # 出错时节点已被回滚，刷新树移除空节点
-            self._refresh_pending_images()  # 发送失败时图片已放回待发送队列，恢复提示行
+            self._refresh_import_status()  # 发送失败时图片已放回待发送队列，恢复提示行
         elif ev.kind == "done":
             node = ev.node
             if node is not None:

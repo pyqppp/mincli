@@ -116,8 +116,8 @@ ChatInput {
     }
 }
 
-/* 待发送图片提示行（输入框下方、状态条上方；有图时显示） */
-#pending-images {
+/* 导入文件状态行（输入框下方、状态条上方；有 /import 导入时显示） */
+#import-status {
     display: none;
     height: 1;
     padding: 0 1;
@@ -125,7 +125,27 @@ ChatInput {
     background: $surface;
     border-top: solid $border-blurred;
 }
-#pending-images.visible {
+#import-status.visible {
+    display: block;
+}
+
+/* 导入文件完整列表悬停弹窗：悬停在 #import-status 上时显示在状态行上方，
+   鼠标移出状态行区域自动消失（性质类似输出区的悬停提示） */
+#import-popup {
+    display: none;
+    position: absolute;
+    height: auto;
+    max-height: 40%;
+    width: auto;
+    max-width: 75%;
+    padding: 0 1;
+    border: round $accent 60%;
+    background: $surface;
+    overflow-y: auto;
+    scrollbar-size-vertical: 0;
+}
+
+#import-popup.visible {
     display: block;
 }
 

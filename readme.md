@@ -127,6 +127,8 @@ Fetch https://example.com
 What files are here?
 ```
 
+> **Tip:** you can also **drag files straight into the terminal window** — most terminals paste the quoted path(s) into the input, and mincli auto-detects them and imports directly (no `/import` needed; multi-file drags work, and plain-text pastes are unaffected).
+
 ---
 
 ## Configuration
@@ -177,7 +179,7 @@ CLI flags:
 | `/mcp add <name> <command> [args...]` | Add a third-party MCP server (local command); a `http(s)://` second arg adds it as a remote server |
 | `/mcp remove <name>` | Remove a third-party MCP server (confirmed) |
 | `/mcp reload` | Reload MCP server config |
-| `/import <path-or-URL>` | Import file (txt/md/py/csv/pdf/docx) or fetch web page |
+| `/import <path-or-URL> [...]` | Import file (txt/md/py/csv/pdf/docx), fetch web page, or add images — multiple targets at once; image files become pending images; `/import clear` clears pending imports |
 | `/<node-id>` (e.g. `/a3`) | Jump to node directly |
 | `/tree` | List all nodes |
 | `/info [node-id]` | Show node details |
@@ -186,7 +188,7 @@ CLI flags:
 | `/full` | Full-view mode: hide the answer area, tree takes full width (input stays; toggle again or switch a node to exit) |
 | `/reasoning` | Expand/collapse the current message's reasoning (auto-collapsed once the answer starts streaming; click the folded block too) |
 | `/save [node-id]` | Export node as Markdown |
-| `/delete <node-id>` | Delete node and children (confirmed) |
+| `/delete <node-id> [...]` | Delete one or more nodes and their children (confirmed; children of a deleted parent are removed together, no not-found error) |
 | `/view` | Open reply in editor |
 
 Type `/` in the input box to see the command list; keep typing to filter, `Tab` to complete, and a fully-typed command shows its usage help above the input.

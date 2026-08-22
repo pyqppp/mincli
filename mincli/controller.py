@@ -21,7 +21,6 @@ from mincli.config import (
     MODEL_V4_PRO,
     MODEL_V4_VISION,
     MODELS_AVAILABLE,
-    COMPACT_DEFAULT_KEEP,
     COMPACT_MAX_TOKENS,
     COMPACT_SOURCE_MAX_CHARS,
     COMPACT_REASONING_MAX_CHARS,
@@ -145,7 +144,7 @@ class ChatController:
         # 命令执行默认工作目录（/set workspace 设置；None 时用 mincli 启动目录）
         self.workspace: Optional[str] = None
 
-        # 多模态：待发送图片（/img、/import 图片填充；发送后绑定到节点并清空）
+        # 多模态：待发送图片（/import 导入的图片填充；发送后绑定到节点并清空）
         self.pending_images: List[ImageAttachment] = []
         # 图片 detail 全局默认（/set detail 可调；low 省 token，auto≈original 最清晰）
         self.image_detail: str = VISION_DEFAULT_DETAIL
@@ -153,6 +152,9 @@ class ChatController:
         self.tree = ConversationTree(default_system)
 
         self.imported_content: Optional[str] = None
+        # /import 导入的文本/网页文件元数据（{"kind": "text"|"web", "name": str}），
+        # 用于输入框下方状态栏展示；内容拼接在 imported_content 中随下次发送附带
+        self.imported_files: List[Dict[str, str]] = []
         self.temp_dir = tempfile.mkdtemp(prefix="mincli_")
         self.temp_files: Dict[str, str] = {}
 
@@ -214,6 +216,7 @@ class ChatController:
                 "workspace": self.workspace,
                 "tree": self.tree.to_dict(),
                 "imported_content": self.imported_content,
+                "imported_files": self.imported_files,
             }
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -250,6 +253,7 @@ class ChatController:
             self.tree = ConversationTree(self.current_system)
 
         self.imported_content = data.get("imported_content")
+        self.imported_files = data.get("imported_files") or []
         self.session_loaded = True
         return True
 
@@ -331,10 +335,36 @@ class ChatController:
     )
 
     def import_target(self, target: str) -> Optional[str]:
-        """导入文件/网页为上下文；图片路径/URL 转为待发送图片附件。
+        """导入单个文件/网页为上下文（兼容入口）。
 
-        成功返回 None，失败返回错误信息（图片附件成功时也返回 None）。
+        图片路径/URL 转为待发送图片附件。成功返回 None，失败返回错误信息。
         """
+        res = self.import_targets([target])
+        if res["errors"] and not res["images_added"] and not res["text_added"]:
+            return res["errors"][0]
+        return None
+
+    def import_targets(self, targets: List[str]) -> dict:
+        """批量导入（/import 多文件）：图片→待发送图片，文本/网页→下次发送附带。
+
+        返回 {"images_added": int, "text_added": int, "errors": [str, ...]}。
+        """
+        images_before = len(self.pending_images)
+        text_before = len(self.imported_files)
+        errors: List[str] = []
+        for t in targets:
+            err = self._import_one(t)
+            if err:
+                errors.append(err)
+        return {
+            "images_added": len(self.pending_images) - images_before,
+            "text_added": len(self.imported_files) - text_before,
+            "errors": errors,
+        }
+
+    def _import_one(self, target: str) -> Optional[str]:
+        """导入单个目标。成功返回 None，失败返回错误信息。"""
+        target = target.strip()
         if re.match(r"^https?://", target):
             # 网页 URL：图片扩展名 → 图片附件；否则抓取网页文本
             if looks_like_image_target(target):
@@ -343,18 +373,54 @@ class ChatController:
                     return None
                 return errors[0] if errors else f"无法读取: {target}"
             result = fetch_webpage(target)
-        else:
-            # 本地文件：按内容嗅探是否为受支持图片（不依赖扩展名）
-            if os.path.isfile(target) and is_image_path(target):
-                added, errors = self.add_pending_images([target])
-                if added:
-                    return None
-                return errors[0] if errors else f"无法读取: {target}"
-            result = parse_file(target)
+            if result and not result.startswith(self._IMPORT_FAIL_PREFIXES):
+                self._append_imported(result, {"kind": "web", "name": target[:120]})
+                return None
+            return result or f"无法读取: {target}"
+        # 本地文件：先展开 ~（否则 ~/图片 会漏过图片嗅探走进文本解析）
+        path = os.path.expanduser(target)
+        if os.path.isfile(path) and is_image_path(target):
+            added, errors = self.add_pending_images([target])
+            if added:
+                return None
+            return errors[0] if errors else f"无法读取: {target}"
+        result = parse_file(path)
         if result and not result.startswith(self._IMPORT_FAIL_PREFIXES):
-            self.imported_content = result
+            self._append_imported(result, {"kind": "text", "name": os.path.basename(path)})
             return None
         return result or f"无法读取: {target}"
+
+    def _append_imported(self, content: str, meta: Dict[str, str]) -> None:
+        """把一段导入内容拼接到 imported_content，并记录文件元数据。"""
+        if self.imported_content:
+            self.imported_content += "\n\n---\n\n"
+        self.imported_content = (self.imported_content or "") + content
+        self.imported_files.append(meta)
+
+    def clear_imports(self) -> int:
+        """清空待导入内容（图片 + 文本/网页），返回清除的文件数。"""
+        n = len(self.pending_images) + len(self.imported_files)
+        self.pending_images = []
+        self.imported_content = None
+        self.imported_files = []
+        return n
+
+    def import_summary(self) -> str:
+        """输入框下方状态栏文本：已导入文件数量 + 前 2 个文件名；无导入返回空串。"""
+        names = [a.name for a in self.pending_images] + [
+            f["name"] for f in self.imported_files
+        ]
+        if not names:
+            return ""
+        shown = "、".join(names[:2])
+        extra = "…" if len(names) > 2 else ""
+        return f"📎 已导入 {len(names)} 个文件：{shown}{extra} · /import clear 清除"
+
+    def import_file_list(self) -> List[Dict[str, str]]:
+        """完整导入文件列表（图片在前、文本/网页在后），供悬停弹窗展示。"""
+        items = [{"kind": "image", "name": a.name} for a in self.pending_images]
+        items += [{"kind": f["kind"], "name": f["name"]} for f in self.imported_files]
+        return items
 
     # ---------------- 多模态：待发送图片 ----------------
 
@@ -373,24 +439,6 @@ class ChatController:
             except ValueError as e:
                 errors.append(str(e))
         return added, errors
-
-    def clear_pending_images(self) -> int:
-        """清空待发送图片，返回清除数量。"""
-        n = len(self.pending_images)
-        self.pending_images = []
-        return n
-
-    def pending_images_summary(self) -> str:
-        """待发送图片的提示文本（输入栏上方显示）；无图返回空串。"""
-        if not self.pending_images:
-            return ""
-        total = sum(a.size_bytes for a in self.pending_images)
-        names = "、".join(a.name for a in self.pending_images[:3])
-        extra = "…" if len(self.pending_images) > 3 else ""
-        return (
-            f"📷 待发送图片 {len(self.pending_images)} 张（共 {total / 1024 / 1024:.1f} MiB）"
-            f"：{names}{extra} · /img clear 清除"
-        )
 
     def save_node(self, node_id: str) -> Optional[str]:
         """导出节点为 Markdown 文件，返回文件路径；节点不存在返回 None。"""
@@ -458,30 +506,28 @@ class ChatController:
 对话历史：
 {source}"""
 
-    def compact_history(
-        self, keep: int = COMPACT_DEFAULT_KEEP, emit: Optional[EventSink] = None
-    ) -> Optional[dict]:
-        """把当前分支的早期对话压缩成详细摘要（/compact）。
+    def compact_history(self, emit: Optional[EventSink] = None) -> Optional[dict]:
+        """把当前分支全部对话压缩成详细摘要，并新建摘要节点（/compact）。
 
-        keep=保留最近 N 轮（含当前节点）的原始内容；0=全部压缩。
-        摘要写入 self.tree.compaction，之后发送消息时自动用摘要替代
-        boundary 及之前节点的原始消息。返回统计信息 dict；无可压缩
-        内容或压缩失败时返回 None。
+        压缩后新建一个子节点（用户消息 = 摘要）并设为当前节点；只有摘要节点
+        及其子节点发送消息时用摘要替代全部历史，其他节点仍发送完整原始消息
+        （不再保留任何原文轮次）。返回统计信息 dict：
+            {"blocked": "already_compact"} —— 当前节点已是摘要节点，禁止重复压缩
+            None —— 无可压缩内容 / 压缩失败
+            其他 —— 成功（含 node_id / before_tokens / after_tokens 等）
 
         统计口径：before/after 均用 estimate_tokens 估算压缩前后「发送给模型
-        的完整消息列表」（与 usage_stats 的 next_input_tokens 同函数、同来源），
-        因此压缩后状态条的「下次输入」会自动等于 after_tokens。
+        的完整消息列表」（与 usage_stats 摘要节点口径同函数、同来源）。
         """
         if self.tree is None or self.tree.current_node is None:
             return None
+        comp = self.tree.compaction
+        if comp and comp.get("boundary_id") == self.tree.current_node.id:
+            return {"blocked": "already_compact"}
         path = self._path_to_root(self.tree.current_node)
-        n = len(path)
-        if keep is None or keep < 0:
-            keep = COMPACT_DEFAULT_KEEP
-        if n - keep < 1:
-            return None  # 对话太短，没有可压缩的轮次
-        boundary = path[n - keep - 1]   # 最后一个被压缩进摘要的节点
-        to_compress = path[: n - keep]  # 被压缩进摘要的节点（含 boundary）
+        if not any(n.user_msg or n.assistant_msg for n in path):
+            return None  # 没有任何可压缩的内容
+        to_compress = path  # 全部压缩，不保留任何原文
 
         source = self._build_compact_source(to_compress)
         if len(source) > COMPACT_SOURCE_MAX_CHARS:
@@ -494,7 +540,7 @@ class ChatController:
 
         if emit:
             emit(ControllerEvent.status(
-                f"正在压缩上下文：{len(to_compress)} 轮 → 详细摘要（保留最近 {keep} 轮原文）…"
+                f"正在压缩上下文：{len(to_compress)} 轮 → 详细摘要…"
             ))
 
         summary = self._call_summarize(source)
@@ -502,31 +548,26 @@ class ChatController:
             return None
 
         before_msgs = self.tree.get_messages_for_node(self.tree.current_node)
-        self.tree.compaction = {
-            "summary": summary,
-            "boundary_id": boundary.id,
-            "next_input_tokens": 0,  # 占位，下面填充
-        }
-        after_msgs = self.tree.get_messages_for_node(self.tree.current_node)
+        # 新建摘要节点（用户消息 = 摘要）并设为当前节点
+        node = self.tree.add_child(
+            self.tree.current_node, summary, "", "", "上下文压缩摘要", 0, 0
+        )
+        self.tree.compaction = {"summary": summary, "boundary_id": node.id}
+        self.tree.current_node = node
+        after_msgs = self.tree.get_messages_for_node(node)
         before_tok = estimate_tokens(before_msgs)
         after_tok = estimate_tokens(after_msgs)
-        # 让状态条「下次输入」在压缩后直接采用压缩报告口径（与 after_tokens 严格一致）
-        self.tree.compaction["next_input_tokens"] = after_tok
 
         return {
             "summary": summary,
-            "boundary_id": boundary.id,
+            "node_id": node.id,
+            "boundary_id": node.id,
             "nodes_compressed": len(to_compress),
-            "nodes_kept": keep,
             "summary_chars": len(summary),
             "before_tokens": before_tok,
             "after_tokens": after_tok,
             "saved_tokens": max(0, before_tok - after_tok),
         }
-
-    def clear_compaction(self) -> bool:
-        """清除上下文压缩摘要（/compact off），恢复完整原始消息。"""
-        return self.tree.clear_compaction() if self.tree else False
 
     # ---------------- 实时用量统计（输入栏状态条） ----------------
 
@@ -535,10 +576,10 @@ class ChatController:
 
         缓存命中率取当前节点累计的 usage.prompt_cache_hit/miss_tokens。
         「下一次输入」token 量采用与相邻数据直接对应的口径：
-        - 未压缩：= 本节点 input_tokens + output_tokens（API 真实口径，
-          即「上次完整输入 + 本节点输出」，与对话结束显示的输入/输出严格对应）；
-        - 已压缩：= 压缩报告 after_tokens（压缩时存储），与 /compact
-          报告的数字严格一致，直观体现压缩节省；
+        - 普通节点：= 本节点 input_tokens + output_tokens（API 真实口径，
+          即「上次完整输入 + 本节点输出」，随对话推进持续更新，不会卡住）；
+        - 摘要节点（/compact 新建、本身无 API 用量）：= 实际发送的摘要
+          上下文估算（estimate_tokens），与 /compact 报告 after_tokens 一致；
         用户新输入内容量小，忽略不计。预计价格按 DeepSeek 峰谷分时定价
         × 缓存命中率折算。
         """
@@ -558,8 +599,12 @@ class ChatController:
         if total > 0:
             stats["cache_hit_rate"] = hit / total
         comp = self.tree.compaction
-        if comp and comp.get("next_input_tokens"):
-            next_in = comp["next_input_tokens"]
+        if comp and comp.get("boundary_id") and node.id == comp["boundary_id"]:
+            # 摘要节点本身：按实际发送的摘要上下文实时估算（不随时间冻结）
+            try:
+                next_in = estimate_tokens(self.tree.get_messages_for_node(node))
+            except Exception:
+                next_in = 0
         else:
             next_in = node.input_tokens + node.output_tokens
         stats["next_input_tokens"] = next_in
@@ -662,6 +707,7 @@ class ChatController:
         if self.imported_content:
             user_input = self.imported_content + "\n\n" + user_input
             self.imported_content = None
+            self.imported_files = []
 
         # 待发送图片：先上传为 file_id（成功后历史重放/后续请求体保持极小）
         if self.pending_images:
@@ -938,12 +984,87 @@ class ChatController:
                         file_ids.append(att.file_id)
         if not self.tree.delete_node(node_id):
             return False
+        self._cleanup_compaction_boundary()
         for fid in file_ids:
             try:
                 delete_file(self.client, fid)
             except FilesAPIError:
                 pass
         return True
+
+    def _cleanup_compaction_boundary(self) -> None:
+        """若压缩摘要的 boundary 节点已被删除，则清除压缩状态（避免悬挂）。"""
+        if self.tree.compaction:
+            bid = self.tree.compaction.get("boundary_id")
+            if not bid or bid not in self.tree.nodes:
+                self.tree.compaction = None
+
+    def delete_nodes(self, node_ids: List[str]) -> dict:
+        """批量删除节点（/delete a1 b3 g5）。
+
+        同一批中若某节点是另一待删节点的子孙，则仅删除祖先（子孙随祖先级联
+        删除，不会因「父节点已删、子节点找不到」而报错）；根节点跳过。
+        返回 {"deleted": [ids], "skipped": [ids]}。
+        """
+        tree = self.tree
+        seen: set = set()
+        ordered: List[str] = []
+        for nid in node_ids:
+            nid = nid.strip()
+            if nid and nid not in seen:
+                seen.add(nid)
+                ordered.append(nid)
+        # 先分出根节点（跳过）与可删候选，避免根节点被误当作「祖先覆盖」
+        deletable: List[str] = []
+        skipped: List[str] = []
+        for nid in ordered:
+            node = tree.nodes.get(nid)
+            if node is None:
+                continue  # 已不存在（可能已被本批更早的父节点删除级联移除）→ 不报错
+            if nid == "main" or (tree.root and nid == tree.root.id):
+                skipped.append(nid)
+            else:
+                deletable.append(nid)
+        deleted: List[str] = []
+        for nid in deletable:
+            # 该节点是其他待删节点的子孙 → 交给祖先级联删除
+            if any(
+                other != nid
+                and other in tree.nodes
+                and self._is_node_descendant(nid, other)
+                for other in deletable
+            ):
+                continue
+            node = tree.nodes.get(nid)
+            if node is None:
+                continue  # 已被本批更早的祖先节点级联删除
+            to_delete: set = set()
+            tree._collect_descendants(node, to_delete)
+            file_ids: List[str] = []
+            for did in to_delete:
+                n = tree.nodes.get(did)
+                if n:
+                    for att in n.user_images:
+                        if att.file_id:
+                            file_ids.append(att.file_id)
+            if tree.delete_node(nid):
+                deleted.append(nid)
+                for fid in file_ids:
+                    try:
+                        delete_file(self.client, fid)
+                    except FilesAPIError:
+                        pass
+        self._cleanup_compaction_boundary()
+        return {"deleted": deleted, "skipped": skipped}
+
+    def _is_node_descendant(self, node_id: str, ancestor_id: str) -> bool:
+        """node_id 是否为 ancestor_id 的子孙节点。"""
+        cur = self.tree.nodes.get(node_id)
+        while cur is not None and cur.parent_id:
+            if cur.parent_id == ancestor_id:
+                return True
+            cur = self.tree.nodes.get(cur.parent_id)
+        return False
 
     def _run_tool(self, name: str, args: dict, emit: EventSink) -> str:
         """执行一个工具，返回文本结果。"""

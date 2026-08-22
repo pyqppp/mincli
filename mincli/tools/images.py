@@ -209,8 +209,12 @@ def estimate_image_tokens(
 def make_path_attachment(
     path: str, detail: str = VISION_DEFAULT_DETAIL
 ) -> ImageAttachment:
-    """从本地图片文件构造附件；校验失败抛 ValueError（中文提示）。"""
-    path = os.path.expanduser(path.strip())
+    """从本地图片文件构造附件；校验失败抛 ValueError（中文提示）。
+
+    保存绝对路径（source=abspath）：会话持久化后即使从其他工作目录
+    启动，历史图片路径仍可解析。
+    """
+    path = os.path.abspath(os.path.expanduser(path.strip()))
     if not os.path.exists(path):
         raise ValueError(f"文件不存在: {path}")
     if not os.path.isfile(path):

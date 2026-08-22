@@ -41,8 +41,7 @@ PREVIEW_USER_MSG_LEN = 100
 PREVIEW_ASSISTANT_MSG_LEN = 200
 WEBPAGE_MAX_LENGTH = 5000
 
-# 上下文压缩（/compact）
-COMPACT_DEFAULT_KEEP = 5          # 默认保留最近 N 轮原始内容
+# 上下文压缩（/compact）：压缩当前分支全部对话并新建摘要节点
 COMPACT_MAX_TOKENS = 8192         # 压缩摘要的最大输出 token 数（生成失败时回退 4096）
 COMPACT_SOURCE_MAX_CHARS = 150_000  # 送入压缩模型的原文上限（超长时截头尾保中间）
 COMPACT_REASONING_MAX_CHARS = 800   # 每个节点思考过程计入摘要源的长度上限

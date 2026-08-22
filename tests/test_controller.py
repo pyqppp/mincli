@@ -244,6 +244,73 @@ def test_import_target():
     check("导入不存在文件返回错误", ctrl.import_target("/nonexistent/xxx.md") is not None)
 
 
+def test_import_multi():
+    print("== /import 多文件混合（图片+文本） ==")
+    a_txt = os.path.join(_TMP, "multi_a.txt")
+    b_md = os.path.join(_TMP, "multi_b.md")
+    png = _make_png(os.path.join(_TMP, "multi.png"))
+    with open(a_txt, "w", encoding="utf-8") as f:
+        f.write("文本一")
+    with open(b_md, "w", encoding="utf-8") as f:
+        f.write("文本二")
+    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    res = ctrl.import_targets([a_txt, png, b_md])
+    check("混合导入无错误", not res["errors"])
+    check("图片计数", res["images_added"] == 1 and len(ctrl.pending_images) == 1)
+    check("文本计数", res["text_added"] == 2 and len(ctrl.imported_files) == 2)
+    check("内容拼接", "文本一" in ctrl.imported_content and "文本二" in ctrl.imported_content)
+    summary = ctrl.import_summary()
+    check("状态栏含数量与前2文件名", "已导入 3 个文件" in summary and "multi_a.txt" in summary and "multi.png" in summary)
+    check("第3个文件名省略", "multi_b.md" not in summary and "…" in summary)
+    items = ctrl.import_file_list()
+    check("完整列表含全部", len(items) == 3 and items[0]["kind"] == "image")
+    check("清除导入", ctrl.clear_imports() == 3 and not ctrl.pending_images and not ctrl.imported_files)
+
+    # 发送：文本导入随消息附带并清空，图片绑定到节点
+    script = [
+        [FakeChunk(content="好", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
+        FakeChatResponse(content="标题"),
+    ]
+    ctrl2 = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl2.import_targets([a_txt, png])
+    node, _ = collect(ctrl2, "结合以上内容回答")
+    check("发送后文本导入清空", ctrl2.imported_content is None and not ctrl2.imported_files)
+    check("图片已绑定到节点", node is not None and node.user_images and node.user_images[0].name == "multi.png")
+    check("发送后待发送图片清空", not ctrl2.pending_images)
+
+
+def test_delete_nodes():
+    print("== 批量删除 /delete a1 b3 g5 ==")
+    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl.tree.create_root("根", "回", "", "根", 1, 1)
+    a1 = ctrl.tree.add_child(ctrl.tree.root, "q", "a", "", "t", 1, 1)
+    a2 = ctrl.tree.add_child(a1, "q", "a", "", "t", 1, 1)
+    b1 = ctrl.tree.add_child(ctrl.tree.root, "q", "a", "", "t", 1, 1)
+    b2 = ctrl.tree.add_child(b1, "q", "a", "", "t", 1, 1)
+    b3 = ctrl.tree.add_child(b2, "q", "a", "", "t", 1, 1)
+    c1 = ctrl.tree.add_child(ctrl.tree.root, "q", "a", "", "t", 1, 1)
+
+    # a2 是 a1 子孙、b3 是 b2 子孙：仅删父即可，子节点随父级联删除不报错
+    res = ctrl.delete_nodes([a1.id, a2.id, b2.id, b3.id, "ghost"])
+    check("删除顶层节点", set(res["deleted"]) == {a1.id, b2.id})
+    check("子孙随父级联删除", a2.id not in ctrl.tree.nodes and b3.id not in ctrl.tree.nodes)
+    check("无关节点保留", b1.id in ctrl.tree.nodes and c1.id in ctrl.tree.nodes and "main" in ctrl.tree.nodes)
+    check("不存在的节点不报错", "ghost" not in res["deleted"])
+
+    # 根节点跳过
+    res2 = ctrl.delete_nodes(["main", b1.id])
+    check("根节点跳过", res2["deleted"] == [b1.id] and res2["skipped"] == ["main"] and ctrl.tree.root is not None)
+
+    # 删除摘要节点后压缩状态清除（避免悬挂）
+    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl2.tree.create_root("根", "回", "", "根", 1, 1)
+    s = ctrl2.tree.add_child(ctrl2.tree.root, "摘要", "", "", "上下文压缩摘要", 0, 0)
+    ctrl2.tree.compaction = {"summary": "摘要", "boundary_id": s.id}
+    ctrl2.tree.current_node = s
+    ctrl2.delete_nodes([s.id])
+    check("删除摘要节点后压缩状态清除", ctrl2.tree.compaction is None)
+
+
 def test_settings():
     print("== 设置 ==")
     ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
@@ -259,7 +326,7 @@ def test_settings():
 
 
 def test_compact():
-    print("== 上下文压缩 /compact ==")
+    print("== 上下文压缩 /compact（全部压缩 + 新建摘要节点） ==")
     script = []
     for i in range(1, 6):
         # 回答内容较长，保证压缩后确实节省 token
@@ -270,44 +337,43 @@ def test_compact():
     script.append(FakeChatResponse(content="【摘要】目标X；已执行命令Y；待办Z。"))
     script.append([FakeChunk(content="回答新：" + "新内容" * 60)])
     script.append(FakeChatResponse(content="标题新"))
-    script.append(FakeChatResponse(content="【摘要2】keep=0 全量压缩"))
     ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     for i in range(1, 6):
         collect(ctrl, f"问题{i}")
 
-    # 压缩（保留最近 2 轮）——压缩前状态条应等于「上次输入+输出」（API 口径）
+    # 压缩——压缩前状态条应等于「上次输入+输出」（API 口径）
+    before_node = ctrl.tree.current_node
     before_us = ctrl.usage_stats()
     events = []
-    stats = ctrl.compact_history(keep=2, emit=events.append)
+    stats = ctrl.compact_history(emit=events.append)
     check("压缩返回统计", stats is not None)
     check(
         "压缩前状态条=上次输入+输出",
         before_us["next_input_tokens"]
-        == ctrl.tree.current_node.input_tokens + ctrl.tree.current_node.output_tokens,
+        == before_node.input_tokens + before_node.output_tokens,
     )
-    # 压缩后：状态条「下次输入」= 压缩报告 after_tokens（三者自洽）
+    # 压缩后：状态条「下次输入」= 摘要节点实际发送的估算（= 压缩报告 after）
     after_us = ctrl.usage_stats()
     check("压缩后状态条=压缩报告 after", after_us["next_input_tokens"] == stats["after_tokens"])
     check("压缩后状态条显著变小", after_us["next_input_tokens"] < before_us["next_input_tokens"])
-    check("压缩 3 轮", stats["nodes_compressed"] == 3)
-    check("保留 2 轮", stats["nodes_kept"] == 2)
+    check("全部压缩（main+4轮=5节点）", stats["nodes_compressed"] == 5)
+    check("新建摘要节点", stats["node_id"] is not None and stats["node_id"] in ctrl.tree.nodes)
+    check("摘要节点设为当前", ctrl.tree.current_node.id == stats["node_id"])
+    check("摘要节点用户消息=摘要", ctrl.tree.current_node.user_msg.startswith("【摘要】"))
     check("摘要写入树", ctrl.tree.compaction is not None and ctrl.tree.compaction["summary"].startswith("【摘要】"))
+    check("boundary=摘要节点", stats["node_id"] == ctrl.tree.compaction["boundary_id"])
     check("发出 status 事件", any(e.kind == "status" for e in events))
     check("节省 token>0", stats["saved_tokens"] > 0)
 
-    path = ctrl._path_to_root(ctrl.tree.current_node)
-    check("boundary=倒数第 3 个节点", stats["boundary_id"] == path[-3].id)
-
     msgs = ctrl.tree.get_messages_for_node(ctrl.tree.current_node)
     joined = "\n".join(str(m.get("content", "")) for m in msgs)
-    check("消息含摘要", "【摘要】" in joined)
-    check("旧内容已压缩", "回答1" not in joined and "回答2" not in joined and "回答3" not in joined)
-    check("新内容保留", "回答4" in joined and "回答5" in joined)
+    check("摘要节点消息仅含摘要", "【摘要】" in joined and "回答1" not in joined and "回答5" not in joined)
     check("摘要带前缀标记", msgs[1]["content"].startswith("【以下是本对话早期内容"))
 
-    # 压缩后继续对话：发给模型的消息应使用摘要
+    # 摘要节点上继续对话：发给模型的消息 = 摘要 + 新输入
     node, _ = collect(ctrl, "新问题")
-    check("压缩后继续对话成功", node is not None)
+    check("摘要节点上继续对话成功", node is not None)
+    check("新节点是摘要节点的子节点", node.parent_id == stats["node_id"])
     sent_joined = ""
     for call in ctrl.client.chat.completions.calls:
         msgs = call.get("messages", [])
@@ -316,16 +382,17 @@ def test_compact():
     check("发给模型的消息含摘要", "【摘要】" in sent_joined)
     check("发给模型的消息不含旧回答", "回答1" not in sent_joined and "回答3" not in sent_joined)
 
-    # /compact off 恢复原文
-    check("清除压缩", ctrl.clear_compaction())
-    msgs2 = ctrl.tree.get_messages_for_node(ctrl.tree.current_node)
-    joined2 = "\n".join(str(m.get("content", "")) for m in msgs2)
-    check("恢复后含完整原文", "回答1" in joined2 and "回答新" in joined2)
-    check("恢复后无摘要", "【摘要】" not in joined2)
+    # 切换到摘要节点之前的节点：仍使用完整历史
+    old_id = ctrl._path_to_root(ctrl.tree.current_node)[-3].id  # 摘要节点前一个节点
+    check("切换到旧节点", ctrl.tree.switch_to_node(old_id))
+    full_joined = "\n".join(str(m.get("content", "")) for m in ctrl.tree.get_messages_for_node(ctrl.tree.current_node))
+    check("旧节点仍用完整历史", "回答1" in full_joined and "回答5" in full_joined)
+    check("旧节点消息不含摘要", "【摘要】" not in full_joined)
 
-    # keep=0 全部压缩
-    stats0 = ctrl.compact_history(keep=0)
-    check("keep=0 压缩全部 6 轮", stats0 is not None and stats0["nodes_compressed"] == 6 and stats0["nodes_kept"] == 0)
+    # 当前节点=摘要节点时禁止重复压缩
+    ctrl.tree.switch_to_node(stats["node_id"])
+    blocked = ctrl.compact_history()
+    check("摘要节点禁止重复压缩", blocked is not None and blocked.get("blocked") == "already_compact")
 
     # 压缩随会话持久化
     ctrl.save_session()
@@ -334,13 +401,12 @@ def test_compact():
     if os.path.exists(TestController.SAVE_FILE):
         os.remove(TestController.SAVE_FILE)
 
-    # 对话太短
+    # 空会话无可压缩内容
     ctrl2 = TestController(
-        FakeClient([[FakeChunk(content="仅一轮")], FakeChatResponse(content="标题")]),
+        FakeClient([]),
         default_system="sys", default_temperature=1.0, auto_start_mcp=False,
     )
-    collect(ctrl2, "问题")
-    check("太短返回 None", ctrl2.compact_history() is None)
+    check("空会话返回 None", ctrl2.compact_history() is None)
 
 
 def _make_png(path: str, w: int = 800, h: int = 600) -> str:
@@ -558,6 +624,8 @@ if __name__ == "__main__":
     test_api_error()
     test_session_roundtrip()
     test_import_target()
+    test_import_multi()
+    test_delete_nodes()
     test_settings()
     test_compact()
     test_multimodal()

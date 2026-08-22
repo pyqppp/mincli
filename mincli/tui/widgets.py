@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+
+from textual import events
 from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import TextArea
@@ -51,9 +55,61 @@ class ChatInput(TextArea):
             super().__init__()
             self.text = text
 
+    class FilesDropped(Message):
+        """终端拖入文件 → 粘贴内容全为路径，请求直接导入。"""
+
+        def __init__(self, paths: list[str]) -> None:
+            super().__init__()
+            self.paths = paths
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._target_height = MIN_INPUT_HEIGHT
+
+    @staticmethod
+    def _paths_from_paste(text: str) -> list[str] | None:
+        """整段粘贴若能解析为文件路径/URL 列表则返回之，否则返回 None。
+
+        终端把拖入的文件粘贴成带引号路径（多文件空格或换行分隔）。
+        仅当所有 token 都 expanduser 后是存在的文件、或是 http(s) URL 时，
+        才判定为「拖入导入」，避免劫持普通文本粘贴（如整句复制）。
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        try:
+            tokens = shlex.split(text, posix=True)
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+        paths: list[str] = []
+        for tok in tokens:
+            if tok.lower().startswith(("http://", "https://")):
+                paths.append(tok)
+                continue
+            expanded = os.path.expanduser(tok)
+            if not os.path.isfile(expanded):
+                return None
+            paths.append(expanded)
+        return paths
+
+    async def _on_paste(self, event: events.Paste) -> None:
+        """拖入文件（路径粘贴）→ 转 FilesDropped 导入；普通粘贴照常插入。
+
+        注意：Textual 的分发器会沿 MRO 调用「所有」_on_paste（含基类
+        TextArea 的），因此路径粘贴需 prevent_default() 阻止基类把路径插入
+        输入框 + stop() 阻止冒泡到 App；普通粘贴也需 prevent_default() 让
+        分发器跳过基类，只由这里 super() 完成一次插入。
+        """
+        paths = self._paths_from_paste(event.text)
+        if paths is not None:
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.FilesDropped(paths))
+            return
+        event.prevent_default()
+        await super()._on_paste(event)
 
     def action_submit_message(self) -> None:
         """提交当前输入并清空输入框。"""
