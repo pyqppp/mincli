@@ -143,6 +143,7 @@ async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
     test_markdown_safety()
     test_selection_safety()
+    test_screen_forward_safety()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -169,8 +170,8 @@ async def main() -> int:
                 break
         chat = app.query_one("#chat-log", Markdown)
         check("流式内容已追加", "你好，世界！" in chat.source)
-        # 正文开始后思考块自动折叠为「思考过程」占位（思考全文已不在源文本中）
-        check("思考已显示（折叠占位）", "思考过程" in chat.source)
+        # 思考过程不折叠：完整内容以灰色块引用显示（无点击展开交互）
+        check("思考以引用格式显示", "思考过程" in chat.source and "> 思考中" in chat.source)
         check("token 统计已显示", "tokens" in chat.source)
 
         # --- 3. 会话树更新 + 光标跟随新节点 ---
@@ -405,6 +406,28 @@ async def main() -> int:
         check("节点视图含图片占位", "[图片: t.png (800x600)]" in app.query_one("#chat-log", Markdown).source)
         await type_command("/clear")
 
+        # --- 7.6c 多轮工具调用：多个思考块穿插正文，各自按引用格式显示 ---
+        node_m = fake.tree.create_root("多轮问题", "", "", "多轮标题", 0, 0)
+        fake.tree.current_node = node_m
+        await app._handle_event(ControllerEvent.node_created(node_m))
+        await app._handle_event(ControllerEvent.stream("", "第一轮思考内容"))
+        await app._handle_event(ControllerEvent.stream("第一轮正文", ""))
+        await app._handle_event(ControllerEvent.tool("execute_command", '{"command":"ls"}', "（完成）"))
+        await app._handle_event(ControllerEvent.stream("", "第二轮思考内容"))
+        await app._handle_event(ControllerEvent.stream("第二轮正文", ""))
+        await app._handle_event(ControllerEvent.done(node_m))
+        for _ in range(30):
+            await pilot.pause()
+        src_m = app.query_one("#chat-log", Markdown).source
+        check("多轮：两个思考块各带标题", src_m.count("思考过程") == 2)
+        check("多轮：第一轮思考按引用显示", "> 第一轮思考内容" in src_m)
+        check("多轮：第二轮思考按引用显示", "> 第二轮思考内容" in src_m)
+        check("多轮：两轮正文都显示", "第一轮正文" in src_m and "第二轮正文" in src_m)
+        node_m.reasoning = "第一轮思考内容\n第二轮思考内容"  # 模拟 controller 汇总全部轮次思考
+        check("多轮：节点视图也含思考引用", "思考过程" in app._node_content(node_m)
+              and "> 第二轮思考内容" in app._node_content(node_m))
+        await type_command("/clear")
+
         await type_command("/unknown_cmd")
         await pilot.pause()
         check("未知命令不发送给 LLM", fake.client.chat.completions.script == [])
@@ -514,6 +537,55 @@ def test_selection_safety():
     # 正常路径不受影响
     sel2 = Selection.from_offsets(Offset(0, 0), Offset(5, 0))
     check("选区提取正常路径不变", sel2.extract("hello world") == "hello")
+
+
+def test_screen_forward_safety():
+    """Screen._forward_event 崩溃重试补丁：MouseDown 命中已分离 widget
+    （选区初始化 AttributeError）→ 临时关选区重试，不崩溃且 ALLOW_SELECT 恢复。"""
+    from mincli.tui import app as app_mod
+    from textual.screen import Screen
+
+    app_mod._patch_textual_screen_forward_event()  # 幂等
+    check(
+        "Screen._forward_event 已打补丁",
+        getattr(Screen, "_mincli_safe_forward_event", False),
+    )
+
+    class _FakeApp:
+        ALLOW_SELECT = True
+
+    class _FakeSelf:
+        app = _FakeApp()
+
+        def _orig(self, event):
+            self.calls += 1
+            if self.calls == 1:
+                raise AttributeError("'NoneType' object has no attribute 'region'")
+            return "ok"
+
+    fake = _FakeSelf()
+    fake.calls = 0
+    mousedown = events.MouseDown(None, 1, 1, 0, 0, 0, False, False, False)
+    saved = app_mod._ORIG_SCREEN_FORWARD_EVENT
+    app_mod._ORIG_SCREEN_FORWARD_EVENT = _FakeSelf._orig  # 未绑定：orig(self, event)
+    try:
+        result = app_mod._safe_screen_forward_event(fake, mousedown)
+    finally:
+        app_mod._ORIG_SCREEN_FORWARD_EVENT = saved
+    check("命中分离 widget 重试不崩溃", result == "ok" and fake.calls == 2)
+    check("重试后 ALLOW_SELECT 恢复", _FakeApp.ALLOW_SELECT is True)
+
+    # 非 MouseDown 事件直接转发（不经过重试逻辑）
+    passthrough = {"n": 0}
+
+    def _orig2(self, event):
+        passthrough["n"] += 1
+        return "pass-through"
+
+    app_mod._ORIG_SCREEN_FORWARD_EVENT = _orig2
+    r2 = app_mod._safe_screen_forward_event(fake, "not-mousedown")
+    check("非 MouseDown 事件直接转发", r2 == "pass-through" and passthrough["n"] == 1)
+    app_mod._ORIG_SCREEN_FORWARD_EVENT = saved
 
 
 def test_markdown_safety():

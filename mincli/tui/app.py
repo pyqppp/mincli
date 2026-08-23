@@ -27,7 +27,6 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Markdown, Static, Tree
-from textual.widgets._markdown import MarkdownBlockQuote
 
 # 防御 Textual 选区提取越界：流式渲染会重建 Markdown 块，拖选跨越重建
 # 瞬间时，锚点行号可能等于/超过新内容行数 → Selection.extract 直接索引
@@ -57,6 +56,44 @@ def _patch_textual_selection() -> None:
 
 
 _patch_textual_selection()
+
+# 防御 Textual Screen 选区初始化崩溃：流式渲染重建 Markdown 块时，鼠标
+# 按下可能命中刚被移除的块（parent 已变 None），Screen._forward_event 的
+# MouseDown 分支构造 SelectStart 时 container = widget.parent = None，
+# 访问 container.region.offset 抛 AttributeError——与上面 Selection.extract
+# 越界是同一竞态的另一半。命中已分离 widget 时临时关闭选区重试一次：
+# 选区逻辑跳过、鼠标事件正常转发，随后恢复 ALLOW_SELECT。
+_ORIG_SCREEN_FORWARD_EVENT = None
+
+
+def _patch_textual_screen_forward_event() -> None:
+    """把 Screen._forward_event 包一层「崩溃重试」（幂等）。"""
+    global _ORIG_SCREEN_FORWARD_EVENT
+    from textual.screen import Screen
+
+    if getattr(Screen, "_mincli_safe_forward_event", False):
+        return
+    _ORIG_SCREEN_FORWARD_EVENT = Screen._forward_event
+    Screen._forward_event = _safe_screen_forward_event
+    Screen._mincli_safe_forward_event = True
+
+
+def _safe_screen_forward_event(self, event) -> None:
+    """MouseDown 命中已分离 widget 导致选区初始化崩溃 → 临时关选区重试。"""
+    if isinstance(event, events.MouseDown):
+        try:
+            return _ORIG_SCREEN_FORWARD_EVENT(self, event)
+        except AttributeError:
+            old = self.app.ALLOW_SELECT
+            self.app.ALLOW_SELECT = False
+            try:
+                return _ORIG_SCREEN_FORWARD_EVENT(self, event)
+            finally:
+                self.app.ALLOW_SELECT = old
+    return _ORIG_SCREEN_FORWARD_EVENT(self, event)
+
+
+_patch_textual_screen_forward_event()
 
 from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
@@ -108,14 +145,14 @@ COMMAND_HELP: dict[str, str] = {
     "/up": "返回父节点",
     "/home": "跳回根节点",
     "/full": "切换全览模式：节点树全宽显示（切换节点自动退出）\n隐藏右侧回答区、输入框保留；再按一次 /full 恢复分栏",
-    "/reasoning": "展开/折叠当前消息的思考过程\n正文开始后思考过程会自动折叠成一行，点击灰色折叠块也可展开",
     "/save": "用法: /save [节点ID]\n导出节点为 Markdown 文件",
     "/delete": "用法: /delete <节点ID> [...]\n删除一个或多个节点及其所有子节点（需确认；子节点随父节点级联删除）",
     "/files": "用法: /files list | /files delete <ID>\n管理已上传的 Files API 图片文件（/import 导入的图片可在此查看/删除）",
 }
 
-# 思考过程折叠后的一行占位（块引用，灰色、可点击展开）
-REASONING_COLLAPSED_MD = "> ▶ 思考过程（点击展开 · /reasoning）"
+# 思考过程：灰色块引用（不再折叠/点击展开；多轮工具调用时每个思考段
+# 各自独立成块，正文穿插其间正常显示）
+REASONING_HEADER_MD = "> 思考过程"
 
 # 青色主题：整体围绕青色设计（对应原命令行版的青色风格），
 # 回答区背景近黑灰色、整体色相略偏蓝。
@@ -197,14 +234,12 @@ class ChatApp(App):
         self._injected_controller = controller
         self.ctrl: ChatController | None = None
         self._stream_active = False
-        self._reasoning_text = ""  # 当前消息的思考过程全文（折叠后用于展开）
-        self._reasoning_md = ""  # 消息区中思考块的当前 Markdown 原文（用于折叠/展开替换）
-        self._reasoning_collapsed = False  # 思考块是否已折叠
+        self._reasoning_open = False  # 流式中当前思考块是否仍打开（正文出现则关闭）
         self._answer_started = False  # 正文的 "**mincli：**" 头部是否已输出
         self._full_view = False  # 全览模式：节点树全宽（隐藏回答区）
         self._last_scroll_t = 0.0  # 上下键滚动：上次按键时间（用于双击加速）
         self._scroll_fast_until = 0.0  # 双击按住 → 2 倍速滚动截止时间
-        self._chat_lock = asyncio.Lock()  # 串行化聊天区 update/append（点击折叠 vs 流式）
+        self._chat_lock = asyncio.Lock()  # 串行化聊天区 update/append（流式渲染 vs 节点切换）
         self._completion_matches: list[str] = []
         self._completion_index = 0
         # 流式渲染节流：SSE 按 token 级产生事件，逐事件 append 会导致
@@ -531,12 +566,12 @@ class ChatApp(App):
         )
         return content
 
-    # ---------------- 思考过程（灰色块引用、正文开始后自动折叠） ----------------
+    # ---------------- 思考过程（灰色块引用；多轮工具调用时每段各自成块） ----------------
 
     @staticmethod
     def _build_reasoning_md(text: str) -> str:
-        """把思考全文转成灰色块引用 Markdown（含折叠头部）。"""
-        lines = ["> ▼ 思考过程（点击折叠）", ">"]
+        """把思考全文转成灰色块引用 Markdown（节点视图/摘要用）。"""
+        lines = [REASONING_HEADER_MD, ">"]
         for ln in text.splitlines():
             lines.append(f"> {ln}" if ln else ">")
         return "\n".join(lines)
@@ -552,65 +587,6 @@ class ChatApp(App):
             else:
                 md += ("\n> " + ln) if ln else "\n>"
         return md
-
-    async def _collapse_reasoning(self) -> None:
-        """正文开始：把灰色思考块替换为一行折叠占位。
-
-        仅在 _handle_event_inner 内调用（此时已持有 _chat_lock）。
-        """
-        chat = self.query_one("#chat-log", Markdown)
-        src = chat.source
-        if self._reasoning_md and self._reasoning_md in src:
-            new = "\n\n" + REASONING_COLLAPSED_MD
-            src = src.replace(self._reasoning_md, new)
-            await chat.update(src)
-            self._reasoning_md = new
-        self._reasoning_collapsed = True
-        chat.scroll_end(animate=False)
-
-    async def _toggle_reasoning_async(self) -> None:
-        """折叠/展开思考块（点击折叠块或 /reasoning）；与流式渲染串行化。"""
-        async with self._chat_lock:
-            await self._toggle_reasoning_inner()
-
-    async def _toggle_reasoning_inner(self) -> None:
-        if not self._reasoning_md:
-            self.notify("当前没有思考过程", severity="warning")
-            return
-        chat = self.query_one("#chat-log", Markdown)
-        src = chat.source
-        if self._reasoning_md not in src:
-            return
-        if self._reasoning_collapsed:
-            new = "\n\n" + self._build_reasoning_md(self._reasoning_text)
-        else:
-            new = "\n\n" + REASONING_COLLAPSED_MD
-        src = src.replace(self._reasoning_md, new)
-        await chat.update(src)
-        self._reasoning_md = new
-        self._reasoning_collapsed = not self._reasoning_collapsed
-        chat.scroll_end(animate=False)
-
-    async def on_click(self, event: events.Click) -> None:
-        """点击灰色思考块：展开/折叠思考过程。
-
-        注意：点击命中的是块引用内部的最里层段落，需向上找到
-        MarkdownBlockQuote 祖先，再从其中找含「思考过程」标记的文本。
-        """
-        w = event.widget
-        if w is None:
-            return
-        quote = w
-        while quote is not None and not isinstance(quote, MarkdownBlockQuote):
-            quote = getattr(quote, "parent", None)
-        if quote is None:
-            return
-        for sub in quote.walk_children(with_self=True):
-            content = getattr(sub, "_content", None)
-            if content is not None and "思考过程" in str(content):
-                await self._toggle_reasoning_async()
-                event.stop()
-                return
 
     # ---------------- 工具调用块（代码块样式） ----------------
 
@@ -671,12 +647,6 @@ class ChatApp(App):
         chat = self.query_one("#chat-log", Markdown)
         chat.update(self._node_content(node))
         self._shrink_lists(chat)
-        # 思考过程状态：内联显示在节点视图里（提问与回答之间），可点击折叠
-        self._reasoning_text = node.reasoning or ""
-        self._reasoning_md = (
-            "\n\n" + self._build_reasoning_md(node.reasoning) if node.reasoning else ""
-        )
-        self._reasoning_collapsed = False
         self._answer_started = True  # 节点视图已含 **mincli：** 头部
         self._refresh_usage_bar()
         return True
@@ -806,9 +776,6 @@ class ChatApp(App):
             chat = self.query_one("#chat-log", Markdown)
             await chat.update(WELCOME)
             self._rebuild_tree()
-            self._reasoning_text = ""
-            self._reasoning_md = ""
-            self._reasoning_collapsed = False
             self._answer_started = False
             self.notify("对话历史已清除")
             self._refresh_usage_bar()
@@ -834,9 +801,6 @@ class ChatApp(App):
         if low in ("/full", "/f"):
             self._set_full_view(not self._full_view)
             self.notify("已进入全览模式（切换节点或发送消息自动退出）" if self._full_view else "已退出全览模式")
-            return True
-        if low in ("/reasoning", "/reason", "/think", "/r"):
-            await self._toggle_reasoning_async()
             return True
         if await self._cmd_tree(cmd):
             return True
@@ -981,7 +945,6 @@ class ChatApp(App):
 - `/up` — 返回父节点
 - `/home` — 跳回根节点
 - `/full` — 全览模式：隐藏回答区，节点树全宽（再按一次或切换节点自动退出）
-- `/reasoning` — 展开/折叠当前消息的思考过程（正文开始后自动折叠，也可点击折叠块）
 - `/save [节点ID]` — 导出节点为 Markdown
 - `/delete <节点ID> [...]` — 删除一个或多个节点及其子节点（需确认；子节点随父节点级联删除）
 
@@ -1395,9 +1358,7 @@ class ChatApp(App):
         chat.scroll_end(animate=False)
         self._refresh_import_status()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False
-        self._reasoning_text = ""
-        self._reasoning_md = ""
-        self._reasoning_collapsed = False
+        self._reasoning_open = False
         self._answer_started = False
         self.run_worker(
             lambda: self._run_message(event.text),
@@ -1469,32 +1430,31 @@ class ChatApp(App):
             await self._render_stream_chunk(content, reasoning)
 
     async def _render_stream_chunk(self, content: str, reasoning: str) -> None:
-        """渲染一批流式增量（正文 + 思考），逻辑与原逐 chunk 渲染等价但按批执行。"""
+        """渲染一批流式增量（正文 + 思考），逻辑与原逐 chunk 渲染等价但按批执行。
+
+        多轮工具调用：一轮「思考→正文→工具调用」结束后会再来一轮
+        「思考→正文」；每轮思考各自开启一个带「思考过程」标题的灰色块引用，
+        正文穿插其间按普通文本显示。
+        """
         chat = self.query_one("#chat-log", Markdown)
         if not self._stream_active:
             self._stream_active = True
             self._answer_started = True
             await chat.append("\n\n---\n\n**mincli**\n\n")
         if reasoning:
-            # 思考过程：灰色块引用，位于提问之后、回答之前；
-            # 增量跨批次直接拼接（不按 token 断行）
-            if not self._reasoning_md:
-                md = (
-                    "\n\n> ▼ 思考过程（点击折叠）\n>\n> "
-                    + self._reasoning_chunk_md(reasoning)
+            # 思考过程：灰色块引用；一轮思考期间跨批次直接拼接不重复标题，
+            # 上一轮思考已被正文关闭（_reasoning_open=False）时开启新块
+            if not self._reasoning_open:
+                self._reasoning_open = True
+                await self._safe_append(
+                    chat,
+                    "\n\n" + REASONING_HEADER_MD + "\n>\n> "
+                    + self._reasoning_chunk_md(reasoning),
                 )
-                self._reasoning_md = md
-                await self._safe_append(chat, md)
             else:
-                md = self._reasoning_chunk_md(reasoning)
-                self._reasoning_md += md
-                await self._safe_append(chat, md)
-            self._reasoning_text += reasoning
-            self._reasoning_collapsed = False
+                await self._safe_append(chat, self._reasoning_chunk_md(reasoning))
         if content:
-            if self._reasoning_md and not self._reasoning_collapsed:
-                # 正文开始 → 自动折叠思考过程
-                await self._collapse_reasoning()
+            self._reasoning_open = False  # 正文出现 → 当前思考块结束
             if not self._answer_started:
                 self._answer_started = True
                 await self._safe_append(chat, "\n\n**mincli：**\n\n")
@@ -1524,9 +1484,7 @@ class ChatApp(App):
                 chat.scroll_end(animate=False)
                 self._refresh_import_status()  # 图片已绑定到节点，隐藏提示行
                 self._stream_active = True  # 视图已含节点头部，后续流式内容直接追加
-                self._reasoning_text = ""
-                self._reasoning_md = ""
-                self._reasoning_collapsed = False
+                self._reasoning_open = False
                 self._answer_started = False
         elif ev.kind == "tool":
             if ev.tool_summary:

@@ -186,7 +186,6 @@ CLI flags:
 | `/up` | Go to parent node |
 | `/home` | Jump to root |
 | `/full` | Full-view mode: hide the answer area, tree takes full width (input stays; toggle again or switch a node to exit) |
-| `/reasoning` | Expand/collapse the current message's reasoning (auto-collapsed once the answer starts streaming; click the folded block too) |
 | `/save [node-id]` | Export node as Markdown |
 | `/delete <node-id> [...]` | Delete one or more nodes and their children (confirmed; children of a deleted parent are removed together, no not-found error) |
 | `/view` | Open reply in editor |
