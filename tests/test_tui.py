@@ -144,6 +144,7 @@ async def main() -> int:
     test_markdown_safety()
     test_selection_safety()
     test_screen_forward_safety()
+    test_tool_args_width()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -412,6 +413,7 @@ async def main() -> int:
         await app._handle_event(ControllerEvent.node_created(node_m))
         await app._handle_event(ControllerEvent.stream("", "第一轮思考内容"))
         await app._handle_event(ControllerEvent.stream("第一轮正文", ""))
+        await app._handle_event(ControllerEvent.tool("execute_command", '{"command":"ls"}', ""))
         await app._handle_event(ControllerEvent.tool("execute_command", '{"command":"ls"}', "（完成）"))
         await app._handle_event(ControllerEvent.stream("", "第二轮思考内容"))
         await app._handle_event(ControllerEvent.stream("第二轮正文", ""))
@@ -423,6 +425,9 @@ async def main() -> int:
         check("多轮：第一轮思考按引用显示", "> 第一轮思考内容" in src_m)
         check("多轮：第二轮思考按引用显示", "> 第二轮思考内容" in src_m)
         check("多轮：两轮正文都显示", "第一轮正文" in src_m and "第二轮正文" in src_m)
+        check("多轮：工具块 fence 自闭合", src_m.count("```") == 4)
+        check("多轮：工具块前后空行", "\n\n```\n" in src_m and "结果：（完成）\n```" in src_m)
+        check("多轮：工具参数逐行显示", "参数：command=\"ls\"" in src_m)
         node_m.reasoning = "第一轮思考内容\n第二轮思考内容"  # 模拟 controller 汇总全部轮次思考
         check("多轮：节点视图也含思考引用", "思考过程" in app._node_content(node_m)
               and "> 第二轮思考内容" in app._node_content(node_m))
@@ -586,6 +591,27 @@ def test_screen_forward_safety():
     r2 = app_mod._safe_screen_forward_event(fake, "not-mousedown")
     check("非 MouseDown 事件直接转发", r2 == "pass-through" and passthrough["n"] == 1)
     app_mod._ORIG_SCREEN_FORWARD_EVENT = saved
+
+
+def test_tool_args_width():
+    """工具参数格式化：长 JSON 逐行显示、单行宽度受限、不产生超宽单行。"""
+    import json
+
+    from mincli.tui.app import ChatApp
+
+    args = json.dumps(
+        {
+            "query": "淘宝闪购 饿了么 关系 2025",
+            "results": [{"url": "https://example.com/" + "x" * 60, "title": "标题"}],
+        },
+        ensure_ascii=False,
+    )
+    fmt = ChatApp._format_tool_args(args)
+    check("工具参数换行（多行）", "\n" in fmt)
+    check("工具参数逐键一行", fmt.split("\n")[0].startswith("query="))
+    check("工具参数单行受限", all(len(line) <= 110 for line in fmt.split("\n")))
+    # 非 dict（如普通字符串）不影响，直接透传不崩溃
+    check("工具参数非 dict 不崩", isinstance(ChatApp._format_tool_args('"just a string"'), str))
 
 
 def test_markdown_safety():

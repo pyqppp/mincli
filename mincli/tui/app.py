@@ -592,19 +592,25 @@ class ChatApp(App):
 
     @staticmethod
     def _format_tool_args(args_str: str) -> str:
-        """把工具参数 JSON 字符串格式化为 键=值 列表。"""
+        """把工具参数 JSON 格式化为逐行易读的多行文本（每行宽度受限）。
+
+        目标：避免紧凑 JSON 变成一行超宽文本（横向溢出、视觉上像行内），
+        每个键值独占一行，复杂值拍平并按宽度截断。
+        """
         try:
             obj = json.loads(args_str)
         except Exception:
             return (args_str or "").strip()[:200]
         if isinstance(obj, dict):
-            parts = []
+            lines = []
             for k, v in obj.items():
-                s = json.dumps(v, ensure_ascii=False)
-                if len(s) > 60:
-                    s = s[:57] + "..."
-                parts.append(f"{k}={s}")
-            return "；".join(parts) if parts else "{}"
+                s = json.dumps(v, ensure_ascii=False, indent=2)
+                # 嵌套 JSON 拍平成单行，避免多行缩进后仍失控；再按宽度断行
+                s = " ".join(s.split())
+                if len(s) > 100:
+                    s = s[:97] + "…"
+                lines.append(f"{k}={s}")
+            return "\n".join(lines) if lines else "{}"
         return json.dumps(obj, ensure_ascii=False)[:200]
 
     def _set_full_view(self, on: bool) -> None:
@@ -1487,11 +1493,14 @@ class ChatApp(App):
                 self._reasoning_open = False
                 self._answer_started = False
         elif ev.kind == "tool":
+            # 每个工具事件输出一个完整、自闭合的 fenced 代码块（前后空行），
+            # 避免跨事件共享一对 fence 导致：参数块与结果块之间的 status 事件
+            # 混入代码块、fence 不配对、工具块被折叠成行内。
             if ev.tool_summary:
-                await chat.append(f"结果：{ev.tool_summary}\n```\n")
+                await chat.append(f"\n\n```\n结果：{ev.tool_summary}\n```\n\n")
             else:
                 args = self._format_tool_args(ev.tool_args)
-                await chat.append(f"\n```\n{ev.tool_name}\n参数：{args}\n")
+                await chat.append(f"\n\n```\n{ev.tool_name}\n参数：{args}\n```\n\n")
             self._shrink_lists(chat)
             chat.scroll_end(animate=False)
         elif ev.kind == "status":
