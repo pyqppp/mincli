@@ -140,24 +140,13 @@ ChatInput {
     }
 }
 
-/* 导入文件完整列表悬停弹窗：悬停在状态条中段的导入提示上时显示在状态条上方，
-   鼠标移出中段区域自动消失（性质类似输出区的悬停提示） */
-#import-popup {
-    display: none;
-    position: absolute;
-    height: auto;
-    max-height: 40%;
-    width: auto;
-    max-width: 75%;
-    padding: 0 1;
+/* 状态条中段悬停 Tooltip（Textual 悬浮层，不参与布局）：显示完整导入文件列表。
+   默认 Tooltip 在光标下方显示；状态条在屏幕底部，constrain: inside inflect 自动翻转到上方 */
+Tooltip {
+    max-width: 80;
     border: round $accent 60%;
     background: $surface;
-    overflow-y: auto;
-    scrollbar-size-vertical: 0;
-}
-
-#import-popup.visible {
-    display: block;
+    color: $text;
 }
 
 /* 命令补全/提示弹窗（输入框上方，仅输入 "/" 开头命令时显示） */
