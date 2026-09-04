@@ -24,7 +24,7 @@ _patch_markdown_it()
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Markdown, Static, Tree
 
@@ -115,7 +115,7 @@ from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
 from mincli.tools.files import FilesAPIError
 from mincli.tools.images import image_placeholder_text
 from mincli.tui.confirm import ConfirmScreen
-from mincli.tui.widgets import ChatInput
+from mincli.tui.widgets import ChatInput, ToolCard
 
 WELCOME = """# mincli
 
@@ -240,6 +240,10 @@ class ChatApp(App):
         self._last_scroll_t = 0.0  # 上下键滚动：上次按键时间（用于双击加速）
         self._scroll_fast_until = 0.0  # 双击按住 → 2 倍速滚动截止时间
         self._chat_lock = asyncio.Lock()  # 串行化聊天区 update/append（流式渲染 vs 节点切换）
+        # 聊天区（#chat-log 容器）：多段正文 Markdown + 工具卡片，按时间穿插。
+        self._chat_md: Markdown | None = None  # 当前正在流式的正文 Markdown 段
+        self._chat_blocks: list = []  # 有序：Markdown 段 或 ToolCard
+        self._active_tool_card = None  # 正在执行的工具卡片（开始→结束更新同一张）
         self._completion_matches: list[str] = []
         self._completion_index = 0
         # 流式渲染节流：SSE 按 token 级产生事件，逐事件 append 会导致
@@ -280,7 +284,7 @@ class ChatApp(App):
                     yield Static("会话", id="sidebar-title")
                     yield Button("⛶ 全览", id="fullview-btn", compact=True)
                 yield Tree("全部", id="tree")
-            yield Markdown(WELCOME, id="chat-log")
+            yield VerticalScroll(id="chat-log")
         with Vertical(id="cmd-popup"):
             yield Static("", id="cmd-popup-body")
         yield ChatInput(
@@ -542,6 +546,74 @@ class ChatApp(App):
             if isinstance(w, MarkdownList) and w.expand:
                 w.expand = False
 
+    # ---------------- 聊天区（#chat-log 容器：多段正文 Markdown + 工具卡片） ----------------
+    # 正文一直 append 到「当前段」(_chat_md)；工具调用时固化当前段、把 ToolCard 插到
+    # 其后、再为后续正文新建一段，从而在 Markdown 流中实现真实穿插的控件卡片。
+
+    def _chat_container(self) -> VerticalScroll:
+        return self.query_one("#chat-log", VerticalScroll)
+
+    async def _chat_ensure_md(self) -> Markdown:
+        """保证存在当前正文段（无则创建并挂到容器末尾）。"""
+        if self._chat_md is None:
+            md = Markdown("")
+            md.styles.height = "auto"
+            await self._chat_container().mount(md)
+            self._chat_md = md
+            self._chat_blocks.append(md)
+        return self._chat_md
+
+    async def _chat_stream_append(self, text: str) -> None:
+        """正文增量 append 到当前段（防御 markdown 解析异常）。"""
+        md = await self._chat_ensure_md()
+        await self._safe_append(md, text)
+
+    async def _chat_fix_segment(self) -> None:
+        """固化当前正文段（置 None，后续 _chat_append 会新建段）。"""
+        self._chat_md = None
+
+    async def _chat_add_toolcard(self, card: ToolCard) -> None:
+        """工具卡片插到当前段之后，并固化当前段（后续正文进新段）。"""
+        await self._chat_fix_segment()
+        await self._chat_container().mount(card)
+        self._chat_blocks.append(card)
+
+    async def _chat_reset(self, text: str) -> None:
+        """重建聊天区：清空所有段/卡片，新建首段显示 text（切换节点/清空）。"""
+        container = self._chat_container()
+        await container.remove_children()
+        self._chat_blocks = []
+        self._chat_md = None
+        self._active_tool_card = None
+        if text:
+            md = Markdown(text)
+            md.styles.height = "auto"
+            await container.mount(md)
+            self._chat_md = md
+            self._chat_blocks.append(md)
+
+    def _chat_source(self) -> str:
+        """聚合所有段的 source（兼容现有 .source 读取）。"""
+        parts = []
+        for b in self._chat_blocks:
+            if isinstance(b, Markdown):
+                parts.append(b.source)
+            elif isinstance(b, ToolCard):
+                parts.append(b.card_summary())
+        return "\n".join(parts)
+
+    def _chat_scroll_end(self) -> None:
+        # scroll_end 为异步调度，同步触发即可（头部诊断确认滚动生效），
+        # 在 _chat_lock 内 await 会等待布局刷新进而挂起。
+        self._chat_container().scroll_end(animate=False)
+
+    async def _chat_shrink_lists(self, scroll: bool = True) -> None:
+        for b in self._chat_blocks:
+            if isinstance(b, Markdown):
+                self._shrink_lists(b)
+        if scroll:
+            self._chat_scroll_end()
+
     def _node_content(self, node) -> str:
         """把节点渲染为消息区 Markdown 内容（思考过程内联在提问与回答之间）。"""
         comp = (
@@ -618,8 +690,7 @@ class ChatApp(App):
         if on == self._full_view:
             return
         self._full_view = on
-        chat = self.query_one("#chat-log", Markdown)
-        chat.set_class(on, "overview-hidden")
+        self.query_one("#chat-log", VerticalScroll).set_class(on, "overview-hidden")
         self.query_one("#sidebar").set_class(on, "overview")
         self.query_one("#fullview-btn", Button).label = "⧉ 分栏" if on else "⛶ 全览"
 
@@ -637,10 +708,11 @@ class ChatApp(App):
             self._scroll_fast_until = now + 1.0
         self._last_scroll_t = now
         fast = now < self._scroll_fast_until
-        chat = self.query_one("#chat-log", Markdown)
-        chat.scroll_relative(y=delta * (2 if fast else 1), animate=False)
+        self.query_one("#chat-log", VerticalScroll).scroll_relative(
+            y=delta * (2 if fast else 1), animate=False
+        )
 
-    def _switch_to(self, node_id: str) -> bool:
+    async def _switch_to(self, node_id: str) -> bool:
         """切换到节点：设当前节点 + 刷新树 + 光标跟随 + 消息区显示节点内容。"""
         if self._full_view:
             self._set_full_view(False)  # 全览模式下切换节点 → 自动退出全览
@@ -650,36 +722,35 @@ class ChatApp(App):
         self._rebuild_tree()
         self._select_tree_node(node_id)
         node = self.ctrl.tree.current_node
-        chat = self.query_one("#chat-log", Markdown)
-        chat.update(self._node_content(node))
-        self._shrink_lists(chat)
+        await self._chat_reset(self._node_content(node))
+        await self._chat_shrink_lists(scroll=False)  # 切换节点：显示节点开头，不滚到底
         self._answer_started = True  # 节点视图已含 **mincli：** 头部
         self._refresh_usage_bar()
         return True
 
-    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+    async def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         """点击会话树节点：切换当前节点并显示其内容。"""
         node_id = event.node.data
         if node_id:
-            self._switch_to(node_id)
+            await self._switch_to(node_id)
 
     # ---------------- 鼠标滚轮（兜底：命中测试可能返回内部容器） ----------------
 
     def _pointer_over_chat_log(self, event) -> bool:
         try:
-            region = self.screen.find_widget(self.query_one("#chat-log", Markdown)).region
+            region = self.screen.find_widget(self.query_one("#chat-log", VerticalScroll)).region
         except Exception:
             return False
         return region.contains(int(event.screen_x), int(event.screen_y))
 
     def _on_mouse_scroll_down(self, event) -> None:
         if self._pointer_over_chat_log(event):
-            self.query_one("#chat-log", Markdown).scroll_down(animate=False)
+            self.query_one("#chat-log", VerticalScroll).scroll_down(animate=False)
             event.stop()
 
     def _on_mouse_scroll_up(self, event) -> None:
         if self._pointer_over_chat_log(event):
-            self.query_one("#chat-log", Markdown).scroll_up(animate=False)
+            self.query_one("#chat-log", VerticalScroll).scroll_up(animate=False)
             event.stop()
 
     # ---------------- 命令补全弹窗 ----------------
@@ -779,8 +850,7 @@ class ChatApp(App):
             return True
         if low in ("/clear", "/c"):
             ctrl.reset()
-            chat = self.query_one("#chat-log", Markdown)
-            await chat.update(WELCOME)
+            await self._chat_reset(WELCOME)
             self._rebuild_tree()
             self._answer_started = False
             self.notify("对话历史已清除")
@@ -872,7 +942,7 @@ class ChatApp(App):
 
         m = re.match(r"^/([A-Za-z]+\d+|main)$", cmd)
         if m and ctrl.tree and m.group(1) in ctrl.tree.nodes:
-            self._switch_to(m.group(1))
+            await self._switch_to(m.group(1))
             return True
         if cmd.startswith("/"):
             self.notify(f"未知命令: {cmd}。输入 /help 查看可用命令", severity="warning")
@@ -881,10 +951,8 @@ class ChatApp(App):
 
     async def _chat_append(self, markdown: str) -> None:
         """向消息区追加一段 Markdown（带分隔线并滚动到底）。"""
-        chat = self.query_one("#chat-log", Markdown)
-        await self._safe_append(chat, f"\n\n---\n\n{markdown}")
-        self._shrink_lists(chat)
-        chat.scroll_end(animate=False)
+        await self._chat_stream_append(f"\n\n---\n\n{markdown}")
+        await self._chat_shrink_lists()
 
     async def _safe_append(self, chat: Markdown, md: str) -> None:
         """chat.append 的防御版本：markdown 解析异常时降级为代码块原样显示。"""
@@ -1067,14 +1135,14 @@ class ChatApp(App):
         if low == "/up":
             if tree.current_node and tree.current_node.parent_id:
                 parent = tree.nodes.get(tree.current_node.parent_id)
-                if parent and not self._switch_to(parent.id):
+                if parent and not (await self._switch_to(parent.id)):
                     self.notify("返回父节点失败", severity="error")
             else:
                 self.notify("已在根节点", severity="warning")
             return True
         if low == "/home":
             if tree.root:
-                self._switch_to(tree.root.id)
+                await self._switch_to(tree.root.id)
             return True
         if low.startswith("/save"):
             nid = parts[1] if len(parts) > 1 else current_id
@@ -1340,7 +1408,7 @@ class ChatApp(App):
             self.notify("当前节点已是压缩摘要节点", severity="warning")
             return
         # 切换到新建的摘要节点：聊天区直接显示压缩后的信息
-        self._switch_to(stats["node_id"])
+        await self._switch_to(stats["node_id"])
         self.notify(
             f"✅ 已压缩 {stats['nodes_compressed']} 轮 → 新节点 {stats['node_id']}（摘要）；"
             f"Token {stats['before_tokens']:,} → {stats['after_tokens']:,}"
@@ -1358,10 +1426,9 @@ class ChatApp(App):
         if await self._handle_command(event.text):
             return
         self._cancel_flush()  # 新消息开始前丢弃上一轮残留的流式缓冲
-        chat = self.query_one("#chat-log", Markdown)
         img_md = self._pending_images_md()
-        chat.append(f"\n\n---\n\n**你**\n\n{event.text}{img_md}")
-        chat.scroll_end(animate=False)
+        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{event.text}{img_md}")
+        await self._chat_shrink_lists()
         self._refresh_import_status()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False
         self._reasoning_open = False
@@ -1442,34 +1509,31 @@ class ChatApp(App):
         「思考→正文」；每轮思考各自开启一个带「思考过程」标题的灰色块引用，
         正文穿插其间按普通文本显示。
         """
-        chat = self.query_one("#chat-log", Markdown)
+        chat = self._chat_container()
         if not self._stream_active:
             self._stream_active = True
             self._answer_started = True
-            await chat.append("\n\n---\n\n**mincli**\n\n")
+            await self._chat_stream_append("\n\n---\n\n**mincli**\n\n")
         if reasoning:
             # 思考过程：灰色块引用；一轮思考期间跨批次直接拼接不重复标题，
             # 上一轮思考已被正文关闭（_reasoning_open=False）时开启新块
             if not self._reasoning_open:
                 self._reasoning_open = True
-                await self._safe_append(
-                    chat,
+                await self._chat_stream_append(
                     "\n\n" + REASONING_HEADER_MD + "\n>\n> "
                     + self._reasoning_chunk_md(reasoning),
                 )
             else:
-                await self._safe_append(chat, self._reasoning_chunk_md(reasoning))
+                await self._chat_stream_append(self._reasoning_chunk_md(reasoning))
         if content:
             self._reasoning_open = False  # 正文出现 → 当前思考块结束
             if not self._answer_started:
                 self._answer_started = True
-                await self._safe_append(chat, "\n\n**mincli：**\n\n")
-            await self._safe_append(chat, content)
-        self._shrink_lists(chat)
-        chat.scroll_end(animate=False)
+                await self._chat_stream_append("\n\n**mincli：**\n\n")
+            await self._chat_stream_append(content)
+        await self._chat_shrink_lists()
 
     async def _handle_event_inner(self, ev: ControllerEvent) -> None:
-        chat = self.query_one("#chat-log", Markdown)
         if ev.kind == "node_created":
             node = ev.node
             if node is not None:
@@ -1485,42 +1549,39 @@ class ChatApp(App):
                         f"- {image_placeholder_text(a)}" for a in node.user_images
                     )
                     view += f"\n\n{marks}"
-                await chat.update(view)
-                self._shrink_lists(chat)
-                chat.scroll_end(animate=False)
+                await self._chat_reset(view)
+                await self._chat_shrink_lists(scroll=False)  # 新节点先显示开头，流式再滚到底
                 self._refresh_import_status()  # 图片已绑定到节点，隐藏提示行
                 self._stream_active = True  # 视图已含节点头部，后续流式内容直接追加
                 self._reasoning_open = False
                 self._answer_started = False
         elif ev.kind == "tool":
-            # 每个工具事件输出一个完整、自闭合的 fenced 代码块（前后空行），
-            # 避免跨事件共享一对 fence 导致：参数块与结果块之间的 status 事件
-            # 混入代码块、fence 不配对、工具块被折叠成行内。
+            # 工具调用渲染成结构化 ToolCard（真控件，穿插在正文 Markdown 流之间）：
+            # 开始事件创建卡片并固化当前正文段，结束事件更新同一张卡片为「完成」。
             if ev.tool_summary:
-                await chat.append(f"\n\n```\n结果：{ev.tool_summary}\n```\n\n")
+                if self._active_tool_card is not None:
+                    self._active_tool_card.set_result(ev.tool_summary)
             else:
-                args = self._format_tool_args(ev.tool_args)
-                await chat.append(f"\n\n```\n{ev.tool_name}\n参数：{args}\n```\n\n")
-            self._shrink_lists(chat)
-            chat.scroll_end(animate=False)
+                args_lines = self._format_tool_args(ev.tool_args).split("\n")
+                card = ToolCard(ev.tool_name, args_lines)
+                await self._chat_add_toolcard(card)
+                self._active_tool_card = card
+            await self._chat_shrink_lists()
         elif ev.kind == "status":
-            await chat.append(f"\n> {ev.message}\n")
-            self._shrink_lists(chat)
-            chat.scroll_end(animate=False)
+            await self._chat_stream_append(f"\n> {ev.message}\n")
+            await self._chat_shrink_lists()
         elif ev.kind == "error":
-            await chat.append(f"\n\n> ⚠️ {ev.message}\n")
-            self._shrink_lists(chat)
-            chat.scroll_end(animate=False)
+            await self._chat_stream_append(f"\n\n> ⚠️ {ev.message}\n")
+            await self._chat_shrink_lists()
             self._rebuild_tree()  # 出错时节点已被回滚，刷新树移除空节点
             self._refresh_import_status()  # 发送失败时图片已放回待发送队列，恢复提示行
         elif ev.kind == "done":
             node = ev.node
             if node is not None:
-                await chat.append(
+                await self._chat_stream_append(
                     f"\n\n---\n\n*📊 输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*\n"
                 )
-            self._shrink_lists(chat)
-            chat.scroll_end(animate=False)
+            await self._chat_shrink_lists()
             self._rebuild_tree()
             if node is not None:
                 self._select_tree_node(node.id)
@@ -1528,10 +1589,7 @@ class ChatApp(App):
 
     def _append_error(self, message: str) -> None:
         self._cancel_flush()  # 出错后不再渲染残留流式缓冲
-        chat = self.query_one("#chat-log", Markdown)
-        chat.append(f"\n\n> ⚠️ {message}\n")
-        self._shrink_lists(chat)
-        chat.scroll_end(animate=False)
+        asyncio.ensure_future(self._chat_append(f"\n\n> ⚠️ {message}\n"))
 
     # ---------------- 确认对话框（供 controller 工具调用） ----------------
 

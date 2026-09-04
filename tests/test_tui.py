@@ -19,7 +19,7 @@ from mincli.controller import ChatController, ControllerEvent
 from mincli.tui.app import ChatApp
 from mincli.tui.widgets import ChatInput
 from textual import events
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Markdown, Static, Tree
 from textual.widgets._markdown import (
     MarkdownBulletList,
@@ -150,7 +150,7 @@ async def main() -> int:
     async with app.run_test(size=(100, 30)) as pilot:
         # --- 1. 布局 ---
         check("布局：输入框存在且聚焦", app.query_one("#chat-input", ChatInput) is not None)
-        check("布局：消息流存在", bool(app.query_one("#chat-log", Markdown)))
+        check("布局：消息流存在", bool(app.query_one("#chat-log", VerticalScroll)))
         check("布局：会话树存在", bool(app.query_one("#tree", Tree)))
         check("布局：状态条存在", bool(app.query_one("#usage-bar", Horizontal)))
         check("布局：状态条两分栏", bool(app.query_one("#usage-left", Static))
@@ -167,13 +167,13 @@ async def main() -> int:
         await pilot.press("enter")
         for _ in range(30):
             await pilot.pause()
-            if "世界！" in app.query_one("#chat-log", Markdown).source:
+            if "世界！" in app._chat_source():
                 break
-        chat = app.query_one("#chat-log", Markdown)
-        check("流式内容已追加", "你好，世界！" in chat.source)
+        chat = app._chat_source()
+        check("流式内容已追加", "你好，世界！" in chat)
         # 思考过程不折叠：完整内容以灰色块引用显示（无点击展开交互）
-        check("思考以引用格式显示", "思考过程" in chat.source and "> 思考中" in chat.source)
-        check("token 统计已显示", "tokens" in chat.source)
+        check("思考以引用格式显示", "思考过程" in chat and "> 思考中" in chat)
+        check("token 统计已显示", "tokens" in chat)
 
         # --- 3. 会话树更新 + 光标跟随新节点 ---
         for _ in range(5):
@@ -190,7 +190,7 @@ async def main() -> int:
             await pilot.pause()
             if app.query(MarkdownTableContent):
                 break
-        chat = app.query_one("#chat-log", Markdown)
+        chat = app.query_one("#chat-log", VerticalScroll)
         tables = list(app.query(MarkdownTableContent))
         check("表格已渲染", len(tables) >= 1)
         if tables:
@@ -221,7 +221,7 @@ async def main() -> int:
         # --- 4. 点击树节点切换 ---
         tree.select_node(tree.root)
         await pilot.pause()
-        check("切换节点显示内容", "测试标题" in app.query_one("#chat-log", Markdown).source)
+        check("切换节点显示内容", "测试标题" in app._chat_source())
 
         # --- 5. 锁定键过滤 ---
         inp.clear()
@@ -241,9 +241,9 @@ async def main() -> int:
         await type_command("/help")
         for _ in range(10):
             await pilot.pause()
-            if "📖 帮助" in app.query_one("#chat-log", Markdown).source:
+            if "📖 帮助" in app._chat_source():
                 break
-        check("命令：/help 显示帮助", "📖 帮助" in app.query_one("#chat-log", Markdown).source)
+        check("命令：/help 显示帮助", "📖 帮助" in app._chat_source())
 
         await type_command("/set model pro")
         await pilot.pause()
@@ -252,9 +252,9 @@ async def main() -> int:
         await type_command("/tree")
         for _ in range(10):
             await pilot.pause()
-            if "main: 测试标题" in app.query_one("#chat-log", Markdown).source:
+            if "main: 测试标题" in app._chat_source():
                 break
-        check("命令：/tree 显示对话树", "main: 测试标题" in app.query_one("#chat-log", Markdown).source)
+        check("命令：/tree 显示对话树", "main: 测试标题" in app._chat_source())
 
         # --- 7.5 命令补全弹窗 + /delete 确认删除（节点此时已存在） ---
         fake.tree.add_child(fake.tree.root, "子问题", "子回答", "", "子节点", 1, 1)
@@ -291,9 +291,9 @@ async def main() -> int:
         await type_command("/set show")
         for _ in range(10):
             await pilot.pause()
-            if "当前配置" in app.query_one("#chat-log", Markdown).source:
+            if "当前配置" in app._chat_source():
                 break
-        check("命令：/set show 显示配置", "当前配置" in app.query_one("#chat-log", Markdown).source)
+        check("命令：/set show 显示配置", "当前配置" in app._chat_source())
 
         # --- 7.6 多模态：/import、/files、/set detail、/set model vision、节点视图占位 ---
         from mincli.tools.images import ImageAttachment
@@ -395,7 +395,7 @@ async def main() -> int:
         await type_command("/files list")
         for _ in range(10):
             await pilot.pause()
-        check("命令：/files list 显示空列表", "已上传图片文件" in app.query_one("#chat-log", Markdown).source)
+        check("命令：/files list 显示空列表", "已上传图片文件" in app._chat_source())
 
         # 节点视图：带图片的节点渲染占位（直接驱动 node_created 事件）
         node = fake.tree.create_root("看图", "", "", "图题", 0, 0)
@@ -404,7 +404,7 @@ async def main() -> int:
         await app._handle_event(ControllerEvent.node_created(node))
         for _ in range(10):
             await pilot.pause()
-        check("节点视图含图片占位", "[图片: t.png (800x600)]" in app.query_one("#chat-log", Markdown).source)
+        check("节点视图含图片占位", "[图片: t.png (800x600)]" in app._chat_source())
         await type_command("/clear")
 
         # --- 7.6c 多轮工具调用：多个思考块穿插正文，各自按引用格式显示 ---
@@ -420,14 +420,16 @@ async def main() -> int:
         await app._handle_event(ControllerEvent.done(node_m))
         for _ in range(30):
             await pilot.pause()
-        src_m = app.query_one("#chat-log", Markdown).source
+        src_m = app._chat_source()
         check("多轮：两个思考块各带标题", src_m.count("思考过程") == 2)
         check("多轮：第一轮思考按引用显示", "> 第一轮思考内容" in src_m)
         check("多轮：第二轮思考按引用显示", "> 第二轮思考内容" in src_m)
         check("多轮：两轮正文都显示", "第一轮正文" in src_m and "第二轮正文" in src_m)
-        check("多轮：工具块 fence 自闭合", src_m.count("```") == 4)
-        check("多轮：工具块前后空行", "\n\n```\n" in src_m and "结果：（完成）\n```" in src_m)
-        check("多轮：工具参数逐行显示", "参数：command=\"ls\"" in src_m)
+        check("多轮：工具卡片显示工具名", "▸ 工具调用：execute_command" in src_m)
+        check("多轮：工具卡片参数逐行", "command=\"ls\"" in src_m and "    command=\"ls\"" in src_m)
+        check("多轮：工具卡片状态完成", "状态：完成" in src_m)
+        check("多轮：工具卡片作为控件穿插在正文段之间",
+              [type(b).__name__ for b in app._chat_blocks] == ["Markdown", "ToolCard", "Markdown"])
         node_m.reasoning = "第一轮思考内容\n第二轮思考内容"  # 模拟 controller 汇总全部轮次思考
         check("多轮：节点视图也含思考引用", "思考过程" in app._node_content(node_m)
               and "> 第二轮思考内容" in app._node_content(node_m))
@@ -456,12 +458,12 @@ async def main() -> int:
             await pilot.pause()
             if fake.tree.compaction and fake.tree.current_node.id == fake.tree.compaction["boundary_id"]:
                 break
-        chat = app.query_one("#chat-log", Markdown)
+        chat = app._chat_source()
         check("命令：/compact 新建摘要节点", fake.tree.compaction is not None)
         node_id = fake.tree.compaction["boundary_id"]
         check(
             "命令：/compact 显示摘要",
-            "上下文压缩摘要" in chat.source and "TUI 压缩测试内容" in chat.source,
+            "上下文压缩摘要" in chat and "TUI 压缩测试内容" in chat,
         )
         check("命令：/compact 摘要节点为当前", fake.tree.current_node.id == node_id)
 
@@ -493,7 +495,7 @@ async def main() -> int:
         check("删除：根节点保留", fake.tree.root is not None and fake.tree.current_node is not None)
 
         # --- 7.9 文字选择 + 复制 ---
-        chat = app.query_one("#chat-log", Markdown)
+        chat = app._chat_source()
         check("选区：ALLOW_SELECT 已开启", app.ALLOW_SELECT)
         await pilot.mouse_down("#chat-log", offset=(10, 4))
         await pilot.pause()

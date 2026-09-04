@@ -8,7 +8,7 @@ import shlex
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
-from textual.widgets import TextArea
+from textual.widgets import Static, TextArea
 
 # 锁定键（Caps Lock / Num Lock / Scroll Lock）绝不应产生输入。
 # 注意：真正的拦截在 App 级优先级绑定（见 app.py 的 action_ignore_lock）；
@@ -151,3 +151,51 @@ class ChatInput(TextArea):
         if target != self._target_height:
             self._target_height = target
             self.styles.height = target
+
+
+class ToolCard(Static):
+    """工具调用卡片：结构化显示工具名、参数与状态（不嵌入正文 Markdown 流）。
+
+    用平面符号（非 emoji）：标题前缀 `▸`，参数逐键一行，状态行纯文字。
+    开始事件 set_start() 显示「执行中」，结束事件 set_result() 更新为「完成」并展示结果。
+    """
+
+    def __init__(self, tool_name: str = "", args_lines: list[str] | None = None, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self.tool_name = tool_name
+        self.args_lines = args_lines or []
+        self._result = ""
+        self._done = False
+
+    def _render_text(self) -> str:
+        lines = [f"▸ 工具调用：{self.tool_name}"]
+        if self.args_lines:
+            lines.append("  参数")
+            for line in self.args_lines:
+                lines.append(f"    {line}")
+        if self._done:
+            status = "完成"
+        else:
+            status = "执行中"
+        lines.append(f"  状态：{status}")
+        if self._result:
+            lines.append(f"  结果：{self._result}")
+        return "\n".join(lines)
+
+    def set_start(self, tool_name: str, args_lines: list[str]) -> None:
+        """工具开始：显示工具名+参数，状态执行中。"""
+        self.tool_name = tool_name
+        self.args_lines = args_lines
+        self._done = False
+        self._result = ""
+        self.update(self._render_text())
+
+    def set_result(self, summary: str) -> None:
+        """工具结束：更新状态为完成，展示结果摘要。"""
+        self._done = True
+        self._result = summary
+        self.update(self._render_text())
+
+    def card_summary(self) -> str:
+        """聚合 source 用：卡片文本。"""
+        return self._render_text()

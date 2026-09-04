@@ -67,6 +67,13 @@ Horizontal {
     background: $background;
     overflow-y: auto;
     scrollbar-gutter: stable;
+    content-align: left top; /* 子内容始终从顶部对齐（与旧 Markdown 布局一致） */
+}
+
+/* 聊天区容器内的正文 Markdown 段与工具卡片：占满宽度，按内容自适应高度 */
+#chat-log > Markdown,
+#chat-log ToolCard {
+    width: 100%;
 }
 
 /* 思考过程：灰色块引用（位于提问与回答之间，正文开始后折叠成一行） */
@@ -80,6 +87,23 @@ Horizontal {
     background: $warning 15%;
     border: round $warning 40%;
     padding: 0 1;
+}
+
+/* 聊天区容器内的正文 Markdown 段：不自己滚动，按内容自适应高度 */
+#chat-log > Markdown {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+/* 工具调用卡片：结构化控件（圆角边框 + 浅底 + 清晰层次），独立于正文 Markdown 流 */
+#chat-log ToolCard {
+    border: round $accent 45%;
+    background: $primary 8%;
+    color: $text;
+    padding: 0 1;
+    margin: 1 0 1 0;
+    max-width: 100%;
+    text-style: none;
 }
 
 /* 表格：列按终端宽度等分并自动换行（默认 grid-columns: auto 按内容撑宽，
