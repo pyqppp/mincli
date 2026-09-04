@@ -153,12 +153,14 @@ async def main() -> int:
         check("布局：消息流存在", bool(app.query_one("#chat-log", VerticalScroll)))
         check("布局：会话树存在", bool(app.query_one("#tree", Tree)))
         check("布局：状态条存在", bool(app.query_one("#usage-bar", Horizontal)))
-        check("布局：状态条两分栏", bool(app.query_one("#usage-left", Static))
+        check("布局：状态条三分栏", bool(app.query_one("#usage-left", Static))
+              and bool(app.query_one("#usage-center", Static))
               and bool(app.query_one("#usage-right", Static)))
         for _ in range(10):
             await pilot.pause()
         usage_left = str(app.query_one("#usage-left", Static).content)
         check("状态条左栏显示缓存/余额", "缓存" in usage_left)
+        check("启动：空会话显示欢迎页", "DeepSeek 树状对话 TUI" in app._chat_source())
 
         # --- 2. 发送消息 → 流式渲染 ---
         inp = app.query_one("#chat-input", ChatInput)
@@ -315,8 +317,8 @@ async def main() -> int:
         for _ in range(10):
             await pilot.pause()
         check("命令：/import 添加待发送图片", len(fake.pending_images) == 1)
-        hint = app.query_one("#import-status", Static)
-        check("导入状态栏显示", "已导入 1 个文件" in str(hint.content) and hint.has_class("visible"))
+        hint = app.query_one("#usage-center", Static)
+        check("导入提示显示在状态条中段", "已导入 1 个文件" in str(hint.content) and hint.has_class("visible"))
 
         # 一次导入多个文件（图片 + 文本）+ 悬停弹窗（完整文件名列表）
         await type_command("/import clear")
@@ -326,7 +328,7 @@ async def main() -> int:
         for _ in range(10):
             await pilot.pause()
         check("命令：/import 多文件", len(fake.pending_images) == 1 and len(fake.imported_files) == 1)
-        check("状态栏数量与前2文件名", "已导入 2 个文件" in str(hint.content) and "note.txt" in str(hint.content))
+        check("状态条中段数量与前2文件名", "已导入 2 个文件" in str(hint.content) and "note.txt" in str(hint.content))
         popup = app.query_one("#import-popup", Static)
         sr = hint.region
         app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
@@ -344,7 +346,7 @@ async def main() -> int:
         for _ in range(10):
             await pilot.pause()
         check("命令：/import clear 清空", len(fake.pending_images) == 0 and len(fake.imported_files) == 0
-              and not app.query_one("#import-status", Static).has_class("visible"))
+              and not app.query_one("#usage-center", Static).has_class("visible"))
 
         # --- 7.6b 拖入文件直接导入（终端把路径粘贴进输入框） ---
         inp.clear()
@@ -493,6 +495,10 @@ async def main() -> int:
         check("删除：父节点级联删除子节点",
               da1.id not in fake.tree.nodes and db1.id not in fake.tree.nodes and db2.id not in fake.tree.nodes)
         check("删除：根节点保留", fake.tree.root is not None and fake.tree.current_node is not None)
+        check("删除：当前节点被删后自动跳转", "main: 根" in app._chat_source())
+        tree_w = app.query_one("#tree", Tree)
+        cursor_node = getattr(tree_w, "cursor_node", None)
+        check("删除：树光标跟随新的当前节点", cursor_node is not None and cursor_node.data == "main")
 
         # --- 7.9 文字选择 + 复制 ---
         chat = app._chat_source()
@@ -520,6 +526,21 @@ async def main() -> int:
 
         # --- 8. Ctrl+C 退出 ---
         await pilot.press("ctrl+c")
+
+    # --- 9. 启动即显示上次会话的当前节点（而非欢迎页） ---
+    fake2 = FakeController()
+    fake2.reset()
+    fake2.tree.create_root("上次的问题", "上次的回答", "", "上次标题", 1, 1)
+    app2 = ChatApp(controller=fake2)
+    async with app2.run_test(size=(100, 30)) as pilot2:
+        for _ in range(10):
+            await pilot2.pause()
+        src2 = app2._chat_source()
+        check("启动：直接显示当前节点（非欢迎页）", "上次标题" in src2 and "DeepSeek 树状对话 TUI" not in src2)
+        tree2 = app2.query_one("#tree", Tree)
+        cursor2 = getattr(tree2, "cursor_node", None)
+        check("启动：树光标跟随当前节点", cursor2 is not None and cursor2.data == "main")
+        await pilot2.press("ctrl+c")
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

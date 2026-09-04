@@ -406,7 +406,7 @@ class ChatController:
         return n
 
     def import_summary(self) -> str:
-        """输入框下方状态栏文本：已导入文件数量 + 前 2 个文件名；无导入返回空串。"""
+        """状态条中段文本：已导入文件数量 + 前 2 个文件名；无导入返回空串。"""
         names = [a.name for a in self.pending_images] + [
             f["name"] for f in self.imported_files
         ]
@@ -414,7 +414,7 @@ class ChatController:
             return ""
         shown = "、".join(names[:2])
         extra = "…" if len(names) > 2 else ""
-        return f"📎 已导入 {len(names)} 个文件：{shown}{extra} · /import clear 清除"
+        return f"已导入 {len(names)} 个文件：{shown}{extra} · /import clear 清除"
 
     def import_file_list(self) -> List[Dict[str, str]]:
         """完整导入文件列表（图片在前、文本/网页在后），供悬停弹窗展示。"""

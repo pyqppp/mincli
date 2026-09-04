@@ -291,13 +291,14 @@ class ChatApp(App):
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
         yield Static("", id="import-popup")
-        yield Static("", id="import-status")
+        # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停查看完整列表），右=下次输入估算
         with Horizontal(id="usage-bar"):
             yield Static("", id="usage-left")
+            yield Static("", id="usage-center")
             yield Static("", id="usage-right")
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.theme = "mincli-cyan"  # 应用青色主题
         if self._injected_controller is not None:
             self.ctrl = self._injected_controller
@@ -315,8 +316,8 @@ class ChatApp(App):
             )
         self.ctrl.confirm = self._confirm
         self.query_one("#tree", Tree).auto_expand = False  # 点击节点名只切换节点，不收起/展开
-        # 导入状态栏与悬停弹窗（缓存引用，on_mouse_move 高频使用）
-        self._import_status_w = self.query_one("#import-status", Static)
+        # 状态条中段的导入提示与悬停弹窗（缓存引用，on_mouse_move 高频使用）
+        self._import_center_w = self.query_one("#usage-center", Static)
         self._import_popup_w = self.query_one("#import-popup", Static)
         self._rebuild_tree()
         self.query_one("#chat-input", ChatInput).focus()
@@ -325,6 +326,12 @@ class ChatApp(App):
         self._start_balance_refresh()
         self._refresh_usage_bar()
         self._refresh_import_status()
+        # 启动即进入上次会话的当前节点：直接显示该节点内容（无节点时才显示欢迎页）
+        node = self.ctrl.tree.current_node if (self.ctrl and self.ctrl.tree) else None
+        if node is not None:
+            await self._switch_to(node.id)
+        else:
+            await self._chat_reset(WELCOME)
 
     def on_unmount(self) -> None:
         self._cancel_flush()
@@ -375,7 +382,7 @@ class ChatApp(App):
         else:
             bal_txt = f"¥{self._balance_txt}"
         self.query_one("#usage-left", Static).update(
-            f"🎯 缓存命中 {rate_txt}   💵 余额 {bal_txt}"
+            f"缓存命中 {rate_txt}   余额 {bal_txt}"
         )
         tokens = stats["next_input_tokens"]
         price = stats["estimated_price"]
@@ -386,10 +393,10 @@ class ChatApp(App):
         )
 
     def _refresh_import_status(self) -> None:
-        """刷新输入框下方状态栏的「已导入文件」提示行（无导入时隐藏）。"""
+        """刷新状态条中段的「已导入文件」提示（无导入时清空隐藏）。"""
         if self.ctrl is None:
             return
-        hint = self._import_status_w
+        hint = self._import_center_w
         text = self.ctrl.import_summary()
         if text:
             hint.update(text)
@@ -408,12 +415,12 @@ class ChatApp(App):
         )
         return f"\n\n{marks}"
 
-    # ---------------- 导入状态栏悬停弹窗（完整文件名列表） ----------------
+    # ---------------- 状态条中段悬停弹窗（完整文件名列表） ----------------
 
-    _IMPORT_KIND_MARKS = {"image": "📷", "text": "📄", "web": "🌐"}
+    _IMPORT_KIND_LABELS = {"image": "图片", "text": "文本", "web": "网页"}
 
     def _show_import_popup(self) -> None:
-        """在导入状态栏上方显示完整文件名列表弹窗（悬停时）。"""
+        """在状态条中段上方显示完整文件名列表弹窗（悬停时）。"""
         if self.ctrl is None:
             return
         items = self.ctrl.import_file_list()
@@ -424,30 +431,31 @@ class ChatApp(App):
             name = item.get("name", "")
             if len(name) > 100:
                 name = name[:97] + "…"
-            lines.append(f"{self._IMPORT_KIND_MARKS.get(item.get('kind', ''), '•')} {name}")
+            label = self._IMPORT_KIND_LABELS.get(item.get("kind", ""))
+            lines.append(f"[{label}] {name}" if label else f"· {name}")
         popup = self._import_popup_w
         popup.update("\n".join(lines))
-        sr = self._import_status_w.region
-        if sr.width <= 0 or sr.height <= 0:
+        bar = self.query_one("#usage-bar", Horizontal).region
+        if bar.width <= 0 or bar.height <= 0:
             return
-        # 绝对定位（offset 相对屏幕左上角）：弹窗紧贴状态栏上方。
+        # 绝对定位（offset 相对屏幕左上角）：弹窗紧贴状态条上方。
         # 高度按内容行数估算（内容 + 圆角边框 1 行，封顶屏幕 40%）。
         max_h = int(self.screen.size.height * 0.4)
         h = min(len(lines), max_h) + 1
-        top = max(0, sr.y - h - 1)
+        top = max(0, bar.y - h - 1)
         popup.styles.position = "absolute"
-        popup.styles.offset = (sr.x, top)
+        popup.styles.offset = (bar.x, top)
         popup.add_class("visible")
 
     def _hide_import_popup(self) -> None:
         self._import_popup_w.remove_class("visible")
 
     def on_mouse_move(self, event) -> None:
-        """鼠标在导入状态栏上悬停 → 显示完整文件列表；移出 → 自动消失。"""
-        status = getattr(self, "_import_status_w", None)
-        if status is None or event.screen_x is None or event.screen_y is None:
+        """鼠标在状态条中段（导入提示）上悬停 → 显示完整文件列表；移出 → 自动消失。"""
+        center = getattr(self, "_import_center_w", None)
+        if center is None or event.screen_x is None or event.screen_y is None:
             return
-        region = status.region
+        region = center.region
         if region.width <= 0 or region.height <= 0:
             return
         if region.contains(int(event.screen_x), int(event.screen_y)):
@@ -1176,17 +1184,27 @@ class ChatApp(App):
             return True
         return False
 
-    def _on_delete_confirmed(self, nids: list, ok: bool) -> None:
+    async def _on_delete_confirmed(self, nids: list, ok: bool) -> None:
         """确认弹窗回调：ok=True 时批量删除（App 消息泵空闲时才被调用）。"""
         if not ok:
             self.notify("已取消删除")
             return
         tree = self.ctrl.tree
+        prev_current_id = tree.current_node.id if tree.current_node else None
         result = self.ctrl.delete_nodes(nids)
         self.ctrl._cleanup_temp_files(keep_ids=set(tree.nodes.keys()))
-        self._rebuild_tree()
-        if tree.current_node:
-            self._select_tree_node(tree.current_node.id)
+        if prev_current_id is not None and prev_current_id not in tree.nodes:
+            # 当前节点（或其祖先）被删：模型已把当前移到父节点/根 —— 自动跳转过去，
+            # 让聊天区/树光标/用量状态跟随新的当前节点（_switch_to 内部重建树并选中）
+            if tree.current_node is not None:
+                await self._switch_to(tree.current_node.id)
+            else:  # 理论不会发生（根节点不可删），防御：退回欢迎页
+                self._rebuild_tree()
+                await self._chat_reset(WELCOME)
+        else:
+            self._rebuild_tree()
+            if tree.current_node:
+                self._select_tree_node(tree.current_node.id)
         if result["deleted"]:
             self.notify(f"已删除 {len(result['deleted'])} 个节点（含其子节点及关联图片文件）")
         else:
