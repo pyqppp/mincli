@@ -125,6 +125,7 @@ class FakeClient:
 
 class TestController(ChatController):
     SAVE_FILE = os.path.join(_TMP, "session.json")
+    WORKFLOWS_FILE = os.path.join(_TMP, "workflows.json")
 
 
 def collect(ctrl, text):
@@ -618,6 +619,112 @@ def test_usage_stats():
           and stats3["next_input_tokens"] == 0 and stats3["estimated_price"] is None)
 
 
+def test_workflows():
+    """工作流（/wf）：存储持久化 / 提炼 / 合成 / 修订 / 管理。"""
+    from mincli.workflows import FALLBACK_MARK, Workflow
+
+    if os.path.exists(TestController.WORKFLOWS_FILE):
+        os.remove(TestController.WORKFLOWS_FILE)
+
+    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    check("工作流：初始无文件", not os.path.exists(TestController.WORKFLOWS_FILE))
+    check("工作流：列表初始为空", ctrl.wf_list() == [])
+
+    DOC = (
+        "目标：为 Git 仓库生成 changelog 并写入文件\n\n"
+        "变量：\n"
+        "- {start}：起始版本（示例：v1.0）\n"
+        "- {end}：目标版本（示例：v2.0）\n\n"
+        "步骤：\n"
+        "1. 查看自 {start} 以来的提交：`git log {start}..{end} --oneline`\n"
+        "2. 生成 CHANGELOG.md"
+    )
+    ctrl._wf_store.put(Workflow(name="rel", doc=DOC))
+    check("工作流：put 后文件已写入", os.path.exists(TestController.WORKFLOWS_FILE))
+
+    # “重启”后从同一文件加载
+    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    wf = ctrl2.wf_get("rel")
+    check("工作流：重启后仍在且内容一致", wf is not None and wf.doc == DOC)
+    check("工作流：占位符推导", wf is not None and wf.placeholders() == ["start", "end"])
+    lst = ctrl2.wf_list()
+    check("工作流：list 摘要正确", len(lst) == 1 and lst[0]["name"] == "rel"
+          and "changelog" in lst[0]["goal"] and lst[0]["steps"] == 2
+          and lst[0]["vars"] == ["start", "end"])
+    check("工作流：同名 put 需 overwrite", ctrl2._wf_store.put(Workflow(name="rel", doc="x")) is False)
+    check("工作流：同名 put overwrite 成功",
+          ctrl2._wf_store.put(Workflow(name="rel", doc="x"), overwrite=True) is True)
+    ctrl2.wf_import_text("rel", DOC)
+    check("工作流：import_text 回写文档", ctrl2.wf_get("rel").doc == DOC)
+    check("工作流：重命名非法名报错", ctrl2.wf_rename("rel", "bad name") is not None)
+    check("工作流：重命名成功", ctrl2.wf_rename("rel", "rel2") is None
+          and ctrl2.wf_get("rel") is None and ctrl2.wf_get("rel2") is not None)
+    ctrl2.wf_rename("rel2", "rel")
+    check("工作流：删除不存在返回 False", ctrl2.wf_delete("nope") is False)
+    check("工作流：删除成功", ctrl2.wf_delete("rel") is True and ctrl2.wf_get("rel") is None)
+
+    # 提炼：构造带工具调用的节点 + stub 模型
+    ctrl3 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3.tree.create_root("请为仓库生成 changelog 并写入文件", "已完成", "", "生成 changelog", 1, 1)
+    node = ctrl3.tree.current_node
+    node.tool_messages = [
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "git log --oneline v1.0..HEAD"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "a1b2c3 提交说明"},
+    ]
+    src = ctrl3._wf_build_source([node])
+    check("工作流：提炼源含用户指令", "请为仓库生成 changelog" in src)
+    check("工作流：提炼源含工具调用细节", "调用工具: execute_command" in src and "git log" in src)
+    check("工作流：提炼源含工具结果", "工具结果" in src and "a1b2c3" in src)
+
+    ctrl3._wf_call_model = lambda messages, max_tokens: DOC  # stub 提炼
+    r = ctrl3.wf_save("demo")
+    check("工作流：自动提炼保存", r.get("status") == "saved" and r.get("from") == "extract"
+          and r.get("placeholders") == ["start", "end"])
+    check("工作流：记录来源节点", ctrl3.wf_get("demo").source_nodes == ["main"])
+    check("工作流：同名未 force 返回 exists", ctrl3.wf_save("demo").get("status") == "exists")
+    check("工作流：force 覆盖成功", ctrl3.wf_save("demo", force=True).get("status") == "saved")
+    check("工作流：起点不在链上报错", ctrl3.wf_save("x", start_id="bogus").get("status") == "error")
+    # 一连串操作：起点 → 当前链（a1 挂在 main 下）
+    a1 = ctrl3.tree.add_child(ctrl3.tree.root, "第二轮追问", "第二轮回答", "", "追问", 1, 1)
+    ctrl3.tree.current_node = a1
+    r_chain = ctrl3.wf_save("chain", start_id="main")
+    check("工作流：一连串操作提炼（起点→当前）",
+          r_chain.get("status") == "saved" and r_chain.get("nodes") == 2)
+    wf_chain = ctrl3.wf_get("chain")
+    check("工作流：来源记录整条链", wf_chain is not None and wf_chain.source_nodes == ["main", "a1"])
+    ctrl3._wf_call_model = lambda messages, max_tokens: ""  # 提炼失败
+    rfb = ctrl3.wf_save("fb")
+    check("工作流：提炼失败回退原文", rfb.get("status") == "saved" and rfb.get("from") == "fallback")
+    check("工作流：回退文档含提示标记", FALLBACK_MARK in ctrl3.wf_get("fb").doc)
+
+    # 合成：use / run 与变量替换、运行计数
+    ctrl4 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl4._wf_store.put(Workflow(name="rel", doc=DOC))
+    m_use = ctrl4.wf_compose("rel", typed="这次发布到 v2.0")
+    check("工作流：use 合成含规范与本次输入", m_use is not None
+          and "请执行工作流「rel」" in m_use and "本次输入：这次发布到 v2.0" in m_use)
+    m_run = ctrl4.wf_compose("rel", values={"start": "v1.0", "end": "v2.0"})
+    check("工作流：run 合成替换变量", m_run is not None
+          and "{start}" not in m_run and "{end}" not in m_run
+          and "v1.0" in m_run and "v2.0" in m_run)
+    m_part = ctrl4.wf_compose("rel", values={"start": "v1.0"})
+    check("工作流：缺失变量提示推断", m_part is not None
+          and "{end}" in m_part and "未提供值的变量" in m_part)
+    check("工作流：未知名合成返回 None", ctrl4.wf_compose("nope") is None)
+    wf4 = ctrl4.wf_get("rel")
+    check("工作流：运行计数递增", wf4 is not None and wf4.run_count == 3 and wf4.last_run_at is not None)
+
+    # 修订
+    ctrl4._wf_call_model = lambda messages, max_tokens: "目标：修订版\n\n步骤：\n1. 校验步骤"
+    rr = ctrl4.wf_revise("rel", "增加校验")
+    check("工作流：模型修订成功", rr.get("status") == "revised" and "修订版" in ctrl4.wf_get("rel").doc)
+    ctrl4._wf_call_model = lambda messages, max_tokens: ""
+    rerr = ctrl4.wf_revise("rel", "x")
+    check("工作流：修订失败报错", rerr.get("status") == "error")
+    check("工作流：修订失败保留原文档", "修订版" in ctrl4.wf_get("rel").doc)
+    check("工作流：修订不存在名字报错", ctrl4.wf_revise("nope", "x").get("status") == "error")
+
+
 if __name__ == "__main__":
     test_simple_qa()
     test_tool_round()
@@ -630,5 +737,6 @@ if __name__ == "__main__":
     test_compact()
     test_multimodal()
     test_usage_stats()
+    test_workflows()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

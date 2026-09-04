@@ -148,6 +148,7 @@ COMMAND_HELP: dict[str, str] = {
     "/save": "用法: /save [节点ID]\n导出节点为 Markdown 文件",
     "/delete": "用法: /delete <节点ID> [...]\n删除一个或多个节点及其所有子节点（需确认；子节点随父节点级联删除）",
     "/files": "用法: /files list | /files delete <ID>\n管理已上传的 Files API 图片文件（/import 导入的图片可在此查看/删除）",
+    "/wf": "用法: /wf list | /wf show <名> | /wf save <名> [起点节点ID] | /wf use <名> | /wf stop | /wf run <名> [键=值...] | /wf edit <名> [修改要求] | /wf rename <旧> <新> | /wf delete <名>\n把当前某次/一连串操作保存为可复用工作流并长期保存；/wf use 挂载到下一次输入自动执行，/wf run 立即执行；重复任务无需再描述",
 }
 
 # 思考过程：灰色块引用（不再折叠/点击展开；多轮工具调用时每个思考段
@@ -254,6 +255,14 @@ class ChatApp(App):
         self._flush_interval = 0.08  # 批量渲染间隔（秒）
         self._flush_timer = None  # 批量渲染定时器（textual Timer）
         self._balance_txt: Optional[str] = None  # 最近一次拉取的账户余额（字符串）
+        # 工作流（/wf）：已挂载到“下一次输入”的工作流名（发送后自动解除）
+        self._pending_wf: Optional[str] = None
+        # /wf edit：系统编辑器打开的临时文档轮询（检测改动后自动回写）
+        self._wf_edit_timer = None  # textual Interval
+        self._wf_edit_path: Optional[str] = None
+        self._wf_edit_name: Optional[str] = None
+        self._wf_edit_mtime: Optional[float] = None
+        self._wf_edit_deadline: Optional[float] = None
 
     def action_ignore_lock(self) -> None:
         """忽略锁定键（Caps Lock / Num Lock / Scroll Lock）。"""
@@ -336,6 +345,7 @@ class ChatApp(App):
 
     def on_unmount(self) -> None:
         self._cancel_flush()
+        self._wf_stop_edit()
         if self.ctrl is not None:
             self.ctrl.save_session()
             self.ctrl.close()
@@ -394,10 +404,19 @@ class ChatApp(App):
         )
 
     def _refresh_import_status(self) -> None:
-        """刷新状态条中段的「已导入文件」提示（无导入时清空隐藏）。"""
+        """刷新状态条中段的提示：工作流挂载提示优先，其次「已导入文件」提示。
+
+        无任何提示时清空隐藏（弹窗随之隐藏）。
+        """
         if self.ctrl is None:
             return
         hint = self._import_center_w
+        if self._pending_wf:
+            text = f"工作流已挂载：{self._pending_wf}（发送即执行 · /wf stop 取消）"
+            hint.update(text)
+            hint.add_class("visible")
+            self._import_popup_w.remove_class("visible")
+            return
         text = self.ctrl.import_summary()
         if text:
             hint.update(text)
@@ -423,8 +442,14 @@ class ChatApp(App):
     _IMPORT_KIND_LABELS = {"image": "图片", "text": "文本", "web": "网页"}
 
     def _show_import_popup(self) -> None:
-        """在状态条上方固定位置显示完整文件名列表弹窗（悬停中段时）。"""
+        """在状态条上方固定位置显示完整文件名列表弹窗（悬停中段时）。
+
+        已挂载工作流时中段显示的是工作流提示，不弹导入列表。
+        """
         if self.ctrl is None:
+            return
+        if self._pending_wf:
+            self._import_popup_w.remove_class("visible")
             return
         items = self.ctrl.import_file_list()
         if not items:
@@ -867,6 +892,15 @@ class ChatApp(App):
         if low.startswith("/compact"):
             await self._cmd_compact(cmd)
             return True
+        # /wf（及 /workflow 别名）：仅精确前缀 + 空格，避免误吞 /wf1 这类节点跳转
+        if (
+            low == "/wf"
+            or low.startswith("/wf ")
+            or low == "/workflow"
+            or low.startswith("/workflow ")
+        ):
+            await self._cmd_wf(cmd)
+            return True
         if low in ("/view",):
             self._cmd_view()
             return True
@@ -996,6 +1030,7 @@ class ChatApp(App):
 - `/exit`, `/quit`, `/q` — 退出程序（自动保存会话）
 - `/clear`, `/c` — 清空当前会话
 - `/compact` — 压缩上下文：把当前分支全部对话压成详细摘要并新建摘要节点（在摘要节点输入用摘要，其他节点仍用完整历史）
+- `/wf <list|show|save|use|run|edit|delete|rename|stop>` — 把当前某次/一连串操作保存为可复用工作流并长期保存；`/wf use 名` 挂载到下次输入，`/wf run 名` 立即执行（输入 `/wf` 查看全部用法）
 - `/help`, `/h` — 显示此帮助
 - `/import <路径或URL> [...]` — 导入文件/网页/图片（可一次多个；`/import clear` 清除待导入内容）
 - `/mcp <list|add|remove|reload>` — 管理第三方 MCP server
@@ -1433,6 +1468,327 @@ class ChatApp(App):
             f"（节省 {stats['saved_tokens']:,}）"
         )
 
+    # ---------------- 工作流（/wf） ----------------
+
+    _WF_USAGE = (
+        "用法: /wf list | /wf show <名> | /wf save <名> [起点节点ID] | "
+        "/wf use <名> | /wf stop | /wf run <名> [键=值...] | "
+        "/wf edit <名> [修改要求] | /wf rename <旧> <新> | /wf delete <名>"
+    )
+
+    async def _cmd_wf(self, cmd: str) -> None:
+        """工作流命令入口（/wf 与 /workflow 等价）。"""
+        ctrl = self.ctrl
+        if ctrl is None:
+            self.notify("控制器未就绪", severity="error")
+            return
+        parts = cmd.strip().split(maxsplit=1)
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            self.notify("参数解析失败（引号不匹配）", severity="warning")
+            return
+        sub = tokens[0].lower() if tokens else ""
+        name = tokens[1] if len(tokens) > 1 else ""
+
+        if sub in ("", "help", "-h", "--help"):
+            await self._chat_append(
+                "**工作流命令**\n\n"
+                f"{self._WF_USAGE}\n\n"
+                "- `/wf save <名> [起点节点ID]` — 把当前节点（或起点→当前的一连串操作）"
+                "提炼为可复用工作流并长期保存（自动把每次会变化的数据抽成 {变量}）\n"
+                "- `/wf use <名>` — 挂载到下一次输入：发送下一条消息即按工作流执行（一次性）\n"
+                "- `/wf run <名> [键=值...]` — 立即按工作流执行；未提供值的变量由模型结合当前情况推断\n"
+                "- `/wf edit <名> <修改要求>` — 让模型修订规范；macOS 下不带要求则用系统编辑器打开修改\n"
+                "- 工作流长期保存于 `~/.mincli/workflows.json`，重启后仍在"
+            )
+            return
+        if sub in ("list", "ls"):
+            await self._cmd_wf_list()
+            return
+        if sub == "show":
+            if not name:
+                self.notify("用法: /wf show <名>", severity="warning")
+                return
+            wf = ctrl.wf_get(name)
+            if wf is None:
+                self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
+                return
+            await self._chat_append(
+                f"**工作流 {wf.name}**（运行 {wf.run_count} 次）\n\n{wf.doc}"
+            )
+            return
+        if sub == "save":
+            if not name:
+                self.notify("用法: /wf save <名> [起点节点ID]", severity="warning")
+                return
+            start_id = tokens[2] if len(tokens) > 2 else None
+            if ctrl.wf_get(name) is not None:
+                self._ask_confirm(
+                    "覆盖工作流",
+                    f"工作流「{name}」已存在，重新提炼会覆盖旧版本，是否继续？",
+                    lambda ok, n=name, s=start_id: self._on_wf_save_confirmed(n, s, ok),
+                )
+                return
+            await self._wf_save_exec(name, start_id)
+            return
+        if sub == "use":
+            if not name:
+                self.notify("用法: /wf use <名>（/wf stop 取消挂载）", severity="warning")
+                return
+            if ctrl.wf_get(name) is None:
+                self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
+                return
+            self._pending_wf = name
+            self._refresh_import_status()
+            self.notify(
+                f"已挂载工作流「{name}」：发送下一条消息即按工作流执行（/wf stop 取消）"
+            )
+            return
+        if sub in ("stop", "unuse"):
+            if self._pending_wf:
+                self.notify(f"已解除工作流「{self._pending_wf}」的挂载")
+            else:
+                self.notify("当前没有已挂载的工作流")
+            self._pending_wf = None
+            self._refresh_import_status()
+            return
+        if sub == "run":
+            await self._cmd_wf_run(tokens)
+            return
+        if sub == "delete":
+            if not name:
+                self.notify("用法: /wf delete <名>", severity="warning")
+                return
+            if ctrl.wf_get(name) is None:
+                self.notify(f"工作流「{name}」不存在", severity="warning")
+                return
+            self._ask_confirm(
+                "删除工作流",
+                f"确定删除工作流「{name}」吗？此操作不可恢复。",
+                lambda ok, n=name: self._on_wf_delete_confirmed(n, ok),
+            )
+            return
+        if sub == "rename":
+            new_name = tokens[2] if len(tokens) > 2 else ""
+            if not name or not new_name:
+                self.notify("用法: /wf rename <旧名> <新名>", severity="warning")
+                return
+            err = ctrl.wf_rename(name, new_name)
+            if err:
+                self.notify(err, severity="warning")
+            else:
+                if self._pending_wf == name:
+                    self._pending_wf = new_name
+                    self._refresh_import_status()
+                self.notify(f"已重命名：{name} → {new_name}")
+            return
+        if sub == "edit":
+            if not name:
+                self.notify("用法: /wf edit <名> [修改要求]", severity="warning")
+                return
+            if ctrl.wf_get(name) is None:
+                self.notify(f"工作流「{name}」不存在", severity="warning")
+                return
+            if len(tokens) > 2:
+                request = " ".join(tokens[2:])
+                self.notify(f"正在按你的要求修订工作流「{name}」…")
+                res = await asyncio.to_thread(ctrl.wf_revise, name, request)
+                if res.get("status") == "error":
+                    self.notify(res.get("message", "修订失败"), severity="error")
+                else:
+                    self.notify(f"✅ 工作流「{name}」已按你的要求更新")
+                return
+            self._wf_start_editor(name)
+            return
+        self.notify(self._WF_USAGE, severity="warning")
+
+    async def _cmd_wf_list(self) -> None:
+        data = self.ctrl.wf_list() if self.ctrl else []
+        if not data:
+            await self._chat_append(
+                "**工作流**（暂无）\n\n把当前操作保存为可复用工作流：`/wf save <名>`；"
+                "已有工作流用 `/wf use <名>` 挂载到下次输入、`/wf run <名>` 立即执行。"
+            )
+            return
+        lines = [
+            "**工作流列表**",
+            "",
+            "| 名称 | 目标 | 步骤 | 变量 | 运行 | 更新于 |",
+            "|---|---|---|---|---|---|",
+        ]
+        for item in data:
+            upd = (item.get("updated_at") or "")[:16].replace("T", " ")
+            goal = item.get("goal") or "—"
+            if len(goal) > 40:
+                goal = goal[:40] + "…"
+            lines.append(
+                f"| `{item['name']}` | {goal} | {item.get('steps', 0)} "
+                f"| {len(item.get('vars') or [])} | {item.get('run_count', 0)} | {upd} |"
+            )
+        lines += [
+            "",
+            "使用: `/wf use <名>` 挂载下次输入 · `/wf run <名>` 立即执行 · "
+            "`/wf show <名>` 查看 · `/wf edit <名> <修改要求>` 修改",
+        ]
+        await self._chat_append("\n".join(lines))
+
+    async def _wf_save_exec(self, name: str, start_id: Optional[str]) -> None:
+        """后台提炼并保存工作流（force=True，覆盖同名）。"""
+        ctrl = self.ctrl
+        if ctrl is None:
+            return
+        self.notify(f"正在从对话提炼工作流「{name}」…")
+        res = await asyncio.to_thread(ctrl.wf_save, name, start_id, True)
+        if res.get("status") == "error":
+            self.notify(res.get("message", "保存失败"), severity="error")
+            return
+        if res.get("from") == "fallback":
+            self.notify(
+                f"已保存工作流「{name}」（未能自动提炼，原始记录已存档，"
+                f"可用 /wf edit {name} 修改）",
+                severity="warning",
+                timeout=8,
+            )
+        else:
+            n = res.get("nodes", 0)
+            v = len(res.get("placeholders") or [])
+            self.notify(
+                f"✅ 已提炼保存工作流「{name}」（{n} 轮 / {v} 个变量）；"
+                f"/wf use {name} 挂载到下次输入",
+                timeout=8,
+            )
+
+    async def _on_wf_save_confirmed(
+        self, name: str, start_id: Optional[str], ok: bool
+    ) -> None:
+        if not ok:
+            self.notify("已取消")
+            return
+        await self._wf_save_exec(name, start_id)
+
+    async def _cmd_wf_run(self, tokens: list) -> None:
+        name = tokens[1] if len(tokens) > 1 else ""
+        if not name:
+            self.notify("用法: /wf run <名> [键=值...]（位置参数按变量顺序填充）", severity="warning")
+            return
+        ctrl = self.ctrl
+        if ctrl is None:
+            return
+        wf = ctrl.wf_get(name)
+        if wf is None:
+            self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
+            return
+        values: dict = {}
+        positionals: list = []
+        for tok in tokens[2:]:
+            if "=" in tok:
+                k, _, v = tok.partition("=")
+                values[k.strip()] = v
+            else:
+                positionals.append(tok)
+        if positionals:
+            phs = wf.placeholders()
+            for i, pv in enumerate(positionals):
+                if i >= len(phs):
+                    break
+                key = phs[i]
+                if key not in values:
+                    values[key] = pv
+            if len(positionals) > len(phs):
+                ph_txt = "、".join("{" + p + "}" for p in phs) or "无"
+                self.notify(f"多余的位置参数已忽略（该工作流变量：{ph_txt}）", severity="warning")
+        composed = ctrl.wf_compose(name, values=values)
+        if composed is None:
+            self.notify(f"工作流「{name}」不存在", severity="warning")
+            return
+        self.notify(f"已开始执行工作流「{name}」")
+        await self._send_user_text(composed)
+
+    async def _on_wf_delete_confirmed(self, name: str, ok: bool) -> None:
+        if not ok:
+            self.notify("已取消")
+            return
+        if self.ctrl and self.ctrl.wf_delete(name):
+            if self._pending_wf == name:
+                self._pending_wf = None
+                self._refresh_import_status()
+            self.notify(f"已删除工作流「{name}」")
+        else:
+            self.notify(f"删除失败：工作流「{name}」不存在", severity="warning")
+
+    # ---------------- 工作流编辑器回写（macOS） ----------------
+
+    def _wf_start_editor(self, name: str) -> None:
+        """macOS：用系统编辑器打开工作流临时文件，保存改动后自动回写。"""
+        if sys.platform != "darwin":
+            self.notify("当前平台请用 /wf edit <名> <修改要求> 由模型修订", severity="warning")
+            return
+        ctrl = self.ctrl
+        if ctrl is None:
+            return
+        path = ctrl.wf_export_temp(name)
+        if path is None:
+            self.notify(f"工作流「{name}」不存在", severity="warning")
+            return
+        try:
+            subprocess.Popen(["open", "-e", path])
+        except Exception as e:
+            self.notify(
+                f"打开编辑器失败: {e}（可改用 /wf edit {name} <修改要求>）",
+                severity="error",
+            )
+            return
+        self._wf_stop_edit()
+        self._wf_edit_path = path
+        self._wf_edit_name = name
+        try:
+            self._wf_edit_mtime = os.path.getmtime(path)
+        except OSError:
+            self._wf_edit_mtime = None
+        self._wf_edit_deadline = time.time() + 60
+        self._wf_edit_timer = self.set_interval(1.0, self._wf_editor_poll)
+        self.notify(
+            f"已在编辑器中打开工作流「{name}」：保存改动后自动更新（60 秒内）"
+        )
+
+    def _wf_editor_poll(self) -> None:
+        """轮询编辑器临时文件：内容变化 → 回写工作流文档。"""
+        if not self._wf_edit_path or not self._wf_edit_name:
+            self._wf_stop_edit()
+            return
+        try:
+            mtime = os.path.getmtime(self._wf_edit_path)
+        except OSError:
+            self._wf_stop_edit()
+            return
+        if mtime != self._wf_edit_mtime:
+            try:
+                with open(self._wf_edit_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                return
+            self._wf_edit_mtime = mtime
+            name = self._wf_edit_name
+            if self.ctrl and self.ctrl.wf_import_text(name, text):
+                self.notify(f"工作流「{name}」已从编辑器更新")
+        if self._wf_edit_deadline is not None and time.time() > self._wf_edit_deadline:
+            self._wf_stop_edit()
+
+    def _wf_stop_edit(self) -> None:
+        """停止编辑器轮询并清理状态（保留临时文件供用户继续编辑/另存）。"""
+        if self._wf_edit_timer is not None:
+            try:
+                self._wf_edit_timer.stop()
+            except Exception:
+                pass
+            self._wf_edit_timer = None
+        self._wf_edit_path = None
+        self._wf_edit_name = None
+        self._wf_edit_mtime = None
+        self._wf_edit_deadline = None
+
     # ---------------- 消息发送与流式渲染 ----------------
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
@@ -1443,16 +1799,37 @@ class ChatApp(App):
             return  # 命令未输完：先补全，等再次 Enter 执行
         if await self._handle_command(event.text):
             return
+        await self._send_user_text(event.text)
+
+    async def _send_user_text(self, text: str) -> None:
+        """发送一条用户消息（普通输入或 /wf run）。
+
+        若已挂载工作流（/wf use），先把它合成为“按工作流执行”的消息再发送，
+        挂载随之解除（一次性）。
+        """
+        if self.ctrl is None:
+            self.notify("控制器未就绪（请检查 DEEPSEEK_API_KEY）", severity="error", timeout=5)
+            return
+        if self._pending_wf:
+            wf_name = self._pending_wf
+            self._pending_wf = None
+            composed = self.ctrl.wf_compose(wf_name, typed=text)
+            self._refresh_import_status()
+            if composed is None:
+                self.notify(f"工作流「{wf_name}」不存在，已解除挂载", severity="warning")
+                return
+            text = composed
+            self.notify(f"已按工作流「{wf_name}」执行")
         self._cancel_flush()  # 新消息开始前丢弃上一轮残留的流式缓冲
         img_md = self._pending_images_md()
-        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{event.text}{img_md}")
+        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{text}{img_md}")
         await self._chat_shrink_lists()
         self._refresh_import_status()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False
         self._reasoning_open = False
         self._answer_started = False
         self.run_worker(
-            lambda: self._run_message(event.text),
+            lambda: self._run_message(text),
             name="chat-message",
             thread=True,
             exit_on_error=False,

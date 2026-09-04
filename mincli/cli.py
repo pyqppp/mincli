@@ -7,6 +7,7 @@ prompt_toolkit / 无流式渲染依赖）。
 import os
 import shlex
 import sys
+from typing import Optional
 
 import typer
 from openai import OpenAI
@@ -133,6 +134,144 @@ def list_models() -> None:
         print("\n（无已注册模型，可用 `mincli register <模型名> <URL>` 添加）")
 
 
+_WF_PLAIN_USAGE = (
+    "用法: /wf list | /wf show <名> | /wf save <名> [起点节点ID] | "
+    "/wf use <名> | /wf stop | /wf run <名> [键=值...] | "
+    "/wf edit <名> <修改要求> | /wf rename <旧> <新> | /wf delete <名>"
+)
+
+
+def _plain_wf(ctrl, text: str) -> Optional[str]:
+    """纯文本模式 /wf 分发（use/stop 由调用方就地处理）。
+
+    返回需要发送执行的消息文本（/wf run），其余命令打印结果并返回 None。
+    """
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        print("参数解析失败（引号不匹配）")
+        return None
+    if len(parts) < 2:
+        print(_WF_PLAIN_USAGE)
+        return None
+    sub = parts[1].lower()
+    name = parts[2] if len(parts) > 2 else ""
+
+    if sub in ("list", "ls"):
+        data = ctrl.wf_list()
+        if not data:
+            print("（暂无工作流）用法: /wf save <名> 把当前操作保存为工作流")
+            return None
+        for item in data:
+            goal = (item.get("goal") or "—")[:40]
+            print(
+                f"{item['name']}  |  {goal}  |  步骤 {item.get('steps', 0)} / "
+                f"变量 {len(item.get('vars') or [])} / 运行 {item.get('run_count', 0)}"
+            )
+        print("使用: /wf use <名> 挂载下次输入 | /wf run <名> 立即执行 | /wf show <名> 查看")
+        return None
+    if sub == "show":
+        wf = ctrl.wf_get(name)
+        if wf is None:
+            print(f"⚠️ 工作流「{name}」不存在")
+        else:
+            print(f"工作流 {wf.name}（运行 {wf.run_count} 次）\n{wf.doc}")
+        return None
+    if sub == "save":
+        if not name:
+            print("用法: /wf save <名> [起点节点ID]")
+            return None
+        start_id = parts[3] if len(parts) > 3 else None
+        if ctrl.wf_get(name) is not None and not ctrl.confirm(
+            "覆盖工作流", f"工作流「{name}」已存在，覆盖旧版本？"
+        ):
+            print("已取消")
+            return None
+        print("正在从对话提炼工作流…")
+        res = ctrl.wf_save(name, start_id, True)
+        if res.get("status") == "error":
+            print(f"⚠️ {res.get('message')}")
+        elif res.get("from") == "fallback":
+            print(f"已保存（未能自动提炼，原始记录已存档，可 /wf edit {name} <修改要求> 修正）")
+        else:
+            print(
+                f"✅ 已提炼保存工作流「{name}」（{res.get('nodes', 0)} 轮 / "
+                f"{len(res.get('placeholders') or [])} 个变量）"
+            )
+        return None
+    if sub == "run":
+        if not name:
+            print("用法: /wf run <名> [键=值...]（位置参数按变量顺序填充）")
+            return None
+        wf = ctrl.wf_get(name)
+        if wf is None:
+            print(f"⚠️ 工作流「{name}」不存在")
+            return None
+        values: dict = {}
+        positionals: list = []
+        for tok in parts[3:]:
+            if "=" in tok:
+                k, _, v = tok.partition("=")
+                values[k.strip()] = v
+            else:
+                positionals.append(tok)
+        if positionals:
+            phs = wf.placeholders()
+            for i, pv in enumerate(positionals):
+                if i >= len(phs):
+                    break
+                key = phs[i]
+                if key not in values:
+                    values[key] = pv
+            if len(positionals) > len(phs):
+                print("⚠️ 多余的位置参数已忽略")
+        composed = ctrl.wf_compose(name, values=values)
+        if composed is None:
+            print(f"⚠️ 工作流「{name}」不存在")
+            return None
+        print(f"▶ 已开始执行工作流「{name}」")
+        return composed
+    if sub == "delete":
+        if not name:
+            print("用法: /wf delete <名>")
+            return None
+        if not ctrl.confirm("删除工作流", f"确定删除工作流「{name}」吗？此操作不可恢复。"):
+            print("已取消")
+        elif ctrl.wf_delete(name):
+            print(f"已删除工作流「{name}」")
+        else:
+            print(f"⚠️ 删除失败：工作流「{name}」不存在")
+        return None
+    if sub == "rename":
+        new_name = parts[3] if len(parts) > 3 else ""
+        if not name or not new_name:
+            print("用法: /wf rename <旧名> <新名>")
+            return None
+        err = ctrl.wf_rename(name, new_name)
+        if err:
+            print(f"⚠️ {err}")
+        else:
+            print(f"已重命名：{name} → {new_name}")
+        return None
+    if sub == "edit":
+        if not name:
+            print("用法: /wf edit <名> <修改要求>")
+            return None
+        if len(parts) < 4:
+            print("纯文本模式不支持打开编辑器；请用 /wf edit <名> <修改要求> 由模型修订")
+            return None
+        request = " ".join(parts[3:])
+        print("正在按你的要求修订工作流…")
+        res = ctrl.wf_revise(name, request)
+        if res.get("status") == "error":
+            print(f"⚠️ {res.get('message')}")
+        else:
+            print(f"✅ 工作流「{name}」已按你的要求更新")
+        return None
+    print(_WF_PLAIN_USAGE)
+    return None
+
+
 def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, effort: str) -> None:
     """极简纯文本对话：input() 逐行输入，无 Rich / prompt_toolkit 依赖。"""
     from mincli.controller import ControllerEvent
@@ -157,6 +296,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
     ctrl.confirm = lambda title, text: input(f"{title}: {text} (y/N): ").strip().lower() in ("y", "yes")
 
     print("mincli 纯文本模式（输入 /exit 退出，/help 查看命令）")
+    pending_wf: Optional[str] = None  # /wf use 挂载到下一次输入的工作流名
     try:
         while True:
             try:
@@ -170,7 +310,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             if low in ("/exit", "/quit", "/q"):
                 break
             if low in ("/help", "/h"):
-                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文（新建摘要节点） | /tree 显示对话树 | /info 节点详情 | /import 导入文件/图片 | /files 管理图片文件")
+                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文（新建摘要节点） | /tree 显示对话树 | /info 节点详情 | /import 导入文件/图片 | /files 管理图片文件 | /wf 工作流（list/save/use/run 等）")
                 continue
             if low.startswith("/import"):
                 try:
@@ -237,6 +377,38 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                         f"Token {stats['before_tokens']} → {stats['after_tokens']}（节省 {stats['saved_tokens']}）"
                     )
                 continue
+            if low.startswith(("/wf", "/workflow")):
+                try:
+                    wparts = shlex.split(text)
+                except ValueError:
+                    print("参数解析失败（引号不匹配）")
+                    continue
+                wsub = wparts[1].lower() if len(wparts) > 1 else ""
+                wname = wparts[2] if len(wparts) > 2 else ""
+                if wsub == "use":
+                    if not wname:
+                        print("用法: /wf use <名>（/wf stop 取消）")
+                        continue
+                    if ctrl.wf_get(wname) is None:
+                        print(f"⚠️ 工作流「{wname}」不存在（/wf list 查看）")
+                        continue
+                    pending_wf = wname
+                    print(f"▶ 已挂载工作流「{wname}」：下一条消息发送即按工作流执行（/wf stop 取消）")
+                    continue
+                if wsub in ("stop", "unuse"):
+                    if pending_wf:
+                        print(f"已解除工作流「{pending_wf}」的挂载")
+                    else:
+                        print("当前没有已挂载的工作流")
+                    pending_wf = None
+                    continue
+                to_send = _plain_wf(ctrl, text)
+                if to_send is not None:
+                    try:
+                        ctrl.send_message(to_send, emit)
+                    except Exception as e:
+                        print(f"\n⚠️ {e}")
+                continue
             if low == "/tree":
                 print(ctrl.tree.render_tree(
                     ctrl.tree.current_node.id if ctrl.tree.current_node else None
@@ -245,6 +417,15 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             if text.startswith("/"):
                 print(f"未知命令: {text}")
                 continue
+            if pending_wf:
+                wf_name = pending_wf
+                pending_wf = None
+                composed = ctrl.wf_compose(wf_name, typed=text)
+                if composed is None:
+                    print(f"⚠️ 工作流「{wf_name}」不存在，已解除挂载")
+                    continue
+                text = composed
+                print(f"▶ 已按工作流「{wf_name}」执行")
             try:
                 ctrl.send_message(text, emit)
             except Exception as e:

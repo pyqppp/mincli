@@ -28,6 +28,13 @@ from mincli.config import (
     EXEC_DEFAULT_TIMEOUT,
     VISION_DEFAULT_DETAIL,
     VISION_REQUEST_MAX_BYTES,
+    WORKFLOWS_PATH,
+    WF_EXTRACT_MAX_TOKENS,
+    WF_SOURCE_MAX_CHARS,
+    WF_REASONING_MAX_CHARS,
+    WF_TOOL_ARGS_MAX_CHARS,
+    WF_TOOL_RESULT_MAX_CHARS,
+    WF_ANSWER_MAX_CHARS,
     load_models,
 )
 from mincli.helpers import (
@@ -55,6 +62,15 @@ from mincli.tools.images import (
 )
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage
+from mincli.workflows import (
+    FALLBACK_MARK,
+    Workflow,
+    WorkflowStore,
+    doc_placeholders,
+    now_iso,
+    substitute,
+    valid_name,
+)
 
 try:
     from mincli.mcp_client import McpToolClient
@@ -124,6 +140,9 @@ class ChatController:
 
     SAVE_FILE = os.path.expanduser("~/.mincli_session.json")
 
+    # 工作流持久化文件（测试子类可重写为临时路径，同 SAVE_FILE 模式）
+    WORKFLOWS_FILE = WORKFLOWS_PATH
+
     def __init__(
         self,
         client: OpenAI,
@@ -150,6 +169,8 @@ class ChatController:
         self.image_detail: str = VISION_DEFAULT_DETAIL
 
         self.tree = ConversationTree(default_system)
+
+        self._wf_store = WorkflowStore(self.WORKFLOWS_FILE)
 
         self.imported_content: Optional[str] = None
         # /import 导入的文本/网页文件元数据（{"kind": "text"|"web", "name": str}），
@@ -689,6 +710,275 @@ class ChatController:
                 except Exception:
                     pass
                 del self.temp_files[nid]
+
+    # ---------------- 工作流（/wf） ----------------
+
+    _WF_EXTRACT_INSTR = (
+        "你是操作流程提炼助手。把一段“已完成任务的完整记录”提炼成可复用的"
+        "工作流规范文档。规范用于以后每次执行同类任务时指导模型照做，因此必须"
+        "保留工作内容、执行步骤、每一步调用命令/工具的细节，同时剔除只会出现"
+        "在本次执行中的具体实例数据。"
+    )
+
+    _WF_EXTRACT_PROMPT = """请把下面的操作记录提炼成工作流规范文档，要求：
+
+1. 严格按此格式输出（只输出文档本身，禁止任何开场白或解释）：
+   目标：<一句话：这类任务要完成什么>
+   （空行）
+   变量：
+   - {{变量名}}：含义（示例：一个典型值）
+   （空行）
+   步骤：
+   1. <本步目的与动作>；若需命令，写明命令或工具与用法，如：`git log {{旧版本}}..HEAD`
+   2. …
+
+2. 步骤必须保留“命令/工具调用的细节”：工具名、关键参数/命令本身、该步要达成的
+   目的、结果如何处理，让没有上下文的人也能照做。
+
+3. 【重要】凡是每次执行都会变化的具体数据——版本号、日期、绝对路径、文件名、
+   本次的正文/数据内容、ID、URL 等——一律不得写死，改写成 {{变量名}} 并在
+   “变量”节说明含义与示例。例如不得写“v1.2.0”或“/Users/me/run.sh”，应写成
+   {{旧版本}}、{{脚本路径}}。
+
+4. 不包含思考过程、失败重试的花絮、只与本次记录相关的闲聊。
+
+5. 保留原记录语言（中文记录用中文输出）。
+
+操作记录：
+{source}"""
+
+    _WF_REVISE_INSTR = (
+        "你是工作流文档修订助手。根据用户的修改要求，把给定的工作流规范文档改写为"
+        "完整的新版本文档（输出整篇文档，不是 diff）。沿用原文档的格式与语言，"
+        "沿用其中 {{变量}} 的既有约定。"
+    )
+
+    _WF_REVISE_PROMPT = """以下是当前的工作流规范文档：
+
+{doc}
+
+用户修改要求：
+{request}
+
+请输出完整的新版规范文档（格式与原文一致：目标 / 变量 / 步骤）。"""
+
+    def wf_list(self) -> List[dict]:
+        """返回工作流摘要列表（用于 /wf list）。"""
+        out = []
+        for wf in self._wf_store.list():
+            goal, steps = (wf.goal(), len(
+                [ln for ln in wf.doc.splitlines()
+                 if re.match(r"^\s*\d+[.、]", ln)]))
+            out.append({
+                "name": wf.name,
+                "goal": goal,
+                "steps": steps,
+                "vars": wf.placeholders(),
+                "run_count": wf.run_count,
+                "updated_at": wf.updated_at,
+            })
+        return out
+
+    def wf_get(self, name: str) -> Optional[Workflow]:
+        return self._wf_store.get(name)
+
+    def _wf_build_source(self, nodes: List[ConversationNode]) -> str:
+        parts = []
+        for i, node in enumerate(nodes, start=1):
+            title = (node.title or "").strip()
+            head = f"--- 第 {i} 轮（节点 {node.id}）{('：' + title) if title else ''} ---"
+            parts.append(head)
+            user_line = node.user_msg or ""
+            if node.user_images:
+                img_marks = "；".join(
+                    image_placeholder_text(att) for att in node.user_images
+                )
+                user_line = f"{user_line}\n（附图：{img_marks}）"
+            parts.append(f"用户: {user_line}")
+            for tm in node.tool_messages:
+                role = tm.get("role")
+                if role == "assistant":
+                    for tc in tm.get("tool_calls") or []:
+                        fn = tc.get("function") or {}
+                        args = str(fn.get("arguments", ""))
+                        if len(args) > WF_TOOL_ARGS_MAX_CHARS:
+                            args = args[:WF_TOOL_ARGS_MAX_CHARS] + "…（已截断）"
+                        parts.append(f"调用工具: {fn.get('name', '?')} {args}")
+                elif role == "tool":
+                    content = str(tm.get("content", ""))
+                    if len(content) > WF_TOOL_RESULT_MAX_CHARS:
+                        content = content[:WF_TOOL_RESULT_MAX_CHARS] + "…（已截断）"
+                    parts.append(f"工具结果: {content}")
+            if node.reasoning:
+                parts.append(
+                    f"思考: {node.reasoning[:WF_REASONING_MAX_CHARS]}"
+                )
+            if node.assistant_msg:
+                ans = node.assistant_msg
+                if len(ans) > WF_ANSWER_MAX_CHARS:
+                    ans = ans[:WF_ANSWER_MAX_CHARS] + "…（已截断）"
+                parts.append(f"回答: {ans}")
+        return "\n\n".join(parts)
+
+    def _wf_call_model(self, messages: List[Dict], max_tokens: int) -> str:
+        """调用当前模型生成工作流文档（提炼/修订）；失败返回空串。"""
+        for tokens in (max_tokens, 2000):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.current_model,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=tokens,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                if content:
+                    return content
+            except Exception:
+                continue
+        return ""
+
+    def wf_save(self, name: str, start_id: Optional[str] = None,
+                force: bool = False) -> dict:
+        """把当前节点（或 start_id→当前节点的连续链）提炼为工作流并保存。
+
+        返回：
+            {"status": "exists"} —— 同名已存在且未 force（UI 确认后带 force 重试）
+            {"status": "error", "message": ...}
+            {"status": "saved", "from": "extract"|"fallback", "name": ...,
+             "nodes": N, "doc": ..., "placeholders": [...]}
+        """
+        if not valid_name(name):
+            return {"status": "error",
+                    "message": "工作流名需为 1-32 位字母/数字/_/-（如 release、git-changelog）"}
+        if self._wf_store.has(name) and not force:
+            return {"status": "exists"}
+
+        if self.tree is None or self.tree.current_node is None:
+            return {"status": "error", "message": "当前没有可提炼的对话"}
+        current = self.tree.current_node
+
+        if start_id:
+            path = self._path_to_root(current)
+            path_ids = [n.id for n in path]
+            if start_id not in path_ids:
+                return {"status": "error",
+                        "message": f"起点节点 {start_id} 不在当前节点链上（应为当前节点或其祖先）"}
+            nodes = path[path_ids.index(start_id):]
+        else:
+            nodes = [current]
+        if not any(n.user_msg or n.assistant_msg or n.tool_messages for n in nodes):
+            return {"status": "error", "message": "所选对话没有可提炼的内容"}
+
+        source = self._wf_build_source(nodes)
+        if len(source) > WF_SOURCE_MAX_CHARS:
+            half = WF_SOURCE_MAX_CHARS // 2
+            source = (
+                source[:half]
+                + f"\n\n…（原文过长，中间 {len(source) - WF_SOURCE_MAX_CHARS} 字符已省略）…\n\n"
+                + source[-half:]
+            )
+
+        messages = [
+            {"role": "system", "content": self._WF_EXTRACT_INSTR},
+            {"role": "user",
+             "content": self._WF_EXTRACT_PROMPT.format(source=source)},
+        ]
+        doc = self._wf_call_model(messages, WF_EXTRACT_MAX_TOKENS)
+        from_status = "extract"
+        if not doc:
+            doc = (
+                f"{FALLBACK_MARK}\n\n目标：未能自动提炼\n\n"
+                f"原始操作记录：\n\n{source}"
+            )
+            from_status = "fallback"
+
+        wf = Workflow(
+            name=name,
+            doc=doc,
+            source_nodes=[n.id for n in nodes],
+        )
+        if not self._wf_store.put(wf, overwrite=True):
+            return {"status": "error", "message": f"工作流「{name}」保存失败（文件不可写）"}
+        return {
+            "status": "saved",
+            "from": from_status,
+            "name": name,
+            "nodes": len(nodes),
+            "doc": doc,
+            "placeholders": doc_placeholders(doc),
+        }
+
+    def wf_delete(self, name: str) -> bool:
+        return self._wf_store.delete(name)
+
+    def wf_rename(self, old: str, new: str) -> Optional[str]:
+        """重命名；成功返回 None，失败返回错误信息。"""
+        return self._wf_store.rename(old, new)
+
+    def wf_revise(self, name: str, request: str) -> dict:
+        """按用户要求让模型修订工作流文档并保存。"""
+        wf = self._wf_store.get(name)
+        if wf is None:
+            return {"status": "error", "message": f"工作流「{name}」不存在"}
+        messages = [
+            {"role": "system", "content": self._WF_REVISE_INSTR},
+            {"role": "user",
+             "content": self._WF_REVISE_PROMPT.format(
+                 doc=wf.doc, request=request)},
+        ]
+        new_doc = self._wf_call_model(messages, WF_EXTRACT_MAX_TOKENS)
+        if not new_doc:
+            return {"status": "error",
+                    "message": "修订失败（模型未返回内容），工作流未改变"}
+        wf.doc = new_doc
+        self._wf_store.put(wf, overwrite=True)
+        return {"status": "revised", "name": name, "doc": new_doc}
+
+    def wf_export_temp(self, name: str) -> Optional[str]:
+        """把工作流文档写入临时 .md 文件（供系统编辑器打开）；不存在返回 None。"""
+        wf = self._wf_store.get(name)
+        if wf is None:
+            return None
+        from mincli.workflows import write_doc_tempfile
+
+        return write_doc_tempfile(wf.doc)
+
+    def wf_import_text(self, name: str, text: str) -> bool:
+        """编辑器改回后更新工作流文档。"""
+        wf = self._wf_store.get(name)
+        if wf is None:
+            return False
+        wf.doc = text.strip() or wf.doc
+        return self._wf_store.put(wf, overwrite=True)
+
+    def wf_compose(self, name: str, typed: str = "",
+                   values: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """为“下一次输入/立即运行”构造执行消息文本；不存在返回 None。
+
+        附带工作流规范全文（{占位符} 表示每次会变化的内容）。统计 run_count。
+        """
+        wf = self._wf_store.get(name)
+        if wf is None:
+            return None
+        doc, missing = substitute(wf.doc, values or {})
+        wf.run_count += 1
+        wf.last_run_at = now_iso()
+        self._wf_store.put(wf, overwrite=True)
+
+        extras = ""
+        if missing:
+            extras = "（未提供值的变量：" + "、".join(
+                "{" + m + "}" for m in missing) + "，请结合当前情况合理推断）"
+        head = (
+            f"请执行工作流「{wf.name}」{extras}。\n\n"
+            "下面是该工作流的完整规范，其中 {变量} 表示每次会变化的内容，"
+            "请结合本次输入与当前环境确定取值后严格按步骤执行，最后汇报结果：\n\n"
+            + doc
+        )
+        if typed and typed.strip():
+            return f"{head}\n\n本次输入：{typed}"
+        return head
 
     # ---------------- 发送消息 ----------------
 

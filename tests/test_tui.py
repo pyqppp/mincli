@@ -95,7 +95,18 @@ class FakeController(ChatController):
         tempfile.mkdtemp(prefix="mincli_tui_test_"), "session.json"
     )
 
+    # 工作流提炼/修订的固定产出（不联网）
+    WF_STUB_DOC = (
+        "目标：测试工作流\n\n"
+        "变量：\n"
+        "- {path}：目标文件（示例：a.txt）\n\n"
+        "步骤：\n"
+        "1. 读取 {path} 并总结\n"
+    )
+
     def __init__(self):
+        wf_dir = tempfile.mkdtemp(prefix="mincli_tui_wf_")
+        self.WORKFLOWS_FILE = os.path.join(wf_dir, "workflows.json")
         super().__init__(
             client=_FakeClient([]),
             default_system="sys",
@@ -104,6 +115,12 @@ class FakeController(ChatController):
         )
         self.saved = False
         self.closed = False
+
+    def _wf_call_model(self, messages, max_tokens):
+        user = str((messages[-1] or {}).get("content", ""))
+        if "用户修改要求" in user:
+            return "目标：已按修改要求更新的工作流\n\n步骤：\n1. 修订后的步骤"
+        return self.WF_STUB_DOC
 
     def send_message(self, text, emit):
         node = self.tree.create_root(text, "你好，世界！", "思考中", "测试标题", 10, 5)
@@ -542,6 +559,123 @@ async def main() -> int:
         cursor2 = getattr(tree2, "cursor_node", None)
         check("启动：树光标跟随当前节点", cursor2 is not None and cursor2.data == "main")
         await pilot2.press("ctrl+c")
+
+    # --- 10. 工作流（/wf）：保存 / 挂载 / 执行 / 列表 / 修订 / 管理 ---
+    fake3 = FakeController()
+    app3 = ChatApp(controller=fake3)
+    async with app3.run_test(size=(100, 30)) as pilot3:
+        for _ in range(5):
+            await pilot3.pause()
+        inp3 = app3.query_one("#chat-input", ChatInput)
+
+        async def type_wf_cmd(cmd: str) -> None:
+            inp3.clear()
+            await pilot3.press(*list(cmd))
+            await pilot3.press("enter")
+
+        # 先发一条消息，成为可提炼的当前节点
+        await type_wf_cmd("总结一下项目变更")
+        for _ in range(30):
+            await pilot3.pause()
+            if fake3.tree.current_node is not None:
+                break
+        check("工作流：准备当前节点成功", fake3.tree.current_node is not None
+              and fake3.tree.current_node.user_msg == "总结一下项目变更")
+
+        # /wf save（提炼被 stub）
+        await type_wf_cmd("/wf save demo")
+        for _ in range(40):
+            await pilot3.pause()
+            if fake3.wf_get("demo") is not None:
+                break
+        wf_demo = fake3.wf_get("demo")
+        check("工作流：/wf save 提炼保存", wf_demo is not None
+              and wf_demo.doc.startswith("目标：测试工作流"))
+        check("工作流：来源节点与变量", wf_demo is not None
+              and wf_demo.source_nodes == ["main"] and wf_demo.placeholders() == ["path"])
+
+        # /wf list / show
+        await type_wf_cmd("/wf list")
+        for _ in range(12):
+            await pilot3.pause()
+            if "工作流列表" in app3._chat_source():
+                break
+        check("工作流：/wf list 显示列表", "工作流列表" in app3._chat_source()
+              and "demo" in app3._chat_source())
+        await type_wf_cmd("/wf show demo")
+        for _ in range(12):
+            await pilot3.pause()
+            if "目标：测试工作流" in app3._chat_source():
+                break
+        check("工作流：/wf show 显示规范", "目标：测试工作流" in app3._chat_source())
+
+        # /wf use：状态条中段提示 → 下一条消息按工作流合成执行 → 一次性解除
+        await type_wf_cmd("/wf use demo")
+        for _ in range(8):
+            await pilot3.pause()
+        center3 = app3.query_one("#usage-center", Static)
+        check("工作流：挂载提示显示于状态条中段",
+              center3.has_class("visible") and "工作流已挂载：demo" in str(center3.content))
+        await type_wf_cmd("请针对 notes/a.txt 执行")
+        for _ in range(30):
+            await pilot3.pause()
+            cur = fake3.tree.current_node
+            if cur is not None and "请执行工作流「demo」" in cur.user_msg:
+                break
+        cur3 = fake3.tree.current_node
+        check("工作流：下一条消息按工作流合成执行",
+              cur3 is not None and "请执行工作流「demo」" in cur3.user_msg
+              and "本次输入：请针对 notes/a.txt 执行" in cur3.user_msg)
+        check("工作流：挂载一次性解除", app3._pending_wf is None
+              and not center3.has_class("visible"))
+
+        # /wf run：无需再输入，立即执行（位置参数按变量顺序填充）
+        await type_wf_cmd("/wf run demo notes/b.txt")
+        for _ in range(30):
+            await pilot3.pause()
+            cur = fake3.tree.current_node
+            if cur is not None and "请执行工作流「demo」" in cur.user_msg:
+                break
+        cur3b = fake3.tree.current_node
+        check("工作流：/wf run 立即执行", cur3b is not None
+              and "请执行工作流「demo」" in cur3b.user_msg
+              and "notes/b.txt" in cur3b.user_msg and "本次输入：" not in cur3b.user_msg)
+
+        # /wf edit 带修改要求 → 模型修订并落盘
+        await type_wf_cmd("/wf edit demo 增加一条校验步骤")
+        for _ in range(30):
+            await pilot3.pause()
+            wf = fake3.wf_get("demo")
+            if wf is not None and wf.doc.startswith("目标：已按修改要求更新的工作流"):
+                break
+        check("工作流：/wf edit 修订保存",
+              fake3.wf_get("demo").doc.startswith("目标：已按修改要求更新的工作流"))
+
+        # /wf rename / delete（确认弹窗）
+        await type_wf_cmd("/wf rename demo demo2")
+        for _ in range(8):
+            await pilot3.pause()
+        check("工作流：/wf rename 生效", fake3.wf_get("demo") is None
+              and fake3.wf_get("demo2") is not None)
+        await type_wf_cmd("/wf delete demo2")
+        for _ in range(20):
+            await pilot3.pause()
+            if app3.screen.query("#confirm-yes"):
+                break
+        check("工作流：删除需确认", bool(app3.screen.query("#confirm-yes")))
+        app3.screen.query_one("#confirm-yes", Button).press()
+        for _ in range(10):
+            await pilot3.pause()
+        check("工作流：确认后已删除", fake3.wf_get("demo2") is None)
+
+        # 错误路径不崩溃
+        await type_wf_cmd("/wf run 不存在的工作流")
+        for _ in range(5):
+            await pilot3.pause()
+        check("工作流：运行不存在的工作流给出警告且不崩溃", app3.screen is not None
+              and fake3.tree.current_node is not None)
+
+        await pilot3.press("ctrl+c")
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

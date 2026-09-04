@@ -94,6 +94,19 @@ MCP_CONFIG_PATH = os.path.expanduser(
     os.getenv("MINCLI_MCP_CONFIG", "~/.mincli/mcp_servers.json")
 )
 
+# 工作流持久化文件（/wf 系列命令；与会话分开长期保存）
+WORKFLOWS_PATH = os.path.expanduser(
+    os.getenv("MINCLI_WORKFLOWS_PATH", "~/.mincli/workflows.json")
+)
+
+# ---------------- 工作流（/wf）提炼 ----------------
+WF_EXTRACT_MAX_TOKENS = 4000      # 提炼输出上限（失败回退 2000）
+WF_SOURCE_MAX_CHARS = 60_000      # 送入提炼模型的原文上限（超长截头尾保中间）
+WF_REASONING_MAX_CHARS = 400      # 每节点思考计入提炼源的长度上限
+WF_TOOL_ARGS_MAX_CHARS = 800      # 每个工具调用参数计入提炼源的长度上限
+WF_TOOL_RESULT_MAX_CHARS = 400    # 每个工具结果计入提炼源的长度上限
+WF_ANSWER_MAX_CHARS = 1200        # 每节点最终回答计入提炼源的长度上限
+
 # 系统提示词独立存放在文件中，每次启动自动导入：
 # 1. MINCLI_SYSTEM_PROMPT_PATH 环境变量指定的文件（优先级最高）
 # 2. ~/.mincli/system_prompt.md（用户自定义，覆盖默认提示词）

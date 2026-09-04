@@ -18,6 +18,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - 🌲 **Tree Conversations** — main line + branch nodes with globally unique IDs; click nodes to switch, jump with `/<id>`
 - 🧠 **Thinking Mode** — full V4 reasoning chain display, toggleable on the fly
 - 🔧 **Tool Calling** — AI autonomously invokes tools: read/write/edit files, fetch web pages, list directories, execute commands (user-confirmed)
+- 🔁 **Workflows (`/wf`)** — save one finished task (or a whole run of turns) as a reusable workflow that lives on disk; `/wf use` attaches it to your next message, `/wf run` executes it right away — no need to re-describe repetitive work
 - ⌨️ **Command Completion** — type `/` to list commands; letters filter candidates; `Tab` cycles / completes; a completed command shows its usage help
 - 🛡️ **Confirm Dialogs** — destructive actions (`/delete`, `/mcp remove`) ask for confirmation; `←`/`→` switches buttons and the default is *Cancel*
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
@@ -169,6 +170,13 @@ CLI flags:
 |---------|-------------|
 | `/exit`, `/quit` | Exit (session auto-saved) |
 | `/clear`, `/c` | Clear session |
+| `/wf list` | List saved workflows |
+| `/wf show <name>` | Show a workflow's full spec (goal / variables / steps & command details) |
+| `/wf save <name> [start-node-id]` | Distill the **current node** (or the run from `start-node` to the current node) into a reusable workflow; overwriting an existing name asks for confirmation |
+| `/wf use <name>` | Attach the workflow to your **next message** — the next non-command send runs it (one-shot; `/wf stop` cancels) |
+| `/wf run <name> [key=value...]` | Execute a workflow **immediately** without typing (unset `{variables}` are inferred by the model from context) |
+| `/wf edit <name> [change request]` | With a request: model revises the spec. Without (macOS): open the spec in a system editor and auto-import on save |
+| `/wf rename <old> <new>` / `/wf delete <name>` | Rename / delete a workflow (delete is confirmed) |
 | `/set system <text>` | Change system prompt |
 | `/set temp <value>` | Change temperature |
 | `/set model <flash\|pro>` | Switch model |
@@ -251,6 +259,43 @@ In chat you can also add a remote server directly with `/mcp add <name> <URL>`.
 
 ---
 
+## Workflows (`/wf`)
+
+For repetitive jobs (weekly changelog, periodic repo inspection, a fixed release flow…), save **one finished run** as a workflow instead of describing it from scratch every time:
+
+```
+/wf save changelog            # distill the current node (incl. the AI's tool/command steps)
+/wf save release a1           # distill the whole run from node a1 → current node
+```
+
+Saving invokes the current model to turn the transcript into a spec doc: **goal, steps, and the exact commands/tools used**, with anything that varies per run (versions, dates, paths, per-run content) rewritten as `{variables}` with explanations (e.g. `git log {old}..HEAD`). If distillation fails, the raw transcript is saved instead and you can fix it with `/wf edit`.
+
+```
+/wf use changelog             # attach to the next input (hint shown in the status bar)
+# next message: run it, then the workflow is auto-detached
+
+/wf run release old=v1.0 new=v2.0   # execute immediately, no typing needed
+/wf run release v1.0 v2.0           # positional values fill variables in order
+/wf stop                            # cancel an attached workflow
+```
+
+Workflow runs go through the exact same pipeline as a normal send (streaming, tool audit and user confirmation still apply). Provided values substitute the placeholders; unset ones are inferred by the model from the message and current context.
+
+```
+/wf list                    # list workflows (goal / steps / vars / run count)
+/wf show changelog          # print the full spec
+/wf edit changelog add a verification step   # model revises the spec
+/wf rename changelog cl     # rename
+/wf delete changelog        # delete (confirmed)
+```
+
+- Workflows are stored apart from the session in `~/.mincli/workflows.json` (override with `MINCLI_WORKFLOWS_PATH`).
+- On macOS, `/wf edit <name>` without a request opens the spec in a system editor and auto-imports it on save; other platforms use the model-revision form.
+- Re-running `/wf save <name>` overwrites (with confirmation) — redo the task first, then re-save to update a workflow.
+- `--no-tui` text mode supports `/wf list/show/save/use/run/delete/rename/edit` (edit = model revision only).
+
+---
+
 ## Project Structure
 
 ```
@@ -269,6 +314,7 @@ In chat you can also add a remote server directly with `/mcp add <name> <URL>`.
 │   ├── system_prompt.md     # Default system prompt (auto-loaded on startup)
 │   ├── controller.py        # ChatController (logic + event stream)
 │   ├── models.py            # ConversationNode/Tree
+│   ├── workflows.py         # Workflow (/wf) data model + persistent store
 │   ├── helpers.py           # Utilities (tokens, title gen, formulas)
 │   ├── streaming.py         # Streaming API interaction
 │   ├── mcp_client.py        # MCP client (async bridge + bundled/third-party)
