@@ -147,7 +147,7 @@ async def main() -> int:
     test_tool_args_width()
     fake = FakeController()
     app = ChatApp(controller=fake)
-    async with app.run_test(size=(100, 30), tooltips=True) as pilot:
+    async with app.run_test(size=(100, 30)) as pilot:
         # --- 1. 布局 ---
         check("布局：输入框存在且聚焦", app.query_one("#chat-input", ChatInput) is not None)
         check("布局：消息流存在", bool(app.query_one("#chat-log", VerticalScroll)))
@@ -329,24 +329,19 @@ async def main() -> int:
             await pilot.pause()
         check("命令：/import 多文件", len(fake.pending_images) == 1 and len(fake.imported_files) == 1)
         check("状态条中段数量与前2文件名", "已导入 2 个文件" in str(hint.content) and "note.txt" in str(hint.content))
-        # 悬停 Tooltip（完整文件名列表）；移出中段自动消失
-        from textual.widgets import Tooltip
-        tooltip = app.screen.query_one(Tooltip)
+        # 悬停弹窗（固定显示在状态条上方，完整文件名列表）；移出中段自动消失
+        popup = app.query_one("#import-popup", Static)
         sr = hint.region
-        app.post_message(events.MouseMove(None, sr.x + 1, sr.y, 0, 0, 0, False, False, False,
+        app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
                                           screen_x=sr.x + 1, screen_y=sr.y))
-        for _ in range(80):
+        for _ in range(5):
             await pilot.pause()
-            if tooltip.display and "note.txt" in str(tooltip.content):
-                break
-        check("悬停显示完整列表", tooltip.display and "note.txt" in str(tooltip.content))
-        app.post_message(events.MouseMove(None, 8, 8, 0, 0, 0, False, False, False,
-                                          screen_x=8, screen_y=8))
-        for _ in range(80):
+        check("悬停显示完整列表", popup.has_class("visible") and "note.txt" in str(popup.content))
+        app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
+                                          screen_x=sr.x + 1, screen_y=max(0, sr.y - 5)))
+        for _ in range(5):
             await pilot.pause()
-            if not tooltip.display:
-                break
-        check("移开鼠标自动消失", not tooltip.display)
+        check("移开鼠标自动消失", not popup.has_class("visible"))
 
         await type_command("/import clear")
         for _ in range(10):

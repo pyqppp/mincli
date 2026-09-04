@@ -215,9 +215,6 @@ class ChatApp(App):
 
     CSS_PATH = "chat.tcss"
 
-    # 悬停预览的 Tooltip 延迟：0.1s 近乎即时（Textual 默认 0.5s 偏慢）
-    TOOLTIP_DELAY = 0.1
-
     BINDINGS = [
         # Ctrl+C 在所有平台统一：有选中文字时先复制（Textual 屏幕级绑定
         # 优先，ChatInput/输入框选区、聊天区选区均可复制），无选中时退出
@@ -293,7 +290,9 @@ class ChatApp(App):
         yield ChatInput(
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
-        # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停 Tooltip 显示完整列表），右=下次输入估算
+        # 悬停弹窗放独立布局层（见 chat.tcss #import-popup），固定显示在状态条上方
+        yield Static("", id="import-popup")
+        # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停显示完整列表），右=下次输入估算
         with Horizontal(id="usage-bar"):
             yield Static("", id="usage-left")
             yield Static("", id="usage-center")
@@ -318,8 +317,9 @@ class ChatApp(App):
             )
         self.ctrl.confirm = self._confirm
         self.query_one("#tree", Tree).auto_expand = False  # 点击节点名只切换节点，不收起/展开
-        # 状态条中段的导入提示（缓存引用）；悬停查看完整列表走 Textual Tooltip（悬浮层，不占布局）
+        # 状态条中段导入提示 + 其上方的悬停弹窗（缓存引用，on_mouse_move 高频使用）
         self._import_center_w = self.query_one("#usage-center", Static)
+        self._import_popup_w = self.query_one("#import-popup", Static)
         self._rebuild_tree()
         self.query_one("#chat-input", ChatInput).focus()
         if self.ctrl.session_loaded:
@@ -405,8 +405,7 @@ class ChatApp(App):
         else:
             hint.update("")
             hint.remove_class("visible")
-        # 悬停 Tooltip = 完整文件列表；无导入时置 None 不显示
-        hint.tooltip = self._import_tooltip_text()
+            self._import_popup_w.remove_class("visible")
 
     def _pending_images_md(self) -> str:
         """待发送图片在聊天区里的 Markdown 占位行（提交回显用）。"""
@@ -417,20 +416,19 @@ class ChatApp(App):
         )
         return f"\n\n{marks}"
 
-    # ---------------- 状态条中段悬停提示（Textual Tooltip 显示完整文件列表） ----------------
-    # 用 Tooltip（屏幕悬浮层）替代自定义绝对定位弹窗：不参与布局，避免悬停时
-    # 把聊天区/输入框/状态条整体顶起。状态条位于屏幕最底部，Tooltip 的
-    # constrain: inside inflect 会自动翻转显示在状态条上方。
+    # ---------------- 状态条上方固定悬停弹窗（完整文件名列表） ----------------
+    # 弹窗位于独立布局层（CSS layer），显隐不影响主内容布局；显示位置固定贴住
+    # 状态条上方（不跟随光标），设定最小宽度保证可读性。
 
     _IMPORT_KIND_LABELS = {"image": "图片", "text": "文本", "web": "网页"}
 
-    def _import_tooltip_text(self) -> str | None:
-        """完整导入文件列表文本（悬停显示）；无导入返回 None。"""
+    def _show_import_popup(self) -> None:
+        """在状态条上方固定位置显示完整文件名列表弹窗（悬停中段时）。"""
         if self.ctrl is None:
-            return None
+            return
         items = self.ctrl.import_file_list()
         if not items:
-            return None
+            return
         lines = []
         for item in items:
             name = item.get("name", "")
@@ -438,7 +436,34 @@ class ChatApp(App):
                 name = name[:97] + "…"
             label = self._IMPORT_KIND_LABELS.get(item.get("kind", ""))
             lines.append(f"[{label}] {name}" if label else f"· {name}")
-        return "\n".join(lines)
+        popup = self._import_popup_w
+        popup.update("\n".join(lines))
+        bar = self.query_one("#usage-bar", Horizontal).region
+        if bar.width <= 0 or bar.height <= 0:
+            return
+        # 绝对定位（offset 相对屏幕左上角）：弹窗左缘与状态条对齐、紧贴其上方。
+        # 高度按内容行数估算（内容 + 圆角边框 1 行，封顶屏幕 40%）。
+        max_h = int(self.screen.size.height * 0.4)
+        h = min(len(lines), max_h) + 1
+        top = max(0, bar.y - h - 1)
+        popup.styles.position = "absolute"
+        popup.styles.offset = (bar.x, top)
+        popup.add_class("visible")
+
+    def on_mouse_move(self, event) -> None:
+        """鼠标在状态条中段（导入提示）上悬停 → 显示完整文件列表；移出 → 自动消失。"""
+        center = getattr(self, "_import_center_w", None)
+        if center is None or event.screen_x is None or event.screen_y is None:
+            return
+        region = center.region
+        if region.width <= 0 or region.height <= 0:
+            return
+        if region.contains(int(event.screen_x), int(event.screen_y)):
+            if not self._import_popup_w.has_class("visible"):
+                self._show_import_popup()
+        else:
+            if self._import_popup_w.has_class("visible"):
+                self._import_popup_w.remove_class("visible")
 
     # ---------------- 拖入文件直接导入（终端路径粘贴） ----------------
 
