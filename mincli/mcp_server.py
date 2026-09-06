@@ -1,3 +1,10 @@
+"""mincli 内置 MCP server（由 mincli 主进程通过 stdio 启动）。
+
+安全模型：AI 安全审核、高危命令硬门与用户确认全部由 mincli 主进程（客户端）
+执行，本 server 只是纯执行器，不独立提供任何审核/确认/高危命令防护。
+请勿将本 server 暴露给其他 MCP 客户端（如 Claude Desktop、Cursor 等）直接连接。
+"""
+
 import asyncio
 from typing import Dict, Optional
 
@@ -47,7 +54,7 @@ async def list_directory(directory: str, show_hidden: bool = False) -> str:
 
 @mcp.tool()
 async def write_file(filepath: str, content: str) -> str:
-    """将内容写入文件。如果文件不存在则创建新文件，存在则覆盖原内容。写入前会请求用户确认
+    """将内容写入文件。如果文件不存在则创建新文件，存在则覆盖原内容。用户确认由 mincli 主进程（本 server 的启动方）在执行前完成
 
     Args:
         filepath: 文件路径，支持绝对路径和 ~ 开头的路径
@@ -58,7 +65,7 @@ async def write_file(filepath: str, content: str) -> str:
 
 @mcp.tool()
 async def edit_file(filepath: str, old_string: str, new_string: str) -> str:
-    """在文件中搜索 old_string 并替换为 new_string（仅替换第一个匹配项）。old_string 必须与文件内容精确匹配（包括空格和换行）。操作前会请求用户确认
+    """在文件中搜索 old_string 并替换为 new_string（仅替换第一个匹配项）。old_string 必须与文件内容精确匹配（包括空格和换行）。用户确认由 mincli 主进程（本 server 的启动方）在执行前完成
 
     Args:
         filepath: 文件路径，支持绝对路径和 ~ 开头的路径
@@ -77,7 +84,7 @@ async def execute_command(
     shell: str = "sh",
     max_output: int = EXEC_DEFAULT_MAX_OUTPUT,
 ) -> str:
-    """在用户电脑上执行 shell 命令。每个命令在执行前会经过 AI 安全审核和用户确认；命中高危模式的命令（如 rm -rf /、dd 写磁盘、curl|bash 等）无论审核结果如何都会强制要求用户确认。命令以非交互方式运行（stdin 已关闭），交互式命令（vim、ssh、python REPL 等）会因无输入而立即结束。默认工作目录为 mincli 启动目录（可用 /set workspace 修改，也可用 cwd 参数临时指定）。若预计输出很长，请在命令中限制输出（如追加 | head、>/dev/null）以节省 token
+    """在用户电脑上执行 shell 命令。AI 安全审核、高危命令强制确认与用户确认均由 mincli 主进程（本 server 的启动方）在执行前完成，本 server 不独立提供安全防护。命令以非交互方式运行（stdin 已关闭），交互式命令（vim、ssh、python REPL 等）会因无输入而立即结束。默认工作目录为 mincli 启动目录（可用 /set workspace 修改，也可用 cwd 参数临时指定）。若预计输出很长，请在命令中限制输出（如追加 | head、>/dev/null）以节省 token
 
     Args:
         command: 要执行的 shell 命令（可用 && 串联多条）
