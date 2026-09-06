@@ -1055,6 +1055,7 @@ class ChatController:
         accumulated_cache_hit = 0
         accumulated_cache_miss = 0
         tool_messages: List[Dict] = []
+        file_degraded = False  # file_id 失效降级重试标志（只重试一次）
 
         def _restore_pending() -> None:
             """发送失败时把本轮图片放回待发送队列（下次发送自动重试上传）。"""
@@ -1075,6 +1076,24 @@ class ChatController:
                     on_chunk=lambda c, r: emit(ControllerEvent.stream(c, r)),
                 )
                 if sr.error:
+                    # file_id 失效兜底：消息含 file 块且尚未降级过时，清掉 file_id 用 base64 重试一次
+                    if not file_degraded and self._messages_contain_file_blocks(messages):
+                        file_degraded = True
+                        emit(ControllerEvent.status(
+                            "⚠️ 图片 file_id 似乎已失效，正在降级为 base64 内联重试…"
+                        ))
+                        self._invalidate_file_ids_in_chain(node)
+                        messages = self.tree.get_messages_for_node(node)
+                        # 降级后重新预检 base64 总量
+                        inline_bytes = collect_inline_bytes(messages)
+                        if inline_bytes > VISION_REQUEST_MAX_BYTES:
+                            _restore_pending()
+                            emit(ControllerEvent.error(
+                                "降级后图片 base64 总量超限，无法发送"
+                            ))
+                            self._discard_node(node)
+                            return None
+                        continue
                     _restore_pending()
                     emit(ControllerEvent.error(sr.error))
                     self._discard_node(node)
@@ -1208,6 +1227,33 @@ class ChatController:
             if changed:
                 n.cached_messages = None
 
+    def _invalidate_file_ids_in_chain(self, node: ConversationNode) -> None:
+        """将当前节点链上所有图片的 file_id 置为 None（降级为 base64），并失效消息缓存。
+
+        用于 Files API file_id 失效（过期/被删/API 端异常）时的自动回退。
+        只要清掉了任何 file_id，就失效链上所有节点缓存——子节点缓存包含父节点消息。
+        """
+        any_changed = False
+        for n in self._path_to_root(node):
+            for att in n.user_images:
+                if att.file_id:
+                    att.file_id = None
+                    any_changed = True
+        if any_changed:
+            for n in self._path_to_root(node):
+                n.cached_messages = None
+
+    @staticmethod
+    def _messages_contain_file_blocks(messages: List[Dict]) -> bool:
+        """消息列表中是否存在 Files API file 块（type=file）。"""
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "file":
+                        return True
+        return False
+
     @staticmethod
     def _messages_contain_images(messages: List[Dict]) -> bool:
         """消息列表中是否存在图片内容块（image_url / file）。"""
@@ -1257,8 +1303,19 @@ class ChatController:
         return list_files(self.client)
 
     def files_delete(self, file_id: str) -> bool:
-        """删除一个已上传的图片文件（/files delete）。"""
+        """删除一个已上传的图片文件（/files delete），并同步清除对话树中的失效引用。"""
         delete_file(self.client, file_id)
+        # 同步：把所有节点中引用该 file_id 的图片标记为失效，下次发送自动回退 base64
+        any_changed = False
+        for n in self.tree.nodes.values():
+            for att in n.user_images:
+                if att.file_id == file_id:
+                    att.file_id = None
+                    any_changed = True
+        # 子节点缓存包含父节点消息，任一节点引用失效则全树缓存失效
+        if any_changed:
+            for n in self.tree.nodes.values():
+                n.cached_messages = None
         return True
 
     def delete_node(self, node_id: str) -> bool:
