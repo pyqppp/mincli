@@ -1073,7 +1073,7 @@ class ChatApp(App):
     async def _cmd_set(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         ctrl = self.ctrl
-        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|vision|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show"
+        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|vision|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set file_confirm <on|off> | /set show"
         if len(parts) < 2:
             self.notify(usage, severity="warning")
             return
@@ -1134,6 +1134,16 @@ class ChatApp(App):
                 self.notify(f"图片 detail 已设置为: {ctrl.image_detail}")
             else:
                 self.notify("用法: /set detail <low|auto|high|original>", severity="warning")
+        elif sub == "file_confirm" and len(parts) == 3:
+            arg = parts[2].lower()
+            if arg in ("on", "1", "true"):
+                ctrl.set_file_confirm(True)
+                self.notify("写文件/编辑文件确认已开启")
+            elif arg in ("off", "0", "false"):
+                ctrl.set_file_confirm(False)
+                self.notify("写文件/编辑文件确认已关闭（AI 可直接写入/修改文件）", severity="warning")
+            else:
+                self.notify("用法: /set file_confirm <on|off>", severity="warning")
         elif sub == "show":
             ctrl = self.ctrl
             lines = [
@@ -1144,6 +1154,7 @@ class ChatApp(App):
                 f"- **模型**: {ctrl.current_model}",
                 f"- **思考模式**: {'开' if ctrl.thinking_enabled else '关'} | 推理强度: {ctrl.reasoning_effort}",
                 f"- **审核层级**: {ctrl.audit_level} - {AUDIT_LABELS[ctrl.audit_level]}",
+                f"- **文件写入确认**: {'开' if ctrl.file_confirm else '关（AI 可直接写入/修改文件）'}",
                 f"- **命令工作目录**: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}",
                 f"- **图片 detail**: {ctrl.image_detail}",
             ]

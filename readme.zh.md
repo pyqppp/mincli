@@ -184,6 +184,7 @@ mincli chat --help
 | `/set thinking <on\|off>` | 开关思考模式 |
 | `/set effort <low\|high\|max>` | 推理强度 |
 | `/set audit <1-4>` | 命令审核层级（1=AI审核+确认 / 2=低风险自动 / 3=文本匹配 / 4=无审核） |
+| `/set file_confirm <on\|off>` | 写文件/编辑文件时是否弹窗确认（默认 on；off 时 AI 可直接写入/修改文件） |
 | `/set workspace <路径>` | 命令执行默认工作目录（默认 mincli 启动目录） |
 | `/set detail <low\|auto\|high\|original>` | 图片清晰度（low 缩放 512² 更省 token；auto≈original 保留原图最清晰） |
 | `/set show` | 显示当前配置 |
@@ -287,7 +288,7 @@ AI 在对话中视需要自主调用以下工具：
 
 mincli 的工具执行基于标准 [MCP 协议](https://modelcontextprotocol.io/)（Model Context Protocol）：
 
-- **自建 MCP server**：6 个外部工具（文件读写、网页抓取、命令执行）由 mincli 启动的子进程 server 提供，client 通过 stdio 调用。安全/交互策略（用户确认、AI 审核）仍留在客户端，行为与之前一致。
+- **自建 MCP server**：6 个外部工具（文件读写、网页抓取、命令执行）由 mincli 启动的子进程 server 提供，client 通过 stdio 调用。安全/交互策略（用户确认、AI 审核）仍留在客户端，行为与之前一致。**该内置 server 仅应由 mincli 主进程启动使用，请勿将其暴露给其他 MCP 客户端（如 Claude Desktop、Cursor 等）直接连接**——它不独立实现审核/确认/高危命令防护，安全策略完全依赖 mincli 主进程。
 - **对话树工具**（`query_conversation_tree` / `read_conversation_nodes`）依赖内存中的对话状态，保留在进程内直接分发。
 
 ### 接入第三方 MCP server

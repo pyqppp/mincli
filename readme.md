@@ -182,6 +182,7 @@ CLI flags:
 | `/set model <flash\|pro>` | Switch model |
 | `/set thinking <on\|off>` | Toggle thinking |
 | `/set effort <low\|high\|max>` | Set reasoning effort |
+| `/set file_confirm <on\|off>` | Confirm before writing/editing files (default on; off lets AI write/modify files directly) |
 | `/set show` | Show current config |
 | `/mcp list` | Show MCP server config & connection status |
 | `/mcp add <name> <command> [args...]` | Add a third-party MCP server (local command); a `http(s)://` second arg adds it as a remote server |
@@ -223,7 +224,7 @@ AI autonomously invokes these tools as needed:
 
 mincli's tool execution is built on the standard [MCP protocol](https://modelcontextprotocol.io/):
 
-- **Bundled MCP server**: the 6 external tools (file ops, web fetch, command execution) are provided by a subprocess server that mincli launches and talks to over stdio. Safety/interaction policies (user confirmation, AI audit) stay client-side, so behavior is unchanged.
+- **Bundled MCP server**: the 6 external tools (file ops, web fetch, command execution) are provided by a subprocess server that mincli launches and talks to over stdio. Safety/interaction policies (user confirmation, AI audit) stay client-side, so behavior is unchanged. **This bundled server is meant to be launched by mincli only — do not expose it to other MCP clients (e.g. Claude Desktop, Cursor)**: it does not implement its own audit/confirmation/high-risk command protection and relies entirely on mincli's client-side policies.
 - **Conversation tree tools** (`query_conversation_tree` / `read_conversation_nodes`) depend on in-memory session state and stay in-process.
 
 ### Add third-party MCP servers

@@ -160,6 +160,8 @@ class ChatController:
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
         self.audit_level: int = 1
+        # 写文件/编辑文件时是否弹窗确认（/set file_confirm 控制；默认开启）
+        self.file_confirm: bool = True
         # 命令执行默认工作目录（/set workspace 设置；None 时用 mincli 启动目录）
         self.workspace: Optional[str] = None
 
@@ -234,6 +236,7 @@ class ChatController:
                 "thinking_enabled": self.thinking_enabled,
                 "reasoning_effort": self.reasoning_effort,
                 "audit_level": self.audit_level,
+                "file_confirm": self.file_confirm,
                 "workspace": self.workspace,
                 "tree": self.tree.to_dict(),
                 "imported_content": self.imported_content,
@@ -265,6 +268,7 @@ class ChatController:
         self.thinking_enabled = data.get("thinking_enabled", False)
         self.reasoning_effort = data.get("reasoning_effort", "high")
         self.audit_level = data.get("audit_level", 1)
+        self.file_confirm = data.get("file_confirm", True)
         self.workspace = data.get("workspace") or None
 
         tree_data = data.get("tree")
@@ -333,6 +337,10 @@ class ChatController:
             self.audit_level = level
             return True
         return False
+
+    def set_file_confirm(self, enabled: bool) -> None:
+        """设置写文件/编辑文件时是否弹窗确认。"""
+        self.file_confirm = bool(enabled)
 
     def set_workspace(self, path: str) -> bool:
         """设置命令执行默认工作目录（不存在则创建）。"""
@@ -1452,7 +1460,7 @@ class ChatController:
             preview_lines = content.split("\n")[:5]
             preview = "\n".join(preview_lines) + f"\n…（共 {line_count} 行）"
         details = f"路径: {filepath}\n操作: {mode}\n内容: {line_count} 行, {len(content)} 字符\n预览:\n{preview}"
-        if not self.confirm(f"即将{'覆盖' if exists else '写入'}文件", details):
+        if self.file_confirm and not self.confirm(f"即将{'覆盖' if exists else '写入'}文件", details):
             return "用户已取消操作"
         if self._mcp is not None and "write_file" in self._mcp_tool_names:
             return self._mcp.call("write_file", {"filepath": filepath, "content": content})
@@ -1475,7 +1483,7 @@ class ChatController:
         details += "  替换为:\n"
         for line in new_string.split("\n"):
             details += f"  + {line}\n"
-        if not self.confirm("即将修改文件", details):
+        if self.file_confirm and not self.confirm("即将修改文件", details):
             return "用户已取消操作"
         if self._mcp is not None and "edit_file" in self._mcp_tool_names:
             return self._mcp.call(

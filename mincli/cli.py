@@ -377,6 +377,29 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                         f"Token {stats['before_tokens']} → {stats['after_tokens']}（节省 {stats['saved_tokens']}）"
                     )
                 continue
+            if low.startswith("/set"):
+                parts = text.split(maxsplit=2)
+                sub = parts[1].lower() if len(parts) > 1 else ""
+                if sub == "file_confirm" and len(parts) == 3:
+                    arg = parts[2].lower()
+                    if arg in ("on", "1", "true"):
+                        ctrl.set_file_confirm(True)
+                        print("✅ 写文件/编辑文件确认已开启")
+                    elif arg in ("off", "0", "false"):
+                        ctrl.set_file_confirm(False)
+                        print("⚠️ 写文件/编辑文件确认已关闭（AI 可直接写入/修改文件）")
+                    else:
+                        print("用法: /set file_confirm <on|off>")
+                elif sub == "show":
+                    print(
+                        f"模型: {ctrl.current_model} | 温度: {ctrl.current_temperature} | "
+                        f"思考: {'开' if ctrl.thinking_enabled else '关'} | "
+                        f"审核: {ctrl.audit_level} | "
+                        f"文件确认: {'开' if ctrl.file_confirm else '关'}"
+                    )
+                else:
+                    print("用法: /set file_confirm <on|off> | /set show")
+                continue
             if low.startswith(("/wf", "/workflow")):
                 try:
                     wparts = shlex.split(text)
