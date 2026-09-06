@@ -604,13 +604,11 @@ class ChatController:
         """输入栏状态条数据（纯本地计算，不联网）。
 
         缓存命中率取当前节点累计的 usage.prompt_cache_hit/miss_tokens。
-        「下一次输入」token 量采用与相邻数据直接对应的口径：
-        - 普通节点：= 本节点 input_tokens + output_tokens（API 真实口径，
-          即「上次完整输入 + 本节点输出」，随对话推进持续更新，不会卡住）；
-        - 摘要节点（/compact 新建、本身无 API 用量）：= 实际发送的摘要
-          上下文估算（estimate_tokens），与 /compact 报告 after_tokens 一致；
-        用户新输入内容量小，忽略不计。预计价格按 DeepSeek 峰谷分时定价
-        × 缓存命中率折算。
+        「下一次输入」token 量统一基于当前节点的完整消息链实时估算
+        （estimate_tokens）。这样在树状对话中切换分支、或压缩摘要后，
+        估算值始终反映当前真实上下文，不会停留在旧分支的 API usage
+        代理值上。用户新输入内容量小，忽略不计。
+        预计价格按 DeepSeek 峰谷分时定价 × 缓存命中率折算。
         """
         stats: dict = {
             "cache_hit_rate": None,
@@ -627,15 +625,10 @@ class ChatController:
         total = hit + miss
         if total > 0:
             stats["cache_hit_rate"] = hit / total
-        comp = self.tree.compaction
-        if comp and comp.get("boundary_id") and node.id == comp["boundary_id"]:
-            # 摘要节点本身：按实际发送的摘要上下文实时估算（不随时间冻结）
-            try:
-                next_in = estimate_tokens(self.tree.get_messages_for_node(node))
-            except Exception:
-                next_in = 0
-        else:
-            next_in = node.input_tokens + node.output_tokens
+        try:
+            next_in = estimate_tokens(self.tree.get_messages_for_node(node))
+        except Exception:
+            next_in = 0
         stats["next_input_tokens"] = next_in
         stats["estimated_price"] = estimate_input_price(
             self.current_model, next_in, stats["cache_hit_rate"], stats["peak"]

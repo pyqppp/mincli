@@ -342,16 +342,17 @@ def test_compact():
     for i in range(1, 6):
         collect(ctrl, f"问题{i}")
 
-    # 压缩——压缩前状态条应等于「上次输入+输出」（API 口径）
+    # 压缩——压缩前状态条应基于当前节点完整消息链实时估算
     before_node = ctrl.tree.current_node
     before_us = ctrl.usage_stats()
+    from mincli.helpers import estimate_tokens
     events = []
     stats = ctrl.compact_history(emit=events.append)
     check("压缩返回统计", stats is not None)
     check(
-        "压缩前状态条=上次输入+输出",
+        "压缩前状态条=实时消息链估算",
         before_us["next_input_tokens"]
-        == before_node.input_tokens + before_node.output_tokens,
+        == estimate_tokens(ctrl.tree.get_messages_for_node(before_node)),
     )
     # 压缩后：状态条「下次输入」= 摘要节点实际发送的估算（= 压缩报告 after）
     after_us = ctrl.usage_stats()
@@ -591,11 +592,11 @@ def test_usage_stats():
 
     stats = ctrl.usage_stats()
     check("缓存命中率=90%", stats["cache_hit_rate"] is not None and abs(stats["cache_hit_rate"] - 0.9) < 1e-9)
-    # 未压缩时：下次输入 = 上次完整输入 + 本节点输出（API 口径，与 done 显示对应）
-    from mincli.helpers import estimate_input_price, is_peak_hour
+    # 下次输入 = 当前节点完整消息链的实时估算（树状对话/压缩后口径一致）
+    from mincli.helpers import estimate_input_price, is_peak_hour, estimate_tokens
     node = ctrl.tree.current_node
-    expect_next = node.input_tokens + node.output_tokens
-    check("下次输入=上次输入+本节点输出", stats["next_input_tokens"] == expect_next)
+    expect_next = estimate_tokens(ctrl.tree.get_messages_for_node(node))
+    check("下次输入=当前消息链实时估算", stats["next_input_tokens"] == expect_next)
     check("预计价格非空", stats["estimated_price"] is not None and stats["estimated_price"] > 0)
     expect = estimate_input_price(ctrl.current_model, expect_next, 0.9, is_peak_hour())
     check("预计价格公式正确", abs(stats["estimated_price"] - expect) < 1e-9)
