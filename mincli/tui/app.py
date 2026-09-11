@@ -156,6 +156,52 @@ COMMAND_HELP: dict[str, str] = {
 # 各自独立成块，正文穿插其间正常显示）
 REASONING_HEADER_MD = "> 思考过程"
 
+
+def escape_leading_quote_markers(line: str) -> str:
+    """转义行首的 Markdown 引用标记（`>`），避免与我们自己加的 `> ` 前缀叠加。
+
+    我们把思考过程整体渲染成灰色块引用（每行加 `> `）。模型思考里若自带引用
+    行（`> 注意…`）或流式 chunk 边界正好落在 `>` 前，前缀就会叠加成 `>>` /
+    `> >`，被 Markdown 解析成「引用块里再套引用块」——界面上多出一道竖线，
+    看上去就是 `>>`。这里把行首的 `>` 逐个转义成 `\\>`（渲染仍是字面 `>`），
+    使其留在同一层引用块内，不再嵌套。
+
+    只处理行首：正文中间的 `>` 本来就是普通字符。缩进 4 空格以上的行是代码块
+    （内部 `>` 不会开启引用）故不处理；围栏代码块（```）内的行首 `>` 会被多
+    转义出一个反斜杠，属极少数情况，且只影响思考过程的显示。（增量流式无法
+    可靠地跨 chunk 跟踪围栏状态，故不做该分支。）
+    """
+    n = len(line)
+    i = 0
+    while i < n and line[i] == " " and i < 3:  # CommonMark 允许最多 3 个前导空格
+        i += 1
+    chars = list(line)
+    j = i
+    while j < n and line[j] == ">":
+        chars[j] = "\\>"
+        j += 1
+        while j < n and line[j] == " ":  # `> > x` 这类多层标记一并转义
+            j += 1
+    return "".join(chars) if j != i else line
+
+
+def quote_block_text(text: str) -> str:
+    """把整段文本转成块引用（每行 `> `，行首自带引用标记先转义）。"""
+    out = []
+    for ln in text.splitlines():
+        safe = escape_leading_quote_markers(ln)
+        out.append(f"> {safe}" if safe else ">")
+    return "\n".join(out)
+
+
+def quote_warning(message: str, prefix: str = "⚠️") -> str:
+    """告警块引用：首行带 `⚠️` 前缀，多行内容其余各行仍留在同一引用块内。"""
+    lines = quote_block_text(message).split("\n")
+    head = lines[0]
+    head_text = head[2:] if head.startswith("> ") else head.lstrip(">")
+    return "\n".join([f"> {prefix} {head_text}".rstrip(), *lines[1:]])
+
+
 # 青色主题：整体围绕青色设计（对应原命令行版的青色风格），
 # 回答区背景近黑灰色、整体色相略偏蓝。
 # 默认主题的 $accent 是橙色（输入框/弹窗边框）、滚动条背景是纯黑（ansi_black），
@@ -622,8 +668,13 @@ class ChatApp(App):
         await self._safe_append(md, text)
 
     async def _chat_fix_segment(self) -> None:
-        """固化当前正文段（置 None，后续 _chat_append 会新建段）。"""
+        """固化当前正文段（置 None，后续 _chat_append 会新建段）。
+
+        新段里没有任何已打开的引用块，因此思考块状态一并复位：否则下一轮
+        思考会以为「块还开着」，丢掉「思考过程」标题和 `> ` 前缀。
+        """
         self._chat_md = None
+        self._reasoning_open = False
 
     async def _chat_add_toolcard(self, card: ToolCard) -> None:
         """工具卡片插到当前段之后，并固化当前段（后续正文进新段）。"""
@@ -638,6 +689,7 @@ class ChatApp(App):
         self._chat_blocks = []
         self._chat_md = None
         self._active_tool_card = None
+        self._reasoning_open = False  # 新段没有打开的引用块
         if text:
             md = Markdown(text)
             md.styles.height = "auto"
@@ -689,7 +741,7 @@ class ChatApp(App):
         if getattr(node, "error", ""):
             # 生成中断但已保存的节点：标出失败原因，并提示可以接着让模型继续
             content += (
-                f"> ⚠️ 生成中断：{node.error}\n>\n"
+                f"{quote_warning('生成中断：' + node.error)}\n>\n"
                 "> 本轮内容已保存，可直接输入「继续」接着生成。\n\n"
             )
         content += (
@@ -703,21 +755,22 @@ class ChatApp(App):
     @staticmethod
     def _build_reasoning_md(text: str) -> str:
         """把思考全文转成灰色块引用 Markdown（节点视图/摘要用）。"""
-        lines = [REASONING_HEADER_MD, ">"]
-        for ln in text.splitlines():
-            lines.append(f"> {ln}" if ln else ">")
-        return "\n".join(lines)
+        return REASONING_HEADER_MD + "\n>\n" + quote_block_text(text)
 
     @staticmethod
     def _reasoning_chunk_md(chunk: str) -> str:
         """流式思考增量 → 块引用行增量：只按 chunk 内真实换行断行，
-        跨 chunk 直接拼接（避免每 token 断行）。"""
+        跨 chunk 直接拼接（避免每 token 断行）。
+
+        行首自带 `>` 的思考文本会先转义，防止与 `> ` 前缀叠加成嵌套引用。
+        """
         md = ""
         for i, ln in enumerate(chunk.split("\n")):
+            safe = escape_leading_quote_markers(ln)
             if i == 0:
-                md += ln
+                md += safe
             else:
-                md += ("\n> " + ln) if ln else "\n>"
+                md += ("\n> " + safe) if safe else "\n>"
         return md
 
     # ---------------- 工具调用块（代码块样式） ----------------
@@ -1998,10 +2051,12 @@ class ChatApp(App):
                 self._active_tool_card = card
             await self._chat_shrink_lists()
         elif ev.kind == "status":
-            await self._chat_stream_append(f"\n> {ev.message}\n")
+            # 状态也可能是多行模型文本（如审核思考）：逐行加引用前缀并转义行首
+            # 自带标记，避免第二行起跑出引用块、或叠加成 `>>` 嵌套引用。
+            await self._chat_stream_append("\n" + quote_block_text(ev.message) + "\n")
             await self._chat_shrink_lists()
         elif ev.kind == "error":
-            await self._chat_stream_append(f"\n\n> ⚠️ {ev.message}\n")
+            await self._chat_stream_append(f"\n\n{quote_warning(ev.message)}\n")
             # 出错不再回滚节点：本轮已保存（含已生成的部分内容），提示可继续
             await self._chat_stream_append(
                 ">\n> 💾 本轮已保存到当前节点，可直接输入「继续」接着生成。\n"
@@ -2024,7 +2079,7 @@ class ChatApp(App):
     def _append_error(self, message: str) -> None:
         self._cancel_flush()  # 出错后不再渲染残留流式缓冲
         asyncio.ensure_future(self._chat_append(
-            f"\n\n> ⚠️ {message}\n"
+            f"\n\n{quote_warning(message)}\n"
             ">\n> 💾 本轮已保存到当前节点，可直接输入「继续」接着生成。\n"
         ))
 

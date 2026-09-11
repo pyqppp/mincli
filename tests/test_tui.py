@@ -268,6 +268,135 @@ def test_markup_safety():
     check("工具卡片保留原始方括号文本", "tool_choice" in card._render_text())
 
 
+def _max_quote_depth(md_text: str) -> int:
+    """Markdown 里引用块的最大嵌套层数（>1 即渲染出第二道竖线）。"""
+    from markdown_it import MarkdownIt
+
+    depth = peak = 0
+    for tok in MarkdownIt().parse(md_text):
+        if tok.type == "blockquote_open":
+            depth += 1
+            peak = max(peak, depth)
+        elif tok.type == "blockquote_close":
+            depth -= 1
+    return peak
+
+
+def _inline_text(md_text: str) -> str:
+    """取 Markdown 渲染出的纯文本（inline token 内容拼接）。"""
+    from markdown_it import MarkdownIt
+
+    return "\n".join(
+        tok.content for tok in MarkdownIt().parse(md_text) if tok.type == "inline"
+    )
+
+
+def test_quote_marker_safety():
+    """思考过程引用行不得与我们的 `> ` 前缀叠加成嵌套引用（界面显示成 >>）。
+
+    背景：思考过程整体按灰色块引用渲染（每行加 `> `）。模型思考里自带引用行
+    （`> 注意…`），或流式 chunk 边界正好落在 `>` 之前时，前缀会叠加成 `>>` /
+    `> >`，被解析成「引用块里套引用块」——多出一道竖线。
+    """
+    from mincli.tui.app import (
+        ChatApp,
+        escape_leading_quote_markers,
+        quote_block_text,
+        quote_warning,
+    )
+
+    check("未转义的叠加确实会形成嵌套引用（回归用例有效）",
+          _max_quote_depth("> 思考过程\n>\n> > 注意") == 2)
+
+    # 行首引用标记转义
+    check("行首 `>` 被转义", escape_leading_quote_markers("> 注意") == "\\> 注意")
+    check("连写 `>>` 被逐个转义", escape_leading_quote_markers(">> 连写") == "\\>\\> 连写")
+    check("`> >` 多层标记被转义", escape_leading_quote_markers("> > 多层") == "\\> \\> 多层")
+    check("正文中间的 `>` 不动", escape_leading_quote_markers("a > b") == "a > b")
+    check("缩进代码块（4 空格）不动", escape_leading_quote_markers("    > code") == "    > code")
+
+    # 节点视图整段引用
+    node_md = ChatApp._build_reasoning_md("第一轮\n> 引用行\n\n结尾")
+    check("节点视图引用无嵌套", _max_quote_depth(node_md) == 1)
+    check("节点视图引用行仍显示字面 `>`", "> 引用行" in _inline_text(node_md))
+    check("节点视图标题在最前", node_md.splitlines()[0] == "> 思考过程")
+
+    # 流式 chunk 拼接（chunk 末尾换行 + 下一 chunk 以 `>` 开头 → 曾经的 `>>`）
+    streamed = ChatApp._reasoning_chunk_md("先想一下。\n") + ChatApp._reasoning_chunk_md(
+        "> 注意：要核对。\n"
+    )
+    check("流式拼接不出现字面 `>>`", ">>" not in streamed)
+    check("流式拼接不出现字面 `> >`", "> >" not in streamed)
+    check("流式拼接无嵌套引用", _max_quote_depth("> 思考过程\n>\n" + streamed) == 1)
+    check("流式拼接仍显示字面 `>`", "> 注意：要核对。" in _inline_text(streamed))
+
+    # 状态/告警多行文本同样是模型可控内容
+    quoted = quote_block_text("第一行\n> 第二行")
+    check("多行状态逐行引用", quoted.count("\n> ") == 1 and quoted.startswith("> 第一行"))
+    check("多行状态无嵌套引用", _max_quote_depth(quoted) == 1)
+    warn = quote_warning("第一条\n> 第二条")
+    check("告警首行带 ⚠️ 且其余行留在引用内", warn.startswith("> ⚠️ 第一条")
+          and warn.splitlines()[1] == "> \\> 第二条")
+    check("告警块无嵌套引用", _max_quote_depth(warn) == 1)
+
+
+async def test_reasoning_quote_after_tool():
+    """工具调用后的新一轮思考：仍带「思考过程」标题与 `> ` 前缀，且不嵌套引用。
+
+    工具卡片会把正文段固化（新建 Markdown 段）。若思考块状态不复位，新一轮思考
+    会以为块还开着，丢掉标题和前缀；而模型思考自带的 `>` 会与残留前缀叠加成 `>>`。
+    """
+    from textual.widgets import Markdown
+    from textual.widgets._markdown import MarkdownBlockQuote, MarkdownParagraph
+
+    ctrl = FakeController()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 40)) as pilot:
+        for _ in range(5):
+            await pilot.pause()
+        node = ctrl.tree.create_root("测试", "", "", "引用标题", 10, 5)
+        ctrl.tree.current_node = node
+        await app._handle_event(ControllerEvent.node_created(node))
+        # 第一轮：只有思考、没有正文（真实情况：思考完直接调工具）
+        await app._handle_event(ControllerEvent.stream("", "先想一下。\n"))
+        await asyncio.sleep(0.15)  # 触发一次批量渲染，模拟真实 chunk 边界
+        await app._handle_event(ControllerEvent.tool("web_search", '{"query":"x"}', ""))
+        await app._handle_event(
+            ControllerEvent.tool("web_search", '{"query":"x"}', "工具 web_search 完成")
+        )
+        # 工具之后继续思考：思考里自带引用行
+        await app._handle_event(ControllerEvent.stream("", "> 注意：结果有冲突。\n"))
+        await asyncio.sleep(0.15)
+        await app._handle_event(ControllerEvent.stream("", "> 再核对一次。\n"))
+        await app._handle_event(ControllerEvent.stream("结论：一致。", ""))
+        await app._handle_event(ControllerEvent.done(node))
+        for _ in range(20):
+            await pilot.pause()
+
+        src = app._chat_source()
+        check("工具调用后新一轮思考仍有标题", src.count("思考过程") == 2)
+        check("第二轮思考带引用前缀", "> \\> 注意：结果有冲突。" in src)
+        check("正文里没有字面 `>>`", ">>" not in src)
+        check("正文里没有字面 `> >`", "> >" not in src)
+        check("工具卡片仍在两段之间",
+              [type(b).__name__ for b in app._chat_blocks]
+              == ["Markdown", "ToolCard", "Markdown"])
+
+        quotes = list(app.query(MarkdownBlockQuote))
+        nested = [
+            q for q in quotes
+            if any(isinstance(a, MarkdownBlockQuote) for a in q.ancestors)
+        ]
+        check("两个思考块各自成引用", len(quotes) == 2)
+        check("没有嵌套引用控件（不再出现第二道竖线）", not nested)
+        rendered = [
+            str(p._content) for q in quotes for p in q.query(MarkdownParagraph)
+        ]
+        check("转义只影响源码、界面仍显示字面 `>`",
+              any("> 注意：结果有冲突。" in t for t in rendered))
+        await pilot.press("ctrl+c")
+
+
 async def test_interrupted_node_kept():
     """生成中断：节点保留（带 ⚠ 标记与「继续」提示），不再整轮回滚。"""
 
@@ -329,6 +458,7 @@ async def main() -> int:
     test_tool_args_width()
     test_packaging()
     test_markup_safety()
+    test_quote_marker_safety()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -889,6 +1019,7 @@ async def main() -> int:
 
         await pilot3.press("ctrl+c")
 
+    await test_reasoning_quote_after_tool()
     await test_interrupted_node_kept()
 
     check("退出时保存会话", fake.saved)
