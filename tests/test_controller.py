@@ -245,6 +245,32 @@ def test_import_target():
     check("导入不存在文件返回错误", ctrl.import_target("/nonexistent/xxx.md") is not None)
 
 
+def test_path_args():
+    """跨平台路径解析：Windows 反斜杠路径不能被 POSIX shlex 吃掉。"""
+    print("== 跨平台路径解析（/import 与拖入粘贴） ==")
+    from mincli.helpers import split_path_args
+
+    check("路径解析：Windows 未加引号反斜杠路径完整保留",
+          split_path_args(r"C:\Users\me\notes.txt") == [r"C:\Users\me\notes.txt"])
+    check("路径解析：Windows 带空格多文件（双引号）",
+          split_path_args(r'"C:\Users\me\My File.txt" "D:\b.txt"')
+          == [r"C:\Users\me\My File.txt", r"D:\b.txt"])
+    check("路径解析：Windows 单引号路径",
+          split_path_args(r"'C:\x\y.txt'") == [r"C:\x\y.txt"])
+    check("路径解析：POSIX 引号路径去引号",
+          split_path_args('"/tmp/a b.txt"') == ["/tmp/a b.txt"])
+    check("路径解析：POSIX 转义空格",
+          split_path_args(r"/tmp/a\ b.txt") == ["/tmp/a b.txt"])
+    check("路径解析：URL 原样保留",
+          split_path_args("https://a.com/x.png http://b.com")
+          == ["https://a.com/x.png", "http://b.com"])
+    check("路径解析：普通文本原样返回",
+          split_path_args("这是一段普通文本") == ["这是一段普通文本"])
+    check("路径解析：空串返回空列表", split_path_args("") == [])
+    check("路径解析：引号不匹配不抛异常",
+          isinstance(split_path_args('"/tmp/unclosed'), list))
+
+
 def test_import_multi():
     print("== /import 多文件混合（图片+文本） ==")
     a_txt = os.path.join(_TMP, "multi_a.txt")
@@ -708,12 +734,16 @@ def test_workflows():
     check("工作流：run 合成替换变量", m_run is not None
           and "{start}" not in m_run and "{end}" not in m_run
           and "v1.0" in m_run and "v2.0" in m_run)
+    m_win = ctrl4.wf_compose("rel", values={"start": r"C:\work\a", "end": r"D:\out\b"})
+    check("工作流：替换值含反斜杠不崩溃且原样写入", m_win is not None
+          and r"C:\work\a" in m_win and r"D:\out\b" in m_win
+          and "bad escape" not in m_win)
     m_part = ctrl4.wf_compose("rel", values={"start": "v1.0"})
     check("工作流：缺失变量提示推断", m_part is not None
           and "{end}" in m_part and "未提供值的变量" in m_part)
     check("工作流：未知名合成返回 None", ctrl4.wf_compose("nope") is None)
     wf4 = ctrl4.wf_get("rel")
-    check("工作流：运行计数递增", wf4 is not None and wf4.run_count == 3 and wf4.last_run_at is not None)
+    check("工作流：运行计数递增", wf4 is not None and wf4.run_count == 4 and wf4.last_run_at is not None)
 
     # 修订
     ctrl4._wf_call_model = lambda messages, max_tokens: "目标：修订版\n\n步骤：\n1. 校验步骤"
@@ -732,6 +762,7 @@ if __name__ == "__main__":
     test_api_error()
     test_session_roundtrip()
     test_import_target()
+    test_path_args()
     test_import_multi()
     test_delete_nodes()
     test_settings()

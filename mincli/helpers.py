@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import sys
 import datetime
 from typing import Optional, List, Dict
@@ -21,6 +22,66 @@ def clear_screen() -> None:
         sys.stdout.flush()
     else:
         os.system('cls' if os.name == 'nt' else 'clear')
+
+
+# ---------------- 跨平台路径/URL 参数解析（/import、拖入/粘贴导入） ----------------
+
+# Windows 盘符路径（如 C:\Users\me\a.txt）。POSIX 版 shlex 会把 "\U" 当转义序列
+# 处理从而吃掉反斜杠（C:\Users\me\a.txt → C:Usersmenotes.txt），导致 Windows
+# 上拖入/粘贴与 /import 全部失效。
+_WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:\\")
+
+
+def _strip_matching_quotes(token: str) -> str:
+    """去掉 token 两端成对的引号（终端拖入路径常带引号）。"""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        return token[1:-1]
+    return token
+
+
+def _is_import_target_token(token: str) -> bool:
+    """token 是否可直接作为导入目标（http(s) URL 或存在的文件）。"""
+    if token.lower().startswith(("http://", "https://")):
+        return True
+    try:
+        return os.path.isfile(os.path.expanduser(token))
+    except OSError:
+        return False
+
+
+def split_path_args(text: str) -> List[str]:
+    """把一行（可含多个）文件路径/URL 解析为 token 列表，跨平台。
+
+    决策顺序：
+    1. 优先返回“全部 token 都能作为导入目标（存在的文件或 http(s) URL）”的
+       解析结果，保证 POSIX 转义写法（如 ``/Users/a\\ b.txt``）与 Windows
+       引号写法都能正确落地；
+    2. 否则若文本含 Windows 盘符路径（``C:\\...``），使用**非 POSIX** 解析
+       （保留反斜杠），避免 Windows 路径被当作转义序列破坏；
+    3. 其余情况沿用 POSIX 解析（支持 ``\\`` 转义与引号），失败再退回非 POSIX。
+
+    返回空列表表示没有任何可解析的参数。解析失败（引号不匹配）不抛异常，
+    尽量返回可用的 token（错误文件由导入流程给出“文件不存在”提示）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    posix: List[str] = []
+    nonposix: List[str] = []
+    try:
+        posix = [_strip_matching_quotes(t) for t in shlex.split(text, posix=True)]
+    except ValueError:
+        pass
+    try:
+        nonposix = [_strip_matching_quotes(t) for t in shlex.split(text, posix=False)]
+    except ValueError:
+        pass
+    for tokens in (posix, nonposix):
+        if tokens and all(_is_import_target_token(t) for t in tokens):
+            return tokens
+    if _WINDOWS_DRIVE_RE.search(text) and nonposix:
+        return nonposix
+    return posix or nonposix
 
 
 def is_peak_hour(now: Optional[datetime.datetime] = None) -> bool:

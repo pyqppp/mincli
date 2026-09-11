@@ -188,7 +188,7 @@ CLI flags:
 | `/mcp add <name> <command> [args...]` | Add a third-party MCP server (local command); a `http(s)://` second arg adds it as a remote server |
 | `/mcp remove <name>` | Remove a third-party MCP server (confirmed) |
 | `/mcp reload` | Reload MCP server config |
-| `/import <path-or-URL> [...]` | Import file (txt/md/py/csv/pdf/docx), fetch web page, or add images — multiple targets at once; image files become pending images; `/import clear` clears pending imports |
+| `/import <path-or-URL> [...]` | Import file (txt/md/py/csv/pdf/docx), fetch web page, or add images — multiple targets at once; image files become pending images; `/import clear` clears pending imports. Path parsing is cross-platform: Windows backslash paths (`C:\Users\me\a.txt`) and quoted/paths-with-spaces both work |
 | `/<node-id>` (e.g. `/a3`) | Jump to node directly |
 | `/tree` | List all nodes |
 | `/info [node-id]` | Show node details |

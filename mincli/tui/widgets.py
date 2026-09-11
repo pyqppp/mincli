@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
-import shlex
 
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import Static, TextArea
+
+from mincli.helpers import split_path_args
 
 # 锁定键（Caps Lock / Num Lock / Scroll Lock）绝不应产生输入。
 # 注意：真正的拦截在 App 级优先级绑定（见 app.py 的 action_ignore_lock）；
@@ -70,17 +71,16 @@ class ChatInput(TextArea):
     def _paths_from_paste(text: str) -> list[str] | None:
         """整段粘贴若能解析为文件路径/URL 列表则返回之，否则返回 None。
 
-        终端把拖入的文件粘贴成带引号路径（多文件空格或换行分隔）。
+        终端把拖入的文件粘贴成路径（macOS/Linux 多为带引号或转义空格的
+        POSIX 写法，Windows 为 ``C:\\...`` 反斜杠写法，带空格时加引号）。
         仅当所有 token 都 expanduser 后是存在的文件、或是 http(s) URL 时，
         才判定为「拖入导入」，避免劫持普通文本粘贴（如整句复制）。
+        解析走 helpers.split_path_args（跨平台，兼容 Windows 反斜杠路径）。
         """
         text = (text or "").strip()
         if not text:
             return None
-        try:
-            tokens = shlex.split(text, posix=True)
-        except ValueError:
-            return None
+        tokens = split_path_args(text)
         if not tokens:
             return None
         paths: list[str] = []

@@ -10,7 +10,6 @@ import datetime
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -112,6 +111,7 @@ from mincli.config import (
     save_mcp_servers,
 )
 from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
+from mincli.helpers import split_path_args
 from mincli.tools.files import FilesAPIError
 from mincli.tools.images import image_placeholder_text
 from mincli.tui.confirm import ConfirmScreen
@@ -923,12 +923,9 @@ class ChatApp(App):
         if await self._cmd_tree(cmd):
             return True
         if low.startswith("/import"):
-            try:
-                parts = shlex.split(cmd)
-            except ValueError:
-                self.notify("参数解析失败（引号不匹配）", severity="warning")
-                return True
-            targets = parts[1:]
+            # 参数解析走跨平台 split_path_args：兼容 Windows 反斜杠路径（如 C:\a b\x.txt）
+            cmd_parts = cmd.split(maxsplit=1)
+            targets = split_path_args(cmd_parts[1]) if len(cmd_parts) > 1 else []
             if not targets:
                 self.notify("用法: /import <路径或URL> [...] | /import clear", severity="warning")
                 return True
@@ -1394,11 +1391,8 @@ class ChatApp(App):
     def _mcp_add(self, rest: str) -> None:
         servers = load_mcp_servers()
         is_url = lambda s: bool(re.match(r"^https?://", s))
-        try:
-            tokens = shlex.split(rest)  # 支持带引号的参数与 --header 'K: V'
-        except ValueError:
-            self.notify("参数解析失败（引号不匹配）", severity="warning")
-            return
+        # 跨平台解析：支持带引号的参数、--header 'K: V' 与 Windows 反斜杠命令路径
+        tokens = split_path_args(rest)
         if len(tokens) < 2:
             self.notify(
                 "用法: /mcp add <名称> <命令> [参数...] [--header 'K: V'] 或 /mcp add <名称> <URL> [--header 'K: V']",
@@ -1495,11 +1489,8 @@ class ChatApp(App):
             return
         parts = cmd.strip().split(maxsplit=1)
         rest = parts[1].strip() if len(parts) > 1 else ""
-        try:
-            tokens = shlex.split(rest)
-        except ValueError:
-            self.notify("参数解析失败（引号不匹配）", severity="warning")
-            return
+        # 跨平台解析：工作流的键=值里可能含 Windows 反斜杠路径
+        tokens = split_path_args(rest)
         sub = tokens[0].lower() if tokens else ""
         name = tokens[1] if len(tokens) > 1 else ""
 

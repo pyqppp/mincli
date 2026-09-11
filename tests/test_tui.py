@@ -404,6 +404,33 @@ async def main() -> int:
             await pilot.pause()
         check("拖入后 clear 清空", len(fake.pending_images) == 0 and len(fake.imported_files) == 0)
 
+        # --- 7.6c Windows 反斜杠路径（跨平台解析回归） ---
+        # 在 POSIX 上创建文件名含「C:\...」的真实文件，模拟 Windows 拖入/粘贴路径：
+        # POSIX 版 shlex 会把反斜杠当转义吃掉 → 导入失效；修复后必须原样识别并导入。
+        if os.name != "nt":
+            _win_txt = os.path.join(_tmp_img, r"C:\Users\me\notes.txt")
+            with open(_win_txt, "w", encoding="utf-8") as f:
+                f.write("windows style path")
+            check("拖入：Windows 反斜杠路径被识别为可导入",
+                  ChatInput._paths_from_paste(_win_txt) == [_win_txt])
+            app.post_message(events.Paste(_win_txt))
+            for _ in range(20):
+                await pilot.pause()
+            check("拖入：Windows 反斜杠路径成功导入文本",
+                  any("notes.txt" in f["name"] for f in fake.imported_files))
+            await type_command("/import clear")
+            for _ in range(10):
+                await pilot.pause()
+            # /import 命令参数解析同样需保留反斜杠（此前会被 shlex 吃掉）
+            await app._handle_command(f"/import {_win_txt}")
+            for _ in range(10):
+                await pilot.pause()
+            check("命令：/import 支持 Windows 反斜杠路径",
+                  any("notes.txt" in f["name"] for f in fake.imported_files))
+            await type_command("/import clear")
+            for _ in range(10):
+                await pilot.pause()
+
         await type_command("/set detail low")
         await pilot.pause()
         check("命令：/set detail low", fake.image_detail == "low")
@@ -640,6 +667,18 @@ async def main() -> int:
         check("工作流：/wf run 立即执行", cur3b is not None
               and "请执行工作流「demo」" in cur3b.user_msg
               and "notes/b.txt" in cur3b.user_msg and "本次输入：" not in cur3b.user_msg)
+
+        # /wf 参数里的 Windows 反斜杠路径不能被 POSIX shlex 吃掉（同类解析修复）
+        await app3._handle_command(r"/wf run demo C:\work\b.txt")
+        for _ in range(30):
+            await pilot3.pause()
+            cur = fake3.tree.current_node
+            if cur is not None and "C:\\work\\b.txt" in cur.user_msg:
+                break
+        cur3c = fake3.tree.current_node
+        check("工作流：/wf run 支持 Windows 反斜杠路径参数",
+              cur3c is not None and r"C:\work\b.txt" in cur3c.user_msg
+              and "C:workb.txt" not in cur3c.user_msg)
 
         # /wf edit 带修改要求 → 模型修订并落盘
         await type_wf_cmd("/wf edit demo 增加一条校验步骤")

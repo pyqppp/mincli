@@ -5,7 +5,6 @@ prompt_toolkit / 无流式渲染依赖）。
 """
 
 import os
-import shlex
 import sys
 from typing import Optional
 
@@ -13,6 +12,8 @@ import typer
 from openai import OpenAI
 
 from mincli.tools.files import FilesAPIError
+
+from mincli.helpers import split_path_args
 
 from mincli.config import (
     MODEL_V4_FLASH,
@@ -145,12 +146,9 @@ def _plain_wf(ctrl, text: str) -> Optional[str]:
     """纯文本模式 /wf 分发（use/stop 由调用方就地处理）。
 
     返回需要发送执行的消息文本（/wf run），其余命令打印结果并返回 None。
+    参数解析走跨平台 split_path_args：键=值里可能含 Windows 反斜杠路径。
     """
-    try:
-        parts = shlex.split(text)
-    except ValueError:
-        print("参数解析失败（引号不匹配）")
-        return None
+    parts = split_path_args(text)
     if len(parts) < 2:
         print(_WF_PLAIN_USAGE)
         return None
@@ -313,12 +311,9 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                 print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文（新建摘要节点） | /tree 显示对话树 | /info 节点详情 | /import 导入文件/图片 | /files 管理图片文件 | /wf 工作流（list/save/use/run 等）")
                 continue
             if low.startswith("/import"):
-                try:
-                    parts = shlex.split(text)
-                except ValueError:
-                    print("参数解析失败（引号不匹配）")
-                    continue
-                targets = parts[1:]
+                # 跨平台参数解析：兼容 Windows 反斜杠路径（如 C:\a b\x.txt）
+                cmd_parts = text.split(maxsplit=1)
+                targets = split_path_args(cmd_parts[1]) if len(cmd_parts) > 1 else []
                 if not targets:
                     print("用法: /import <路径或URL> [...] | /import clear")
                 elif targets[0].lower() in ("clear", "c"):
@@ -401,11 +396,8 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                     print("用法: /set file_confirm <on|off> | /set show")
                 continue
             if low.startswith(("/wf", "/workflow")):
-                try:
-                    wparts = shlex.split(text)
-                except ValueError:
-                    print("参数解析失败（引号不匹配）")
-                    continue
+                # 跨平台解析：工作流的键=值里可能含 Windows 反斜杠路径
+                wparts = split_path_args(text)
                 wsub = wparts[1].lower() if len(wparts) > 1 else ""
                 wname = wparts[2] if len(wparts) > 2 else ""
                 if wsub == "use":

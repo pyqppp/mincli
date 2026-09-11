@@ -56,11 +56,16 @@ def doc_placeholders(doc: str) -> List[str]:
 
 
 def substitute(doc: str, values: Dict[str, str]) -> tuple[str, List[str]]:
-    """按 values 替换 {键}；未提供值的占位符原样保留并列入 missing。"""
+    """按 values 替换 {键}；未提供值的占位符原样保留并列入 missing。
+
+    替换值用函数形式交给 re.sub：值里可能含反斜杠（如 Windows 路径
+    ``C:\\work\\b.txt``）或 ``\\1`` 这类序列，直接当替换模板会报
+    ``bad escape`` 或误插入分组引用。
+    """
     out = doc or ""
     for key, val in (values or {}).items():
         pat = re.compile(r"\{" + re.escape(str(key)) + r"\}")
-        out = pat.sub(str(val), out)
+        out = pat.sub(lambda _m, v=str(val): v, out)
     missing = [ph for ph in doc_placeholders(doc) if ph not in (values or {})]
     return out, missing
 
