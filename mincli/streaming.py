@@ -127,4 +127,16 @@ def stream_response(
         )
 
     except Exception as e:
-        return StreamResult(error=str(e))
+        # 出错也要把「已经生成的部分」带回去（content/reasoning/usage）：
+        # 上层会把它写进节点保存下来，用户可以在该节点继续输入「继续」接着生成，
+        # 而不是整轮丢失（见 controller.send_message / _finalize_interrupted）。
+        return StreamResult(
+            error=str(e),
+            content=full_content or None,
+            reasoning=reasoning_text or None,
+            input_tokens=usage_input,
+            output_tokens=usage_output,
+            cache_hit_tokens=usage_cache_hit,
+            cache_miss_tokens=usage_cache_miss,
+            tool_calls=list(accumulated_tool_calls.values()) or None,
+        )

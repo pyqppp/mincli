@@ -22,6 +22,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - ⌨️ **Command Completion** — type `/` to list commands; letters filter candidates; `Tab` cycles / completes; a completed command shows its usage help
 - 🛡️ **Confirm Dialogs** — destructive actions (`/delete`, `/mcp remove`) ask for confirmation; `←`/`→` switches buttons and the default is *Cancel*
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
+- ♻️ **Resumable Interruptions** — a failed turn keeps its node (partial answer, reasoning and finished tool results) marked `⚠ interrupted`; type `继续` to carry on instead of losing the turn
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
 - ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking mode, reasoning effort mid-conversation
 - 🧩 **Two Models** — `deepseek-flash` (DeepSeek-V4.1-Flash: fast, native multimodal image understanding) and `deepseek-v4-pro` (flagship, text only)
@@ -315,6 +316,20 @@ Workflow runs go through the exact same pipeline as a normal send (streaming, to
 - On macOS, `/wf edit <name>` without a request opens the spec in a system editor and auto-imports it on save; other platforms use the model-revision form.
 - Re-running `/wf save <name>` overwrites (with confirmation) — redo the task first, then re-save to update a workflow.
 - `--no-tui` text mode supports `/wf list/show/save/use/run/delete/rename/edit` (edit = model revision only).
+
+---
+
+## Interrupted Generations & "Continue"
+
+An API failure (rate limit, dropped connection, `Content Exists Risk` moderation, timeout) no longer throws the turn away:
+
+- **The node is saved anyway** — whatever was already streamed (partial answer and reasoning), the tool calls/results that already finished, and the tokens spent are all written to the current node, which is marked `⚠ interrupted` in the tree.
+- **The chat log says so** — the failure reason is shown, followed by a note that the turn is saved and that typing `继续` (continue) resumes it.
+- **Just continue** — send `继续` (or any follow-up) under that node; the history sent to the model contains the partial answer and tool results, so it picks up where it stopped instead of starting over.
+- **Empty answers are never sent back** — if nothing was generated, no empty assistant message is sent to the model (the API would reject it); your question still stays in context.
+- Reopening an interrupted node shows the failure reason; delete it with `/delete <node-id>` when you no longer need it.
+
+> If the failure was content moderation, resending the same context may be rejected again — rephrasing or starting a fresh node works better.
 
 ---
 

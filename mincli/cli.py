@@ -287,6 +287,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             print(f"\n[工具: {ev.tool_name}]")
         elif ev.kind == "error":
             print(f"\n⚠️ {ev.message}")
+            print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
         elif ev.kind == "done":
             print()
 
@@ -422,6 +423,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                         ctrl.send_message(to_send, emit)
                     except Exception as e:
                         print(f"\n⚠️ {e}")
+                        print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
                 continue
             if low == "/tree":
                 print(ctrl.tree.render_tree(
@@ -444,6 +446,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                 ctrl.send_message(text, emit)
             except Exception as e:
                 print(f"\n⚠️ {e}")
+                print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
     finally:
         ctrl.save_session()
         ctrl.close()

@@ -204,14 +204,132 @@ def test_tool_round():
 
 
 def test_api_error():
-    print("== API 错误处理 ==")
+    print("== API 错误处理（节点保留，可继续） ==")
     script = [RuntimeError("connection reset")]
     ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     node, events = collect(ctrl, "hello")
-    check("返回 None", node is None)
-    check("出错回滚空节点", ctrl.tree.root is None and ctrl.tree.current_node is None)
+    check("返回已保存的节点（不再回滚）", node is not None and ctrl.tree.root is node)
+    check("节点仍是当前节点", ctrl.tree.current_node is node and node.id in ctrl.tree.nodes)
+    check("错误原因写入节点", "connection reset" in node.error)
+    check("无内容时回答为空", node.assistant_msg == "")
+    check("中断轮不额外调用标题生成", len(ctrl.client.chat.completions.calls) == 1)
     errs = [e for e in events if e.kind == "error"]
     check("发出 error 事件", len(errs) == 1 and "connection reset" in errs[0].message)
+    check("发出 done 事件（UI 刷新树/状态条）", "done" in [e.kind for e in events])
+
+    # 继续：空回答的中断节点不能再把空 assistant 消息发回模型（否则 API 报错）
+    ctrl.client.chat.completions.script = [
+        [FakeChunk(content="补上回答")],
+        FakeChatResponse(content="标题"),
+    ]
+    node2, _ = collect(ctrl, "继续")
+    msgs = ctrl.client.chat.completions.calls[1]["messages"]
+    check("继续轮挂在中断节点下", node2 is not None and node2.parent_id == node.id)
+    check("继续轮不发送空 assistant 消息",
+          all(not (m.get("role") == "assistant" and not m.get("content")) for m in msgs))
+    check("继续轮历史含上一轮提问", any(
+        m.get("role") == "user" and m.get("content") == "hello" for m in msgs
+    ))
+    check("继续轮正常落盘", node2.assistant_msg == "补上回答")
+
+
+def test_partial_save_on_error():
+    print("== 生成中断：部分回答落盘 + 可「继续」 ==")
+
+    def _chunks_then_raise():
+        """先吐两个增量再抛错，模拟生成中途失败（如 400 Content Exists Risk）。"""
+        yield FakeChunk(content="前半句", reasoning_content="先想想")
+        yield FakeChunk(content="，还没写完")
+        raise RuntimeError("Error code: 400 - Content Exists Risk")
+
+    ctrl = TestController(
+        FakeClient([_chunks_then_raise()]),
+        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+    )
+    node, events = collect(ctrl, "写个长回答")
+    check("中断节点已保存", node is not None and node.id in ctrl.tree.nodes)
+    check("部分回答已落盘", node.assistant_msg == "前半句，还没写完")
+    check("部分思考已落盘", node.reasoning == "先想想")
+    check("错误原因写入节点", "Content Exists Risk" in node.error)
+    check("流式内容与落盘一致",
+          "".join(e.content for e in events if e.kind == "stream") == node.assistant_msg)
+    kinds = [e.kind for e in events]
+    check("先 error 后 done", kinds.count("error") == 1 and "done" in kinds)
+    check("error 在 done 之前", kinds.index("error") < kinds.index("done"))
+    check("中断轮不额外调用标题生成", len(ctrl.client.chat.completions.calls) == 1)
+
+    # 「继续」：下一轮历史带上已保存的半截回答与思考，模型可接着写
+    ctrl.client.chat.completions.script = [
+        [FakeChunk(content="接着写完了")],
+        FakeChatResponse(content="继续标题"),
+    ]
+    node2, _ = collect(ctrl, "继续")
+    msgs = ctrl.client.chat.completions.calls[1]["messages"]
+    check("继续轮历史含半截回答", any(
+        m.get("role") == "assistant" and m.get("content") == "前半句，还没写完"
+        for m in msgs
+    ))
+    check("继续轮历史含思考内容", any(
+        m.get("role") == "assistant" and m.get("reasoning_content") == "先想想"
+        for m in msgs
+    ))
+    check("继续轮是中断节点的子节点", node2 is not None and node2.parent_id == node.id)
+    check("继续后错误标记不残留", node2.error == "" and node2.assistant_msg == "接着写完了")
+
+    # 中断标记与部分回答随会话持久化（重启后仍能看到并继续）
+    check("保存带中断标记的会话", ctrl.save_session())
+    ctrl_reload = TestController(
+        FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+    )
+    reloaded = ctrl_reload.tree.nodes.get(node.id)
+    check("重载后部分回答仍在",
+          reloaded is not None and reloaded.assistant_msg == "前半句，还没写完")
+    check("重载后中断标记仍在",
+          reloaded is not None and "Content Exists Risk" in reloaded.error)
+    if os.path.exists(TestController.SAVE_FILE):
+        os.remove(TestController.SAVE_FILE)
+
+
+def test_tool_round_partial_save():
+    print("== 工具轮之后中断：工具结果一并保存 ==")
+    tool_chunks = [
+        FakeChunk(
+            tool_calls=[
+                FakeToolCall(
+                    index=0,
+                    id="call_9",
+                    name="write_file",
+                    arguments='{"filepath": "/tmp/mincli_p.txt", "content": "hi"}',
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3),
+        )
+    ]
+
+    def _answer_then_raise():
+        yield FakeChunk(content="基于检索结果，")
+        raise RuntimeError("connection reset by peer")
+
+    ctrl = TestController(
+        FakeClient([tool_chunks, _answer_then_raise()]),
+        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+    )
+    ctrl.confirm = lambda title, text: True
+    node, events = collect(ctrl, "帮我写文件再总结")
+    check("工具轮后中断的节点保留", node is not None and node.assistant_msg == "基于检索结果，")
+    check("已完成的工具轮写入节点", bool(node.tool_messages))
+    check("工具轮 token 用量保留", node.input_tokens >= 7 and node.output_tokens >= 3)
+
+    ctrl.client.chat.completions.script = [
+        [FakeChunk(content="总结完毕")],
+        FakeChatResponse(content="标题"),
+    ]
+    node2, _ = collect(ctrl, "继续")
+    # calls: [0] 工具轮 [1] 失败轮 [2] 继续轮 [3] 标题生成
+    msgs = ctrl.client.chat.completions.calls[2]["messages"]
+    check("继续轮历史含 tool 结果",
+          any(m.get("role") == "tool" for m in msgs))
+    check("继续轮回答落盘", node2 is not None and node2.assistant_msg == "总结完毕")
 
 
 def test_session_roundtrip():
@@ -505,12 +623,13 @@ def test_multimodal():
     events3 = []
     ctrl3.add_pending_images([png])
     node3 = ctrl3.send_message("看图", events3.append)
-    check("自定义模型被拒", node3 is None)
-    check("图片放回待发送", len(ctrl3.pending_images) == 1)
+    check("自定义模型被拒但节点保留", node3 is not None and "不支持图片" in node3.error)
+    check("图片保留在中断节点里（不再重复放回待发送）",
+          len(ctrl3.pending_images) == 0 and len(node3.user_images) == 1)
     check("发出 error 事件（提示不支持图片）", any(
         e.kind == "error" and "不支持图片" in e.message for e in events3
     ))
-    check("节点已回滚", ctrl3.tree.root is None)
+    check("节点留在树中", node3.id in ctrl3.tree.nodes and ctrl3.tree.root is node3)
 
     # 3b) Pro 不支持图片 → 提示手动切换，且不自动改模型
     ctrl3b = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
@@ -518,11 +637,13 @@ def test_multimodal():
     events3b = []
     ctrl3b.add_pending_images([png])
     node3b = ctrl3b.send_message("看图", events3b.append)
-    check("Pro 收到图片被拒", node3b is None and ctrl3b.current_model == "deepseek-v4-pro")
+    check("Pro 收到图片被拒但节点保留",
+          node3b is not None and ctrl3b.current_model == "deepseek-v4-pro")
     check("Pro 提示切到 flash", any(
         e.kind == "error" and "/set model flash" in e.message for e in events3b
     ))
-    check("Pro 图片放回待发送", len(ctrl3b.pending_images) == 1)
+    check("Pro 图片保留在中断节点里",
+          len(ctrl3b.pending_images) == 0 and len(node3b.user_images) == 1)
 
     # 4) 历史重放：第一轮回退 base64，第二轮补传 → file 块
     script4 = [
@@ -933,6 +1054,8 @@ if __name__ == "__main__":
     test_simple_qa()
     test_tool_round()
     test_api_error()
+    test_partial_save_on_error()
+    test_tool_round_partial_save()
     test_session_roundtrip()
     test_import_target()
     test_path_args()

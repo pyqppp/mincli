@@ -1003,8 +1003,9 @@ class ChatController:
         """发送一条消息（可能触发多轮工具调用），完成后返回新节点。
 
         节点在流式输出前即创建并设为当前节点（UI 可立即“进入”新节点进行
-        流式输出）；出错时回滚该节点。emit 会收到 node_created / stream /
-        tool / status / done / error 事件。API 错误或无回答时返回 None。
+        流式输出）；**出错时节点也会保留**（写入已生成的部分内容与 node.error），
+        用户可以直接输入「继续」接着生成，不再整轮回滚。emit 会收到
+        node_created / stream / tool / status / done / error 事件。
 
         多模态：待发送图片先上传为 Files API file_id（请求体极小、序列化稳定、
         不破坏前缀缓存），上传失败回退 base64 内联；图片消息自动切换视觉模型。
@@ -1038,30 +1039,26 @@ class ChatController:
         if self._messages_contain_images(messages):
             guard_err = self._ensure_vision_model(emit)
             if guard_err:
-                self.pending_images = this_turn_images + self.pending_images
                 emit(ControllerEvent.error(guard_err))
-                self._discard_node(node)
-                return None
+                return self._finalize_interrupted(node, guard_err, emit)
             limit_err = self._validate_request_images(node)
             if limit_err:
-                self.pending_images = this_turn_images + self.pending_images
                 emit(ControllerEvent.error(limit_err))
-                self._discard_node(node)
-                return None
+                return self._finalize_interrupted(node, limit_err, emit)
 
         # 请求体大小预检（仅内联 base64 回退路径会产生大请求体）
         inline_bytes = collect_inline_bytes(messages)
         if inline_bytes > VISION_REQUEST_MAX_BYTES:
-            self.pending_images = this_turn_images + self.pending_images
-            emit(ControllerEvent.error(
+            size_err = (
                 f"图片 base64 总量超限（约 {inline_bytes // 1024 // 1024} MiB "
                 f"> {VISION_REQUEST_MAX_BYTES // 1024 // 1024} MiB），"
                 "请减少图片数量或压缩后重试"
-            ))
-            self._discard_node(node)
-            return None
+            )
+            emit(ControllerEvent.error(size_err))
+            return self._finalize_interrupted(node, size_err, emit)
 
         final_answer: Optional[str] = None
+        accumulated_content = ""
         accumulated_reasoning = ""
         accumulated_in_tok = 0
         accumulated_out_tok = 0
@@ -1070,10 +1067,12 @@ class ChatController:
         tool_messages: List[Dict] = []
         file_degraded = False  # file_id 失效降级重试标志（只重试一次）
 
-        def _restore_pending() -> None:
-            """发送失败时把本轮图片放回待发送队列（下次发送自动重试上传）。"""
-            if this_turn_images:
-                self.pending_images = this_turn_images + self.pending_images
+        def _on_chunk(content_delta: str, reasoning_delta: str) -> None:
+            """累积本轮正文（出错时也要落盘到节点）+ 转发 UI。"""
+            nonlocal accumulated_content
+            if content_delta:
+                accumulated_content += content_delta
+            emit(ControllerEvent.stream(content_delta, reasoning_delta))
 
         try:
             while True:
@@ -1086,7 +1085,7 @@ class ChatController:
                     thinking_enabled=self.thinking_enabled,
                     reasoning_effort=self.reasoning_effort,
                     tools=self.llm_tools,
-                    on_chunk=lambda c, r: emit(ControllerEvent.stream(c, r)),
+                    on_chunk=_on_chunk,
                 )
                 if sr.error:
                     # file_id 失效兜底：消息含 file 块且尚未降级过时，清掉 file_id 用 base64 重试一次
@@ -1100,17 +1099,27 @@ class ChatController:
                         # 降级后重新预检 base64 总量
                         inline_bytes = collect_inline_bytes(messages)
                         if inline_bytes > VISION_REQUEST_MAX_BYTES:
-                            _restore_pending()
-                            emit(ControllerEvent.error(
-                                "降级后图片 base64 总量超限，无法发送"
-                            ))
-                            self._discard_node(node)
-                            return None
+                            degrade_err = "降级后图片 base64 总量超限，无法发送"
+                            emit(ControllerEvent.error(degrade_err))
+                            return self._finalize_interrupted(
+                                node, degrade_err, emit,
+                                content=accumulated_content,
+                                reasoning=accumulated_reasoning,
+                                tool_messages=tool_messages,
+                            )
                         continue
-                    _restore_pending()
                     emit(ControllerEvent.error(sr.error))
-                    self._discard_node(node)
-                    return None
+                    return self._finalize_interrupted(
+                        node, sr.error, emit,
+                        content=accumulated_content,
+                        # 失败轮的思考只在 sr 里（成功轮已累加到 accumulated_reasoning）
+                        reasoning=accumulated_reasoning + (sr.reasoning or ""),
+                        input_tokens=accumulated_in_tok + sr.input_tokens,
+                        output_tokens=accumulated_out_tok + sr.output_tokens,
+                        cache_hit_tokens=accumulated_cache_hit + sr.cache_hit_tokens,
+                        cache_miss_tokens=accumulated_cache_miss + sr.cache_miss_tokens,
+                        tool_messages=tool_messages,
+                    )
 
                 reasoning = sr.reasoning or ""
                 if reasoning:
@@ -1170,14 +1179,31 @@ class ChatController:
                     final_answer = sr.content
                     break
 
-                _restore_pending()
-                emit(ControllerEvent.error("回答生成失败，请重试"))
-                self._discard_node(node)
-                return None
-        except Exception:
-            # 未预期的异常：回滚前置创建的节点后重新抛出（由调用方显示错误）
-            _restore_pending()
-            self._discard_node(node)
+                empty_err = "回答生成失败，请重试"
+                emit(ControllerEvent.error(empty_err))
+                return self._finalize_interrupted(
+                    node, empty_err, emit,
+                    content=accumulated_content,
+                    reasoning=accumulated_reasoning,
+                    input_tokens=accumulated_in_tok,
+                    output_tokens=accumulated_out_tok,
+                    cache_hit_tokens=accumulated_cache_hit,
+                    cache_miss_tokens=accumulated_cache_miss,
+                    tool_messages=tool_messages,
+                )
+        except Exception as e:
+            # 未预期的异常：节点仍然保留（含已生成的部分内容），
+            # 异常继续抛给调用方显示（调用方负责提示用户）
+            self._finalize_interrupted(
+                node, str(e) or e.__class__.__name__, emit,
+                content=accumulated_content,
+                reasoning=accumulated_reasoning,
+                input_tokens=accumulated_in_tok,
+                output_tokens=accumulated_out_tok,
+                cache_hit_tokens=accumulated_cache_hit,
+                cache_miss_tokens=accumulated_cache_miss,
+                tool_messages=tool_messages,
+            )
             raise
 
         title = generate_conversation_title(self.client, user_input)
@@ -1288,7 +1314,8 @@ class ChatController:
             return None
         return (
             f"当前模型 {self.current_model} 不支持图片理解，"
-            f"请先 /set model flash 切换后重试（或移除图片）"
+            f"请先 /set model flash 切换后重试（或移除图片）；"
+            f"本轮提问与图片已保存在该节点，切换后直接继续即可"
         )
 
     def _attachments_for_node(self, node: ConversationNode) -> List[ImageAttachment]:
@@ -1365,10 +1392,45 @@ class ChatController:
         self.tree.current_node = node
         return node
 
-    def _discard_node(self, node: ConversationNode) -> None:
-        """出错时回滚前置创建的节点（连带重置当前节点）。"""
-        if node.id in self.tree.nodes:
-            self.tree.delete_node(node.id)
+    def _finalize_interrupted(
+        self,
+        node: ConversationNode,
+        error: str,
+        emit: EventSink,
+        *,
+        content: str = "",
+        reasoning: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
+        tool_messages: Optional[List[Dict]] = None,
+    ) -> ConversationNode:
+        """生成失败/中断时保留节点（含已生成的部分内容），供用户接着「继续」。
+
+        历史行为是「出错即回滚节点」，结果是半截回答连同提问一起消失，用户
+        只能从头再问。现在改为落盘：已流式生成的部分正文/思考、已产生的
+        token 用量、以及已经跑完的工具调用/结果都写进节点，并在 node.error
+        记下失败原因；UI 据此在树上标「⚠ 中断」、在正文里提示可继续。空回答
+        节点不会再作为 assistant 消息发回模型（ConversationNode.get_messages
+        只在 assistant_msg 非空时追加），所以下一轮输入「继续」时历史仍然合法。
+        """
+        node.assistant_msg = content
+        node.reasoning = reasoning
+        node.error = error
+        node.input_tokens = input_tokens
+        node.output_tokens = output_tokens
+        node.cache_hit_tokens = cache_hit_tokens
+        node.cache_miss_tokens = cache_miss_tokens
+        if tool_messages:
+            # 保留已完成的工具轮：用户「继续」时模型能接着用已检索到的资料
+            node.tool_messages = tool_messages
+        # 本节点消息可能是在流式输出前构建并缓存的（缺本节点 assistant 消息），
+        # 失效缓存让下一次发送重建完整消息链。
+        node.cached_messages = None
+        self.tree.current_node = node
+        emit(ControllerEvent.done(node))
+        return node
 
     # ---------------- 多模态：Files API 文件管理 ----------------
 

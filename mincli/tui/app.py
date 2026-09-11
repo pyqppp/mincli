@@ -20,6 +20,7 @@ from mincli.markdown_safe import _patch_markdown_it
 
 _patch_markdown_it()
 
+from rich.markup import escape as _markup_escape
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -285,6 +286,17 @@ class ChatApp(App):
         if text:
             self.notify(f"已复制 {len(text)} 字符")
 
+    def notify(self, message, **kwargs) -> None:
+        """统一关闭 markup 解析。
+
+        通知里常有路径/模型名/工作流名/工具参数这类用户或模型可控的文本，
+        形如 `x="y z"` 的片段会被 Textual 当样式标签解析，
+        直接抛 MarkupError: Expected markup value（显示层报错）。
+        通知内容不需要富文本，全部按纯文本渲染。
+        """
+        kwargs.setdefault("markup", False)
+        super().notify(message, **kwargs)
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
@@ -300,12 +312,13 @@ class ChatApp(App):
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
         # 悬停弹窗放独立布局层（见 chat.tcss #import-popup），固定显示在状态条上方
-        yield Static("", id="import-popup")
+        # markup=False：这里显示文件名/工作流名，方括号或 `x="y"` 会被当标签解析而报错
+        yield Static("", id="import-popup", markup=False)
         # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停显示完整列表），右=下次输入估算
         with Horizontal(id="usage-bar"):
-            yield Static("", id="usage-left")
-            yield Static("", id="usage-center")
-            yield Static("", id="usage-right")
+            yield Static("", id="usage-left", markup=False)
+            yield Static("", id="usage-center", markup=False)
+            yield Static("", id="usage-right", markup=False)
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -536,18 +549,25 @@ class ChatApp(App):
             tree_w.root.label = "（空）"
             return
         current_id = self.ctrl.tree.current_node.id if self.ctrl.tree.current_node else None
-        tree_w.root.label = f"main: {root.title}"
+        root_label = f"main: {root.title}"
+        if getattr(root, "error", ""):
+            root_label += "  ⚠ 中断"
+        tree_w.root.label = _markup_escape(root_label)
         tree_w.root.data = "main"
         tree_w.root.expand()
         for child in root.children:
             self._add_tree_node(tree_w.root, child, current_id)
 
     def _add_tree_node(self, parent, node, current_id) -> None:
+        # 标题由模型生成/用户输入：Tree 标签会按 markup 解析，不转义的话
+        # 形如 [b]…[/b]、[xxx="yyy"] 的标题会被当成样式标签吃掉，显示成截断文本
         if node.id == current_id:
             label = f"➤ {node.id}: {node.title}"
         else:
             label = f"{node.id}: {node.title}"
-        n = parent.add(label, data=node.id)
+        if getattr(node, "error", ""):
+            label += "  ⚠ 中断"  # 生成中断但仍已保存的节点，方便回来「继续」
+        n = parent.add(_markup_escape(label), data=node.id)
         n.expand()
         for child in node.children:
             self._add_tree_node(n, child, current_id)
@@ -665,8 +685,15 @@ class ChatApp(App):
         content = f"# {node.id}: {node.title}\n\n**你：**\n\n{node.user_msg}\n\n"
         if node.reasoning:
             content += "\n\n" + self._build_reasoning_md(node.reasoning) + "\n\n"
+        content += f"**mincli：**\n\n{node.assistant_msg}\n\n"
+        if getattr(node, "error", ""):
+            # 生成中断但已保存的节点：标出失败原因，并提示可以接着让模型继续
+            content += (
+                f"> ⚠️ 生成中断：{node.error}\n>\n"
+                "> 本轮内容已保存，可直接输入「继续」接着生成。\n\n"
+            )
         content += (
-            f"**mincli：**\n\n{node.assistant_msg}\n\n---\n\n"
+            f"---\n\n"
             f"*📊 输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*"
         )
         return content
@@ -1975,9 +2002,13 @@ class ChatApp(App):
             await self._chat_shrink_lists()
         elif ev.kind == "error":
             await self._chat_stream_append(f"\n\n> ⚠️ {ev.message}\n")
+            # 出错不再回滚节点：本轮已保存（含已生成的部分内容），提示可继续
+            await self._chat_stream_append(
+                ">\n> 💾 本轮已保存到当前节点，可直接输入「继续」接着生成。\n"
+            )
             await self._chat_shrink_lists()
-            self._rebuild_tree()  # 出错时节点已被回滚，刷新树移除空节点
-            self._refresh_import_status()  # 发送失败时图片已放回待发送队列，恢复提示行
+            self._rebuild_tree()  # 节点保留，刷新树（中断节点带 ⚠ 标记）
+            self._refresh_import_status()
         elif ev.kind == "done":
             node = ev.node
             if node is not None:
@@ -1992,7 +2023,10 @@ class ChatApp(App):
 
     def _append_error(self, message: str) -> None:
         self._cancel_flush()  # 出错后不再渲染残留流式缓冲
-        asyncio.ensure_future(self._chat_append(f"\n\n> ⚠️ {message}\n"))
+        asyncio.ensure_future(self._chat_append(
+            f"\n\n> ⚠️ {message}\n"
+            ">\n> 💾 本轮已保存到当前节点，可直接输入「继续」接着生成。\n"
+        ))
 
     # ---------------- 确认对话框（供 controller 工具调用） ----------------
 

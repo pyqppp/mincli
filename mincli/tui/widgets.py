@@ -161,6 +161,9 @@ class ToolCard(Static):
     """
 
     def __init__(self, tool_name: str = "", args_lines: list[str] | None = None, **kwargs) -> None:
+        # markup=False：工具名/参数/结果来自模型，形如 query="a b" 的片段
+        # 会被 Textual 当样式标签解析并抛 MarkupError
+        kwargs.setdefault("markup", False)
         super().__init__("", **kwargs)
         self.tool_name = tool_name
         self.args_lines = args_lines or []

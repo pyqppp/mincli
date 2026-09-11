@@ -30,6 +30,14 @@ from textual.widgets._markdown import (
 PASS = 0
 FAIL = 0
 
+# 触发 Textual markup 解析崩溃的文本形态：未闭合的 `[` + 键="跨行值"
+# （markup 的 quoted value 正则 `".*?"` 不跨行；工具参数里的 JSON 数组 +
+# 多行字符串、模型生成的标题都可能是这种形态）
+MARKUP_BAD_TEXT = (
+    '结果：[{"title":"a"}, '
+    'tool_choice="Tools 表 web_search 内置工具 支持情况\ntool_choice 联网搜索"'
+)
+
 
 def check(name: str, cond: bool) -> None:
     global PASS, FAIL
@@ -228,6 +236,91 @@ def test_packaging():
     check("打包：chat.tcss 可被 Textual 读取（启动无 StylesheetError）", readable)
 
 
+def test_markup_safety():
+    """模型/用户可控文本里的 markup 形态不得让 Textual 渲染崩溃。
+
+    背景：Textual 8 的 Static/Toast 默认按 markup 解析字符串，而它的
+    quoted value 正则 `".*?"` 不跨行；内容里只要出现「未闭合的 `[` + 键="跨行值"」
+    （工具参数里的 JSON 数组 + 多行字符串、模型生成的标题等）就会抛
+    MarkupError: Expected markup value，整个渲染/通知报错。
+    """
+    from textual.content import Content
+    from textual.widgets import Static
+
+    from mincli.tui.widgets import ToolCard
+
+    bad = MARKUP_BAD_TEXT
+    rejected = False
+    try:
+        Content.from_markup(bad)
+    except Exception:
+        rejected = True
+    check("markup 解析器确实会拒绝该形态（回归用例有效）", rejected)
+
+    card = ToolCard("tavily_research", [bad])
+    try:
+        card.set_start("tavily_research", [bad])
+        card.set_result(bad)
+        card_ok = True
+    except Exception:
+        card_ok = False
+    check("工具卡片按纯文本渲染（不再抛 MarkupError）", card_ok)
+    check("工具卡片保留原始方括号文本", "tool_choice" in card._render_text())
+
+
+async def test_interrupted_node_kept():
+    """生成中断：节点保留（带 ⚠ 标记与「继续」提示），不再整轮回滚。"""
+
+    class InterruptedController(FakeController):
+        def send_message(self, text, emit):
+            node = self.tree.create_root(text, "前半句", "先想想", "中断标题", 3, 2)
+            node.error = "Error code: 400 - Content Exists Risk"
+            emit(ControllerEvent.node_created(node))
+            emit(ControllerEvent.stream("前半句", "先想想"))
+            emit(ControllerEvent.error(node.error))
+            emit(ControllerEvent.done(node))
+            return node
+
+    ctrl = InterruptedController()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        inp = app.query_one("#chat-input", ChatInput)
+        await pilot.press("写", "个", "长", "回", "答")
+        await pilot.press("enter")
+        for _ in range(40):
+            await pilot.pause()
+
+        source = app._chat_source()
+        check("中断后正文仍在（部分回答未丢）", "前半句" in source)
+        check("中断后提示已保存可继续", "本轮已保存到当前节点" in source)
+        check("中断原因显示在正文里", "Content Exists Risk" in source)
+
+        tree = app.query_one("#tree", Tree)
+        labels = [str(tree.root.label)] + [str(n.label) for n in tree.root.children]
+        check("树中保留中断节点并标 ⚠", any("⚠ 中断" in lb for lb in labels))
+        check("中断节点仍是当前节点", ctrl.tree.current_node is not None
+              and ctrl.tree.current_node.error != "")
+        check("状态条等控件关闭 markup",
+              all(not app.query_one(sel, Static)._render_markup
+                  for sel in ("#usage-left", "#usage-center", "#usage-right",
+                              "#import-popup")))
+
+        # 确认弹窗里是模型生成的命令/文件内容，同样必须按纯文本渲染
+        from mincli.tui.confirm import ConfirmScreen
+
+        app.push_screen(ConfirmScreen("确认", MARKUP_BAD_TEXT))
+        for _ in range(10):
+            await pilot.pause()
+        conf_statics = list(app.screen.query(Static))
+        check("确认弹窗按纯文本渲染（不抛 MarkupError）",
+              bool(conf_statics)
+              and all(not w._render_markup for w in conf_statics))
+        app.pop_screen()
+        for _ in range(5):
+            await pilot.pause()
+        await pilot.press("ctrl+c")
+
+
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
     test_markdown_safety()
@@ -235,6 +328,7 @@ async def main() -> int:
     test_screen_forward_safety()
     test_tool_args_width()
     test_packaging()
+    test_markup_safety()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -794,6 +888,8 @@ async def main() -> int:
               and fake3.tree.current_node is not None)
 
         await pilot3.press("ctrl+c")
+
+    await test_interrupted_node_kept()
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

@@ -51,8 +51,10 @@ class ConfirmScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-box"):
-            yield Static(self._title, id="confirm-title")
-            yield Static(self._text, id="confirm-text")
+            # markup=False：确认内容含模型生成的命令/文件内容/工具参数，
+            # 其中的 [xxx="yyy"] 会被 Textual 当样式标签解析而报错
+            yield Static(self._title, id="confirm-title", markup=False)
+            yield Static(self._text, id="confirm-text", markup=False)
             with Horizontal(id="confirm-buttons"):
                 yield Button("是", variant="primary", id="confirm-yes")
                 yield Button("否", id="confirm-no")
