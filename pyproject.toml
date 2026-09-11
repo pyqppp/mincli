@@ -27,3 +27,7 @@ include = ["mincli*"]
 
 [tool.setuptools.package-data]
 mincli = ["*.md"]
+# 子包的数据文件必须单独声明（键是包名，值相对该包目录）。
+# 漏声明 mincli.tui 会让 chat.tcss 不进 wheel/sdist，
+# 安装后 `mincli chat` 启动即 StylesheetError（回归测试见 tests/test_tui.py 的 test_packaging）。
+"mincli.tui" = ["*.tcss"]

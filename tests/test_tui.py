@@ -156,12 +156,85 @@ class FakeController(ChatController):
         return None
 
 
+def test_packaging():
+    """打包回归：运行时读取的非 .py 数据文件必须随 wheel/sdist 一起安装。
+
+    背景：pyproject 的 package-data 键是「包名」，子包数据要单独声明；
+    mincli.tui 漏声明导致 chat.tcss 不进安装包，`pip install .` 后
+    `mincli chat` 启动即 StylesheetError: unable to read CSS file。
+    """
+    import fnmatch
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+    # 解析 [tool.setuptools.package-data]（容忍单行/多行数组）
+    declared: dict[str, list[str]] = {}
+    head = re.search(r"(?m)^\[tool\.setuptools\.package-data\]\s*$", text)
+    if head:
+        body = []
+        for line in text[head.end():].splitlines():
+            if line.lstrip().startswith("["):
+                break
+            body.append(line)
+        for km in re.finditer(
+            r'(?m)^\s*"?([\w.\-]+)"?\s*=\s*\[(.*?)\]', "\n".join(body), re.S
+        ):
+            declared[km.group(1)] = re.findall(r'["\']([^"\']+)["\']', km.group(2))
+
+    def matches(rel: str, pattern: str) -> bool:
+        # 与 setuptools 的 glob 一致：* 不跨目录分隔符
+        rel_parts, pat_parts = rel.split("/"), pattern.split("/")
+        return len(rel_parts) == len(pat_parts) and all(
+            fnmatch.fnmatchcase(a, b) for a, b in zip(rel_parts, pat_parts)
+        )
+
+    def covered(rel: str) -> bool:
+        return any(
+            matches(rel, f"{pkg.replace('.', '/')}/{pat}")
+            for pkg, patterns in declared.items()
+            for pat in patterns
+        )
+
+    data_files = sorted(
+        f"{p.parent.relative_to(root).as_posix()}/{p.name}"
+        for p in (root / "mincli").rglob("*")
+        if p.is_file()
+        and "__pycache__" not in p.parts
+        and p.suffix not in {".py", ".pyc"}
+        and p.name != ".DS_Store"
+    )
+    uncovered = [f for f in data_files if not covered(f)]
+    check("打包：package-data 覆盖全部运行时数据文件",
+          bool(data_files) and not uncovered)
+    if uncovered:
+        print(f"       未声明: {uncovered}")
+
+    # chat.tcss 必须与 app.py 同目录，且能像 Textual 启动时那样被读取
+    import mincli.tui.app as tui_app
+
+    css = Path(tui_app.__file__).resolve().parent / Path(str(ChatApp.CSS_PATH)).name
+    check("打包：chat.tcss 与 app.py 同目录存在", css.is_file())
+    readable = False
+    if css.is_file():
+        try:
+            from textual.css.stylesheet import Stylesheet
+
+            Stylesheet().read_all([css])
+            readable = True
+        except Exception as exc:  # pragma: no cover - 防御分支
+            print(f"       读取 CSS 失败: {exc!r}")
+    check("打包：chat.tcss 可被 Textual 读取（启动无 StylesheetError）", readable)
+
+
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
     test_markdown_safety()
     test_selection_safety()
     test_screen_forward_safety()
     test_tool_args_width()
+    test_packaging()
     fake = FakeController()
     app = ChatApp(controller=fake)
     async with app.run_test(size=(100, 30)) as pilot:

@@ -1,0 +1,4 @@
+# sdist 必须带上运行时读取的数据文件，否则从源码包安装同样缺文件。
+include readme.md
+include readme.zh.md
+recursive-include mincli *.md *.tcss
