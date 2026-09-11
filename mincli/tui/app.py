@@ -96,7 +96,7 @@ _patch_textual_screen_forward_event()
 
 from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
-    MODEL_V4_FLASH,
+    MODEL_FLASH,
     BALANCE_REFRESH_SECONDS,
     PREVIEW_ASSISTANT_MSG_LEN,
     PREVIEW_USER_MSG_LEN,
@@ -111,7 +111,7 @@ from mincli.config import (
     save_mcp_servers,
 )
 from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
-from mincli.helpers import split_path_args
+from mincli.helpers import open_path_with_os, split_path_args
 from mincli.tools.files import FilesAPIError
 from mincli.tools.images import image_placeholder_text
 from mincli.tui.confirm import ConfirmScreen
@@ -139,7 +139,7 @@ COMMAND_HELP: dict[str, str] = {
     "/view": "用编辑器打开当前回答",
     "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
     "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
-    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|vision|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show\n修改运行配置",
+    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show\n修改运行配置",
     "/tree": "显示完整对话树",
     "/info": "用法: /info [节点ID]\n查看节点详情（默认当前节点）",
     "/up": "返回父节点",
@@ -322,7 +322,7 @@ class ChatApp(App):
                 client=OpenAI(api_key=api_key, base_url="https://api.deepseek.com"),
                 default_system=DEFAULT_SYSTEM_PROMPT,
                 default_temperature=1.0,
-                default_model=MODEL_V4_FLASH,
+                default_model=MODEL_FLASH,
             )
         self.ctrl.confirm = self._confirm
         self.query_one("#tree", Tree).auto_expand = False  # 点击节点名只切换节点，不收起/展开
@@ -1013,11 +1013,15 @@ class ChatApp(App):
         if filepath is None:
             self.notify("当前节点没有可打开的回答内容", severity="warning")
             return
-        try:
-            subprocess.Popen(["open", filepath])
-            self.notify(f"已用编辑器打开节点 {node.id} 的回答")
-        except Exception as e:
-            self.notify(f"打开文件失败: {e}", severity="error")
+        err = open_path_with_os(filepath)
+        if err:
+            self.notify(
+                f"打开文件失败（{err}）；文件路径: {filepath}",
+                severity="warning",
+                timeout=8,
+            )
+        else:
+            self.notify(f"已用系统默认程序打开节点 {node.id} 的回答")
 
     async def _cmd_help(self) -> None:
         await self._chat_append(
@@ -1036,7 +1040,7 @@ class ChatApp(App):
 **配置命令**
 - `/set system <提示词>` — 修改系统提示词
 - `/set temp <值>` — 设置温度（0.0~2.0）
-- `/set model <flash|pro|vision|模型名>` — 切换模型
+- `/set model <flash|pro|模型名>` — 切换模型（flash 支持图片理解；vision 为 flash 的旧别名）
 - `/set thinking <on|off>` — 开关思考模式
 - `/set effort <low|high|max>` — 推理强度
 - `/set audit <1-4>` — 审核层级
@@ -1045,7 +1049,7 @@ class ChatApp(App):
 - `/set show` — 显示当前配置
 
 **多模态（图片理解）**
-- `/import <路径或URL> [...]` — 图片文件/图片 URL 自动转为待发送图片（发送时自动附带；图片消息自动切换视觉模型 deepseek-v4-flash-vision-exp）
+- `/import <路径或URL> [...]` — 图片文件/图片 URL 自动转为待发送图片（发送时自动附带；图片理解仅 deepseek-flash 支持，其他模型会提示切换）
 - `/files list|delete <ID>` — 查看/删除 Files API 已上传的图片文件
 
 **多模型**
@@ -1070,7 +1074,7 @@ class ChatApp(App):
     async def _cmd_set(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         ctrl = self.ctrl
-        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|vision|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set file_confirm <on|off> | /set show"
+        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set file_confirm <on|off> | /set show"
         if len(parts) < 2:
             self.notify(usage, severity="warning")
             return
@@ -1502,7 +1506,7 @@ class ChatApp(App):
                 "提炼为可复用工作流并长期保存（自动把每次会变化的数据抽成 {变量}）\n"
                 "- `/wf use <名>` — 挂载到下一次输入：发送下一条消息即按工作流执行（一次性）\n"
                 "- `/wf run <名> [键=值...]` — 立即按工作流执行；未提供值的变量由模型结合当前情况推断\n"
-                "- `/wf edit <名> <修改要求>` — 让模型修订规范；macOS 下不带要求则用系统编辑器打开修改\n"
+                "- `/wf edit <名> <修改要求>` — 让模型修订规范；不带要求时用系统默认编辑器打开，保存后自动回写（跨平台）\n"
                 "- 工作流长期保存于 `~/.mincli/workflows.json`，重启后仍在"
             )
             return
@@ -1720,13 +1724,14 @@ class ChatApp(App):
         else:
             self.notify(f"删除失败：工作流「{name}」不存在", severity="warning")
 
-    # ---------------- 工作流编辑器回写（macOS） ----------------
+    # ---------------- 工作流编辑器回写（跨平台） ----------------
 
     def _wf_start_editor(self, name: str) -> None:
-        """macOS：用系统编辑器打开工作流临时文件，保存改动后自动回写。"""
-        if sys.platform != "darwin":
-            self.notify("当前平台请用 /wf edit <名> <修改要求> 由模型修订", severity="warning")
-            return
+        """用系统默认编辑器打开工作流临时文件，保存改动后自动回写（跨平台）。
+
+        macOS `open -e`（强制文本编辑器）；Windows `os.startfile`；
+        其他 Unix `xdg-open`。失败时提示改用模型修订方式。
+        """
         ctrl = self.ctrl
         if ctrl is None:
             return
@@ -1734,12 +1739,13 @@ class ChatApp(App):
         if path is None:
             self.notify(f"工作流「{name}」不存在", severity="warning")
             return
-        try:
-            subprocess.Popen(["open", "-e", path])
-        except Exception as e:
+        err = open_path_with_os(path, prefer_text_editor=True)
+        if err:
             self.notify(
-                f"打开编辑器失败: {e}（可改用 /wf edit {name} <修改要求>）",
-                severity="error",
+                f"打开编辑器失败（{err}）；可改用 /wf edit {name} <修改要求> "
+                f"由模型修订，或手动编辑 {path}",
+                severity="warning",
+                timeout=8,
             )
             return
         self._wf_stop_edit()

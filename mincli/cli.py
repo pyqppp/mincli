@@ -16,19 +16,21 @@ from mincli.tools.files import FilesAPIError
 from mincli.helpers import split_path_args
 
 from mincli.config import (
-    MODEL_V4_FLASH,
-    MODEL_V4_PRO,
-    MODEL_V4_VISION,
+    MODEL_FLASH,
+    MODEL_PRO,
+    PRICING_PATH,
     SAVE_BASE_DIR,
     DEFAULT_SYSTEM_PROMPT,
     SYSTEM_PROMPT_SOURCE,
     MODELS_AVAILABLE,
     API_PROVIDERS,
     load_models,
+    normalize_model_name,
     register_model,
     get_model_base_url,
     get_model_key_var,
 )
+from mincli.pricing import image_tokens_per_image, load_pricing
 
 app = typer.Typer(help="mincli - 树状对话 AI 助手")
 
@@ -44,15 +46,12 @@ def resolve_api_key(provider: str, model: str) -> str:
 
 
 def resolve_model_name(model: str) -> str:
-    """把简写 flash/pro/vision 映射为完整模型名。"""
-    arg = (model or "").lower()
-    if arg in ("flash", "v4-flash", "f"):
-        return MODEL_V4_FLASH
-    if arg in ("pro", "v4-pro", "p"):
-        return MODEL_V4_PRO
-    if arg in ("vision", "v-flash-vision", "v4-vision"):
-        return MODEL_V4_VISION
-    return model
+    """把简写/旧模型名映射为现役完整模型名。
+
+    flash/f → deepseek-flash；pro/p → deepseek-v4-pro；
+    vision 等识图旧名 → deepseek-flash（图片能力已并入 Flash）。
+    """
+    return normalize_model_name(model)
 
 
 def build_controller(
@@ -457,10 +456,16 @@ def info() -> None:
     registered = load_models()
     print("mincli 配置")
     print(f"  API Key: {'已配置 ✓' if api_key else '未配置 ✗'} (DEEPSEEK_API_KEY)")
-    print(f"  模型: {MODEL_V4_FLASH} / {MODEL_V4_PRO} / {MODEL_V4_VISION}")
+    print(f"  模型: {MODEL_FLASH} / {MODEL_PRO}（图片理解仅 {MODEL_FLASH} 支持）")
     if registered:
         print(f"  已注册模型: {', '.join(registered.keys())}")
     print(f"  保存路径: {SAVE_BASE_DIR}")
+    pricing = load_pricing()
+    print(
+        f"  定价配置: {pricing['path'] or '内置默认'}"
+        f"（可编辑 {PRICING_PATH} 覆盖价格/峰谷/图片 token）"
+    )
+    print(f"  图片 token 估算: {image_tokens_per_image(pricing)} / 张")
     print(f"  系统提示词: {SYSTEM_PROMPT_SOURCE or '内置兜底'}（{len(DEFAULT_SYSTEM_PROMPT)} 字符）")
     print("  模式: 树状对话 (Textual TUI)")
     print("  多模型: `mincli register <模型名> <URL>` 注册 / `mincli models` 查看")

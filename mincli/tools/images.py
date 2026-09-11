@@ -4,9 +4,10 @@
 与 DeepSeek API 的行为一致（API 也按内容而非扩展名/声明 MIME 判断，
 实测 JPEG 内容声明为 png 仍可正常识别，BMP 会被 400 拒绝）。
 
-token 估算基于真实 API 实测校准（见 config.VISION_SIZE_EXTRA_ANCHORS 注释）：
-每图固定开销 117 token，尺寸附加额按面积线性插值、封顶 240，总计封顶 384；
-仅用于 /compact 前后统计与 usage 缺失时的兜底估算，实际计费以接口 usage 为准。
+token 估算采用「每图固定值」（默认 1024 = 官方单图上限，可在 pricing.json
+通过 image_tokens 调整）：官方文档说明每张图片缩放后 token 数存在上限，
+且官方未公开精确换算公式；这里只用于状态条与压缩前后统计的近似估算，
+实际计费以接口返回的 usage 为准。
 """
 
 from __future__ import annotations
@@ -17,14 +18,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from mincli.config import (
-    VISION_BASE_IMAGE_TOKENS,
     VISION_DEFAULT_DETAIL,
-    VISION_IMAGE_MAX_BYTES,
-    VISION_IMAGE_TOKEN_CAP,
-    VISION_SIZE_EXTRA_ANCHORS,
-    VISION_SIZE_EXTRA_CAP,
+    VISION_FILE_ID_IMAGE_MAX_BYTES,
+    VISION_INLINE_IMAGE_MAX_BYTES,
     VISION_URL_MAX_CHARS,
 )
+from mincli.pricing import image_tokens_per_image
 
 # 图片格式支持：API 按内容识别，这里本地先行校验（避免 400）
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -176,32 +175,16 @@ def encode_data_url(data: bytes, fmt: str) -> str:
     return f"data:image/{fmt};base64,{b64}"
 
 
-def _interp_extra(area: float) -> float:
-    """按实测锚点表线性插值出尺寸附加 token；封顶 VISION_SIZE_EXTRA_CAP。"""
-    prev_x, prev_y = 0.0, 0.0
-    for x, y in VISION_SIZE_EXTRA_ANCHORS:
-        if area <= x:
-            if x == prev_x:
-                return prev_y
-            return prev_y + (y - prev_y) * (area - prev_x) / (x - prev_x)
-        prev_x, prev_y = x, y
-    return min(prev_y, float(VISION_SIZE_EXTRA_CAP))
-
-
 def estimate_image_tokens(
     width: Optional[int], height: Optional[int], detail: str = VISION_DEFAULT_DETAIL
 ) -> int:
-    """估算一张图片消耗的 token（近似；实际以接口 usage 为准）。"""
-    if not width or not height:
-        return VISION_IMAGE_TOKEN_CAP
-    w, h = float(width), float(height)
-    if detail == "low":
-        # 官方：low 缩放至 512×512（保持长宽比）
-        scale = min(512.0 / w, 512.0 / h, 1.0)
-        w, h = w * scale, h * scale
-    area = w * h
-    total = VISION_BASE_IMAGE_TOKENS + int(round(_interp_extra(area)))
-    return min(VISION_IMAGE_TOKEN_CAP, total)
+    """估算一张图片消耗的 token（固定值/图；实际以接口 usage 为准）。
+
+    官方文档：每张图片缩放后 token 数存在上限（1024）。为便于随官方调整，
+    这里不再按尺寸插值，统一用 pricing.json 的 ``image_tokens``（默认 1024）。
+    width/height/detail 仅保留参数兼容（不再影响估算）。
+    """
+    return image_tokens_per_image()
 
 
 # ---------------- 附件构造 ----------------
@@ -220,9 +203,10 @@ def make_path_attachment(
     if not os.path.isfile(path):
         raise ValueError(f"不是文件: {path}")
     size = os.path.getsize(path)
-    if size > VISION_IMAGE_MAX_BYTES:
+    if size > VISION_FILE_ID_IMAGE_MAX_BYTES:
         raise ValueError(
-            f"图片过大（{size / 1024 / 1024:.1f} MiB > 32 MiB 内联上限）"
+            f"图片过大（{size / 1024 / 1024:.1f} MiB > "
+            f"{VISION_FILE_ID_IMAGE_MAX_BYTES // 1024 // 1024} MiB 单图上限）"
         )
     with open(path, "rb") as f:
         data = f.read()
@@ -257,7 +241,7 @@ def make_url_attachment(
         detail=detail,
         name=name[:120],
         is_url=True,
-        tokens_est=VISION_IMAGE_TOKEN_CAP,
+        tokens_est=estimate_image_tokens(None, None, detail),
     )
 
 
@@ -274,6 +258,16 @@ def build_image_block(att: ImageAttachment) -> dict:
             "image_url": {"url": att.source, "detail": att.detail},
         }
     # 本地路径：读取并 base64 内联（上传失败/未上传时的回退路径）
+    if att.size_bytes and att.size_bytes > VISION_INLINE_IMAGE_MAX_BYTES:
+        # 超过内联单图上限：仅 Files API 的 file_id 可承载（本地已尽力上传）
+        return {
+            "type": "text",
+            "text": (
+                f"[图片: {att.name}（{att.size_bytes / 1024 / 1024:.1f} MiB 超过 "
+                f"{VISION_INLINE_IMAGE_MAX_BYTES // 1024 // 1024} MiB 内联上限，"
+                "上传 Files API 失败，未发送）]"
+            ),
+        }
     path = os.path.expanduser(att.source)
     try:
         with open(path, "rb") as f:
@@ -297,6 +291,30 @@ def image_placeholder_text(att: ImageAttachment) -> str:
     if att.width and att.height:
         return f"[图片: {att.name} ({att.width}x{att.height})]"
     return f"[图片: {att.name}]"
+
+
+def oversize_inline_attachments(attachments: List[ImageAttachment]) -> List[str]:
+    """返回会走内联路径（无 file_id、非外部 URL）且超过 32MiB 单图上限的图片名。
+
+    这类图片只能通过 Files API 的 file_id 发送；若上传失败则无法发送。
+    """
+    return [
+        att.name
+        for att in attachments
+        if not att.file_id
+        and not att.is_url
+        and att.size_bytes
+        and att.size_bytes > VISION_INLINE_IMAGE_MAX_BYTES
+    ]
+
+
+def oversize_side_attachments(attachments: List[ImageAttachment], limit: int) -> List[str]:
+    """返回单边超过 limit 像素的图片名（尺寸未知的跳过，交给 API 校验）。"""
+    out: List[str] = []
+    for att in attachments:
+        if att.width and att.height and max(att.width, att.height) > limit:
+            out.append(f"{att.name}（{att.width}x{att.height}）")
+    return out
 
 
 def collect_inline_bytes(messages: List[Dict]) -> int:

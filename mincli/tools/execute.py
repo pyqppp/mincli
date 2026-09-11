@@ -15,7 +15,7 @@ from mincli.config import (
     EXEC_DEFAULT_TIMEOUT,
     EXEC_MAX_OUTPUT,
     EXEC_MAX_TIMEOUT,
-    MODEL_V4_FLASH,
+    MODEL_FLASH,
 )
 from mincli.streaming import stream_response
 from mincli.tools.thinking import AUDIT_SYSTEM_PROMPT
@@ -281,7 +281,7 @@ def audit_command(
         {"role": "user", "content": f"请审核以下命令：\n\n```bash\n{command}\n```"},
     ]
     sr = stream_response(
-        client, audit_messages, MODEL_V4_FLASH,
+        client, audit_messages, MODEL_FLASH,
         0.3, command,
         thinking_enabled=True,
         reasoning_effort="high",

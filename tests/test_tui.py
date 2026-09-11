@@ -437,7 +437,13 @@ async def main() -> int:
 
         await type_command("/set model vision")
         await pilot.pause()
-        check("命令：/set model vision", fake.current_model == "deepseek-v4-flash-vision-exp")
+        check("命令：/set model vision 映射为 flash", fake.current_model == "deepseek-flash")
+        await type_command("/set model pro")
+        await pilot.pause()
+        check("命令：/set model pro", fake.current_model == "deepseek-v4-pro")
+        await type_command("/set model flash")
+        await pilot.pause()
+        check("命令：/set model flash", fake.current_model == "deepseek-flash")
 
         await type_command("/files list")
         for _ in range(10):

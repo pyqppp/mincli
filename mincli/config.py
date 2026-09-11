@@ -7,16 +7,46 @@ from dotenv import load_dotenv
 load_dotenv()
 load_dotenv(os.path.expanduser("~/.mincli/.env"))
 
-MODEL_V4_FLASH = "deepseek-v4-flash"
-MODEL_V4_PRO = "deepseek-v4-pro"
-MODEL_V4_VISION = "deepseek-v4-flash-vision-exp"
-DEFAULT_MODEL = MODEL_V4_FLASH
+# ---------------- 模型（2026-09 官方文档） ----------------
+# deepseek-flash   = DeepSeek-V4.1-Flash（原生多模态，支持图片理解）
+# deepseek-v4-pro  = DeepSeek-V4-Pro-0813（不支持图片）
+MODEL_FLASH = "deepseek-flash"
+MODEL_PRO = "deepseek-v4-pro"
+DEFAULT_MODEL = MODEL_FLASH
 
-# 内置模型映射：model_name -> base_url（OpenAI 兼容 API）
+# 支持图片理解的模型（仅 Flash；Pro 不支持，收到图片时应提示用户切换）
+VISION_MODELS = (MODEL_FLASH,)
+
+# 模型简写 / 已下线旧名 → 现役模型名（旧名自动改写为现役名，见 normalize_model_name）
+MODEL_ALIASES = {
+    "flash": MODEL_FLASH,
+    "f": MODEL_FLASH,
+    "v4-flash": MODEL_FLASH,
+    "deepseek-v4-flash": MODEL_FLASH,
+    "pro": MODEL_PRO,
+    "p": MODEL_PRO,
+    "v4-pro": MODEL_PRO,
+    # 独立识图模型已下线，图片能力并入 Flash
+    "vision": MODEL_FLASH,
+    "v-flash-vision": MODEL_FLASH,
+    "v4-vision": MODEL_FLASH,
+    "deepseek-v4-flash-vision-exp": MODEL_FLASH,
+    # 更早的旧名（2026-07-24 已停止使用）
+    "deepseek-chat": MODEL_FLASH,
+    "deepseek-reasoner": MODEL_FLASH,
+}
+
+
+def normalize_model_name(name: str) -> str:
+    """把简写/已下线的旧模型名归一为现役模型名；未知名称原样返回。"""
+    key = (name or "").strip().lower()
+    return MODEL_ALIASES.get(key, name)
+
+
+# 内置模型映射：model_name -> base_url（OpenAI 兼容 API；官方 base_url 不带 /v1）
 MODELS_AVAILABLE = {
-    MODEL_V4_FLASH: "https://api.deepseek.com/v1",
-    MODEL_V4_PRO: "https://api.deepseek.com/v1",
-    MODEL_V4_VISION: "https://api.deepseek.com/v1",
+    MODEL_FLASH: "https://api.deepseek.com",
+    MODEL_PRO: "https://api.deepseek.com",
 }
 
 # API Provider 映射：provider_name -> 环境变量名
@@ -47,15 +77,29 @@ COMPACT_SOURCE_MAX_CHARS = 150_000  # 送入压缩模型的原文上限（超长
 COMPACT_REASONING_MAX_CHARS = 800   # 每个节点思考过程计入摘要源的长度上限
 COMPACT_TOOL_RESULT_MAX_CHARS = 500  # 每个工具结果计入摘要源的长度上限
 
-# DeepSeek 官方定价（元/百万 tokens，2026-08 峰谷分时版；高峰 = 空闲×2）
-# 高峰时段：北京时间 9:00-12:00、14:00-18:00，其余为空闲时段
-# 结构: 模型名 -> {"hit": (空闲价, 高峰价), "miss": (空闲价, 高峰价), "output": (空闲价, 高峰价)}
+# DeepSeek 官方定价默认值（元/百万 tokens；2026-09-10 V4.1-Flash 上线后降价）
+# 结构: 模型名 -> {"hit": (空闲价, 高峰价), "miss": (...), "output": (...)}
+# 可被 ~/.mincli/pricing.json 覆盖（见 mincli/pricing.py）；高峰时段规则同样可配。
 DEEPSEEK_PRICING: dict = {
-    MODEL_V4_FLASH: {"hit": (0.05, 0.10), "miss": (1.5, 3.0), "output": (4.5, 9.0)},
-    MODEL_V4_PRO: {"hit": (0.15, 0.30), "miss": (4.5, 9.0), "output": (13.5, 27.0)},
-    # 视觉模型与 flash 同价（官方定价表）
-    MODEL_V4_VISION: {"hit": (0.05, 0.10), "miss": (1.5, 3.0), "output": (4.5, 9.0)},
+    MODEL_FLASH: {"hit": (0.02, 0.04), "miss": (1.0, 2.0), "output": (4.0, 8.0)},
+    MODEL_PRO: {"hit": (0.15, 0.30), "miss": (4.5, 9.0), "output": (13.5, 27.0)},
 }
+
+# 高峰时段默认：北京时间（UTC+8）周一至周五 9:00-12:00、14:00-18:00，其余为空闲时段。
+# 官方 2026-09 起高峰仅限工作日（周末全天空闲）。
+DEFAULT_PEAK_CONFIG: dict = {
+    "days": [1, 2, 3, 4, 5],          # ISO 星期：周一=1 … 周日=7
+    "ranges": [[9, 12], [14, 18]],    # [起始小时, 结束小时)，可多段
+    "timezone_offset_hours": 8,       # 高峰判定所用时区（北京时间为 8）
+}
+
+# 图片 token 估算：官方单图上限 1024，按“固定值/图”估算（可在 pricing.json 调整）
+VISION_IMAGE_TOKENS_DEFAULT = 1024
+
+# 定价配置文件（价格、峰谷时段、图片 token 固定值均可在此覆盖）
+PRICING_PATH = os.path.expanduser(
+    os.getenv("MINCLI_PRICING_PATH", "~/.mincli/pricing.json")
+)
 
 # 账户余额轮询刷新间隔（秒）
 BALANCE_REFRESH_SECONDS = 60
@@ -69,26 +113,23 @@ EXEC_DEFAULT_MAX_OUTPUT = 8000     # 输出截断上限（字符），超出时�
 EXEC_MAX_OUTPUT = 50_000           # max_output 参数允许的最大值
 EXEC_ALLOWED_SHELLS = ("sh", "bash", "zsh")
 
-# ---------------- 多模态（图片理解，deepseek-v4-flash-vision-exp） ----------------
-# 官方限制：格式按文件内容识别（不看扩展名/声明 MIME）；图片仅限 user 消息；
-# 内联单图 32MiB、请求体 48MiB、URL ≤8192 字符、单请求 ≤600 图、单边 ≤8192px。
+# ---------------- 多模态（图片理解，deepseek-flash 原生支持） ----------------
+# 官方限制（2026-09）：格式按文件内容识别（不看扩展名/声明 MIME）；图片仅限 user 消息；
+# 内联/URL 单图 32MiB、Files API file_id 单图 64MiB；请求体 48MiB；URL ≤8192 字符；
+# 单请求 ≤600 图；不含 file_id 的图片总量 ≤64MiB、含 file_id 最高 200MiB；
+# 单边 ≤8192px，单请求 ≥15 张时降为 ≤4096px；每图 token 上限 1024。
 VISION_SUPPORTED_FORMATS = ("jpeg", "png", "gif", "webp")
-VISION_IMAGE_MAX_BYTES = 32 * 1024 * 1024   # 内联（base64 / file_data）单图上限
-VISION_REQUEST_MAX_BYTES = 48 * 1024 * 1024  # 请求体上限（内联 base64 回退路径预检）
+VISION_INLINE_IMAGE_MAX_BYTES = 32 * 1024 * 1024   # base64 / 外部 URL 单图上限
+VISION_FILE_ID_IMAGE_MAX_BYTES = 64 * 1024 * 1024  # Files API file_id 单图上限
+VISION_REQUEST_MAX_BYTES = 48 * 1024 * 1024        # 请求体上限（内联 base64 回退路径预检）
+VISION_REQUEST_IMAGES_MAX_COUNT = 600              # 单请求图片数上限
+VISION_REQUEST_INLINE_TOTAL_MAX_BYTES = 64 * 1024 * 1024  # 不含 file_id 的图片总量上限
+VISION_REQUEST_TOTAL_MAX_BYTES = 200 * 1024 * 1024        # 含 file_id 的图片总量上限
+VISION_MAX_SIDE = 8192             # 单图单边最大像素
+VISION_MAX_SIDE_MANY = 4096        # 单请求 ≥ VISION_MANY_IMAGES_THRESHOLD 张时的单边上限
+VISION_MANY_IMAGES_THRESHOLD = 15
 VISION_URL_MAX_CHARS = 8192
-VISION_DEFAULT_DETAIL = "auto"   # low(512²缩放,省token) / auto≈original(最高清晰度)
-# 官方单图 token 上限（docs：缩放后单图 ≤384 token；估算值与实际以接口 usage 为准）
-VISION_IMAGE_TOKEN_CAP = 384
-# 实测校准（真实 API）：每张图片固定开销 117 token（1×1 图亦然）
-VISION_BASE_IMAGE_TOKENS = 117
-# 实测尺寸附加额（面积 px → 附加 token），线性插值、封顶 240：
-# 锚点: 410²=168100→0, 450²=202500→32, 500²=250000→44, 640×480=307200→92,
-#       1000×400=400000→140, 800²=640000→232, 1600×1200=1920000→240
-VISION_SIZE_EXTRA_CAP = 240
-VISION_SIZE_EXTRA_ANCHORS = (
-    (0, 0), (168_100, 0), (202_500, 32), (250_000, 44),
-    (307_200, 92), (400_000, 140), (640_000, 232), (1_920_000, 240),
-)
+VISION_DEFAULT_DETAIL = "auto"   # low(512²缩放,省token) / high=original / auto≈original
 
 MCP_CONFIG_PATH = os.path.expanduser(
     os.getenv("MINCLI_MCP_CONFIG", "~/.mincli/mcp_servers.json")

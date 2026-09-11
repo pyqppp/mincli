@@ -24,7 +24,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
 - ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking mode, reasoning effort mid-conversation
-- 🧩 **Dual Model** — `deepseek-v4-flash` (fast) and `deepseek-v4-pro` (flagship)
+- 🧩 **Two Models** — `deepseek-flash` (DeepSeek-V4.1-Flash: fast, native multimodal image understanding) and `deepseek-v4-pro` (flagship, text only)
 
 ---
 
@@ -139,6 +139,7 @@ What files are here?
 | `DEEPSEEK_API_KEY` | Yes | — | DeepSeek API key |
 | `MINCLI_SAVE_PATH` | No | `~/Documents/mincli_Conversations` | Export directory |
 | `MINCLI_SYSTEM_PROMPT_PATH` | No | Package `mincli/system_prompt.md` | Path to a custom system prompt file |
+| `MINCLI_PRICING_PATH` | No | `~/.mincli/pricing.json` | Pricing / peak-hour / image-token overrides |
 
 ### System prompt
 
@@ -151,6 +152,26 @@ The system prompt lives in its own file and is auto-loaded on every startup. Res
 | 3 | Package `mincli/system_prompt.md` (default, ships with the project) |
 
 Edit the matching file to customize the default prompt — it takes effect on the next launch. `mincli info` shows which prompt file is actually in use. If none of the files are available, a minimal built-in fallback prompt is used.
+
+### Pricing (`~/.mincli/pricing.json`)
+
+DeepSeek prices change often (Flash was cut on 2026-09-10, and peak hours are now **weekdays only**), so prices, peak-hour rules and the image-token estimate are configurable instead of hard-coded. If the file is missing or invalid, the built-in defaults (current official prices) are used:
+
+```json
+{
+  "peak": { "days": [1, 2, 3, 4, 5], "ranges": [[9, 12], [14, 18]], "timezone_offset_hours": 8 },
+  "models": {
+    "deepseek-flash": { "hit": [0.02, 0.04], "miss": [1.0, 2.0], "output": [4.0, 8.0] },
+    "deepseek-v4-pro": { "miss": 4.5, "output": 13.5 }
+  },
+  "image_tokens": 1024
+}
+```
+
+- Prices are CNY per million tokens; each field accepts `[off-peak, peak]` or a single number (same price all day).
+- `models` is merged per model and per field, so you can override just what changed.
+- `peak.days` uses ISO weekdays (Mon=1 … Sun=7); `image_tokens` is the fixed per-image estimate (official cap is 1024).
+- Run `mincli info` to see the effective pricing file and image-token value.
 
 CLI flags:
 
@@ -179,7 +200,7 @@ CLI flags:
 | `/wf rename <old> <new>` / `/wf delete <name>` | Rename / delete a workflow (delete is confirmed) |
 | `/set system <text>` | Change system prompt |
 | `/set temp <value>` | Change temperature |
-| `/set model <flash\|pro>` | Switch model |
+| `/set model <flash\|pro>` | Switch model (`flash` supports image input; `vision` is a legacy alias for flash) |
 | `/set thinking <on\|off>` | Toggle thinking |
 | `/set effort <low\|high\|max>` | Set reasoning effort |
 | `/set file_confirm <on\|off>` | Confirm before writing/editing files (default on; off lets AI write/modify files directly) |

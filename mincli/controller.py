@@ -17,9 +17,8 @@ from typing import Any, Callable, Dict, List, Optional
 from openai import OpenAI
 
 from mincli.config import (
-    MODEL_V4_FLASH,
-    MODEL_V4_PRO,
-    MODEL_V4_VISION,
+    MODEL_FLASH,
+    VISION_MODELS,
     MODELS_AVAILABLE,
     COMPACT_MAX_TOKENS,
     COMPACT_SOURCE_MAX_CHARS,
@@ -27,7 +26,13 @@ from mincli.config import (
     COMPACT_TOOL_RESULT_MAX_CHARS,
     EXEC_DEFAULT_TIMEOUT,
     VISION_DEFAULT_DETAIL,
+    VISION_MAX_SIDE,
+    VISION_MAX_SIDE_MANY,
+    VISION_MANY_IMAGES_THRESHOLD,
+    VISION_REQUEST_IMAGES_MAX_COUNT,
+    VISION_REQUEST_INLINE_TOTAL_MAX_BYTES,
     VISION_REQUEST_MAX_BYTES,
+    VISION_REQUEST_TOTAL_MAX_BYTES,
     WORKFLOWS_PATH,
     WF_EXTRACT_MAX_TOKENS,
     WF_SOURCE_MAX_CHARS,
@@ -36,6 +41,7 @@ from mincli.config import (
     WF_TOOL_RESULT_MAX_CHARS,
     WF_ANSWER_MAX_CHARS,
     load_models,
+    normalize_model_name,
 )
 from mincli.helpers import (
     convert_formulas,
@@ -59,6 +65,8 @@ from mincli.tools.images import (
     looks_like_image_target,
     make_path_attachment,
     make_url_attachment,
+    oversize_inline_attachments,
+    oversize_side_attachments,
 )
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage
@@ -148,7 +156,7 @@ class ChatController:
         client: OpenAI,
         default_system: str,
         default_temperature: float,
-        default_model: str = MODEL_V4_FLASH,
+        default_model: str = MODEL_FLASH,
         thinking_enabled: bool = False,
         reasoning_effort: str = "high",
         auto_start_mcp: bool = True,
@@ -156,7 +164,9 @@ class ChatController:
         self.client = client
         self.current_system = default_system
         self.current_temperature = default_temperature
-        self.current_model = default_model
+        self.current_model = normalize_model_name(default_model)
+        # 从会话文件加载时，若旧模型名被自动改写，这里记录原始名（供 UI 提示）
+        self.model_migrated_from: Optional[str] = None
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
         self.audit_level: int = 1
@@ -264,7 +274,11 @@ class ChatController:
 
         self.current_system = data.get("system_prompt", self.current_system)
         self.current_temperature = data.get("temperature", self.current_temperature)
-        self.current_model = data.get("model", self.current_model)
+        # 旧模型名（deepseek-v4-flash / -vision-exp / chat / reasoner）自动改写为现役名
+        saved_model = data.get("model", self.current_model)
+        self.current_model = normalize_model_name(saved_model)
+        if self.current_model != saved_model:
+            self.model_migrated_from = saved_model
         self.thinking_enabled = data.get("thinking_enabled", False)
         self.reasoning_effort = data.get("reasoning_effort", "high")
         self.audit_level = data.get("audit_level", 1)
@@ -299,19 +313,19 @@ class ChatController:
         self.current_temperature = temp
 
     def set_model(self, model: str) -> bool:
-        arg = model.lower()
-        if arg in ("flash", "v4-flash", "f"):
-            self.current_model = MODEL_V4_FLASH
-            return True
-        if arg in ("pro", "v4-pro", "p"):
-            self.current_model = MODEL_V4_PRO
-            return True
-        if arg in ("vision", "v-flash-vision", "v4-vision"):
-            self.current_model = MODEL_V4_VISION
-            return True
-        # 支持注册的自定义模型名 / 完整模型名（如 gpt-4o）
+        """切换模型：支持 flash/pro/vision 简写与现役/已注册模型名。
+
+        旧模型名（deepseek-v4-flash、deepseek-v4-flash-vision-exp 等）自动
+        改写为现役名（vision → deepseek-flash，因为图片能力已并入 Flash）。
+        """
+        arg = (model or "").strip()
+        normalized = normalize_model_name(arg)
         registered = load_models()
-        if arg in registered or arg in MODELS_AVAILABLE:
+        if normalized in MODELS_AVAILABLE or normalized in registered:
+            self.current_model = normalized
+            return True
+        # 未注册的自定义完整模型名（如 gpt-4o）原样接受
+        if arg in registered:
             self.current_model = arg
             return True
         return False
@@ -1020,12 +1034,18 @@ class ChatController:
         # 构建发送消息（历史链 + 本轮；图片构造为 OpenAI 兼容内容块）
         messages = self.tree.get_messages_for_node(node)
 
-        # 图片消息必须使用视觉模型（flash/pro 自动切换，其他模型报错）
+        # 图片消息：仅 deepseek-flash 支持；其余模型给出明确提示（不自动切换）
         if self._messages_contain_images(messages):
             guard_err = self._ensure_vision_model(emit)
             if guard_err:
                 self.pending_images = this_turn_images + self.pending_images
                 emit(ControllerEvent.error(guard_err))
+                self._discard_node(node)
+                return None
+            limit_err = self._validate_request_images(node)
+            if limit_err:
+                self.pending_images = this_turn_images + self.pending_images
+                emit(ControllerEvent.error(limit_err))
                 self._discard_node(node)
                 return None
 
@@ -1259,18 +1279,79 @@ class ChatController:
         return False
 
     def _ensure_vision_model(self, emit: EventSink) -> Optional[str]:
-        """图片消息要求视觉模型：flash/pro 自动切换；其他模型返回错误信息。"""
-        if self.current_model == MODEL_V4_VISION:
-            return None
-        if self.current_model in (MODEL_V4_FLASH, MODEL_V4_PRO):
-            self.current_model = MODEL_V4_VISION
-            emit(ControllerEvent.status(
-                f"已自动切换到视觉模型 {MODEL_V4_VISION}（图片消息）"
-            ))
+        """检查当前模型是否支持图片理解；不支持时返回错误信息（不自动切换）。
+
+        2026-09 起仅 `deepseek-flash` 支持图片（Pro 不支持），因此不再自动切换
+        模型，而是明确提示用户手动 `/set model flash`。
+        """
+        if self.current_model in VISION_MODELS:
             return None
         return (
-            f"当前模型 {self.current_model} 不支持图片，请先 /set model vision 切换"
+            f"当前模型 {self.current_model} 不支持图片理解，"
+            f"请先 /set model flash 切换后重试（或移除图片）"
         )
+
+    def _attachments_for_node(self, node: ConversationNode) -> List[ImageAttachment]:
+        """当前请求链（根 → node）上的全部图片附件（按发送顺序）。"""
+        return [att for n in self._path_to_root(node) for att in n.user_images]
+
+    def _validate_request_images(self, node: ConversationNode) -> Optional[str]:
+        """按官方限制校验本次请求的图片集；超限返回错误信息，否则 None。
+
+        官方限制（2026-09）：单请求 ≤600 张；内联/URL 单图 ≤32MiB、Files API
+        单图 ≤64MiB；不含 file_id 的图片总量 ≤64MiB、含 file_id ≤200MiB；
+        单边 ≤8192px（单请求 ≥15 张时 ≤4096px）。
+        """
+        attachments = self._attachments_for_node(node)
+        if not attachments:
+            return None
+        count = len(attachments)
+        if count > VISION_REQUEST_IMAGES_MAX_COUNT:
+            return (
+                f"图片数量超限（{count} > {VISION_REQUEST_IMAGES_MAX_COUNT} 张/请求），"
+                "请减少图片后重试"
+            )
+        side_limit = (
+            VISION_MAX_SIDE_MANY
+            if count >= VISION_MANY_IMAGES_THRESHOLD
+            else VISION_MAX_SIDE
+        )
+        oversize_side = oversize_side_attachments(attachments, side_limit)
+        if oversize_side:
+            return (
+                f"图片尺寸超限（单边最大 {side_limit}px"
+                + (f"；{count} 张时降为 {VISION_MAX_SIDE_MANY}px"
+                   if count >= VISION_MANY_IMAGES_THRESHOLD else "")
+                + f"）：{'、'.join(oversize_side[:3])}"
+                + ("…" if len(oversize_side) > 3 else "")
+            )
+        oversize_inline = oversize_inline_attachments(attachments)
+        if oversize_inline:
+            return (
+                "图片超过内联上限（32MiB）且未能上传到 Files API："
+                + "、".join(oversize_inline[:3])
+                + ("…" if len(oversize_inline) > 3 else "")
+                + "；请压缩图片或检查网络后重试"
+            )
+        inline_total = sum(
+            att.size_bytes or 0
+            for att in attachments
+            if not att.file_id and not att.is_url
+        )
+        if inline_total > VISION_REQUEST_INLINE_TOTAL_MAX_BYTES:
+            return (
+                f"内联图片总量超限（{inline_total // 1024 // 1024} MiB > "
+                f"{VISION_REQUEST_INLINE_TOTAL_MAX_BYTES // 1024 // 1024} MiB），"
+                "请减少图片或压缩后重试"
+            )
+        total = sum(att.size_bytes or 0 for att in attachments)
+        if total > VISION_REQUEST_TOTAL_MAX_BYTES:
+            return (
+                f"图片总大小超限（{total // 1024 // 1024} MiB > "
+                f"{VISION_REQUEST_TOTAL_MAX_BYTES // 1024 // 1024} MiB），"
+                "请减少图片后重试"
+            )
+        return None
 
     def _begin_node(self, user_input: str) -> ConversationNode:
         """在流式输出前前置创建新节点并设为当前节点（UI 立即进入新节点）。"""
@@ -1642,7 +1723,7 @@ class ChatController:
             )
             try:
                 resp = self.client.chat.completions.create(
-                    model=MODEL_V4_FLASH,
+                    model=MODEL_FLASH,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.5,
                     max_tokens=30,

@@ -1,6 +1,7 @@
 import os
 import re
 import shlex
+import subprocess
 import sys
 import datetime
 from typing import Optional, List, Dict
@@ -10,9 +11,13 @@ import tiktoken
 from openai import OpenAI
 
 from mincli.config import (
-    MODEL_V4_FLASH, TITLE_MAX_TOKENS, TITLE_MAX_LENGTH,
-    SAVE_BASE_DIR, TEMPERATURE_MIN, TEMPERATURE_MAX,
-    DEEPSEEK_PRICING, VISION_IMAGE_TOKEN_CAP,
+    MODEL_FLASH, TITLE_MAX_TOKENS, TITLE_MAX_LENGTH,
+    SAVE_BASE_DIR,
+)
+from mincli.pricing import (
+    estimate_input_price,
+    image_tokens_per_image,
+    is_peak_hour,
 )
 
 
@@ -22,6 +27,35 @@ def clear_screen() -> None:
         sys.stdout.flush()
     else:
         os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def open_path_with_os(path: str, prefer_text_editor: bool = False) -> Optional[str]:
+    """用系统默认程序打开文件（跨平台）；成功返回 None，失败返回错误信息。
+
+    - macOS：`open`（prefer_text_editor=True 时用 `open -e` 强制文本编辑器）
+    - Windows：`os.startfile`
+    - 其他 Unix：`xdg-open`，不可用时退回 `gio open`
+    """
+    try:
+        if sys.platform == "darwin":
+            cmd = ["open", "-e", path] if prefer_text_editor else ["open", path]
+            subprocess.Popen(cmd)
+            return None
+        if os.name == "nt":
+            startfile = getattr(os, "startfile", None)
+            if startfile is None:
+                return "当前平台不支持自动打开文件"
+            startfile(path)
+            return None
+        for cmd in (["xdg-open", path], ["gio", "open", path]):
+            try:
+                subprocess.Popen(cmd)
+                return None
+            except FileNotFoundError:
+                continue
+        return "未找到 xdg-open / gio，请手动打开文件"
+    except Exception as e:
+        return str(e)
 
 
 # ---------------- 跨平台路径/URL 参数解析（/import、拖入/粘贴导入） ----------------
@@ -84,36 +118,6 @@ def split_path_args(text: str) -> List[str]:
     return posix or nonposix
 
 
-def is_peak_hour(now: Optional[datetime.datetime] = None) -> bool:
-    """DeepSeek 峰谷定价：北京时间高峰时段 9:00-12:00、14:00-18:00。"""
-    if now is None:
-        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    h = now.hour
-    return (9 <= h < 12) or (14 <= h < 18)
-
-
-def estimate_input_price(
-    model: str,
-    tokens: int,
-    hit_ratio: Optional[float] = None,
-    peak: bool = False,
-) -> Optional[float]:
-    """估算输入价格（元）：命中部分按缓存命中单价、其余按未命中单价。
-
-    仅适配 DeepSeek 官方定价（config.DEEPSEEK_PRICING）；未知模型返回 None。
-    """
-    pricing = DEEPSEEK_PRICING.get(model)
-    if not pricing or tokens <= 0:
-        return None
-    idx = 1 if peak else 0
-    hit_price = pricing["hit"][idx]
-    miss_price = pricing["miss"][idx]
-    ratio = hit_ratio if hit_ratio is not None else 0.0
-    ratio = max(0.0, min(1.0, ratio))
-    avg_price = hit_price * ratio + miss_price * (1.0 - ratio)
-    return tokens * avg_price / 1_000_000
-
-
 def get_balance(client: OpenAI) -> Optional[List[Dict]]:
     try:
         api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -164,7 +168,7 @@ def estimate_tokens(messages: list) -> int:
                     if btype == "text":
                         tokens += len(encoding.encode(block.get("text") or ""))
                     elif btype in ("image_url", "file"):
-                        tokens += VISION_IMAGE_TOKEN_CAP
+                        tokens += image_tokens_per_image()
             if key == "name":
                 tokens += 1
     tokens += 3
@@ -180,7 +184,7 @@ def generate_conversation_title(client: OpenAI, user_msg: str) -> str:
             f"用户：{user_msg}"
         )
         resp = client.chat.completions.create(
-            model=MODEL_V4_FLASH,
+            model=MODEL_FLASH,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
             max_tokens=TITLE_MAX_TOKENS,

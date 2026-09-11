@@ -1,6 +1,6 @@
 """Files API 客户端：图片文件上传 / 列表 / 删除。
 
-配合 deepseek-v4-flash-vision-exp 使用：图片上传一次后通过 file_id 引用，
+配合 deepseek-flash（图片理解）使用：图片上传一次后通过 file_id 引用，
 多个请求复用同一张图片无需重复上传（请求体极小、序列化稳定，不破坏前缀缓存）。
 限制：单文件 ≤64MiB、purpose 必须为 user_data、默认永久有效（不传 expires_after）。
 """

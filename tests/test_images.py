@@ -120,13 +120,11 @@ def test_encode():
 
 
 def test_estimate():
-    print("== token 估算 ==")
-    check("100x100 = 固定开销 117", estimate_image_tokens(100, 100) == 117)
-    check("800x800 = 349", estimate_image_tokens(800, 800) == 349)
-    check("超大图封顶 357", estimate_image_tokens(5000, 4000) == 357)
-    check("low 大幅降低", estimate_image_tokens(1600, 1200, "low") == 144)
-    check("无尺寸按上限", estimate_image_tokens(None, None) == 384)
-    check("400x400 无附加额", estimate_image_tokens(400, 400) == 117)
+    print("== token 估算（固定值/图，可在 pricing.json 调整） ==")
+    check("默认固定值 1024", estimate_image_tokens(100, 100) == 1024)
+    check("与尺寸无关（超大图同值）", estimate_image_tokens(5000, 4000) == 1024)
+    check("low 档同为固定值", estimate_image_tokens(1600, 1200, "low") == 1024)
+    check("无尺寸同为固定值", estimate_image_tokens(None, None) == 1024)
 
 
 def test_attachments():
@@ -137,18 +135,26 @@ def test_attachments():
     check("路径附件保存绝对路径", os.path.isabs(att.source) and att.source == os.path.abspath(png))
     check("尺寸已解析", (att.width, att.height) == (800, 600))
     check("detail 生效", att.detail == "low")
-    check("token 估算写入", att.tokens_est == 144)  # low: 512×384 → 117 + 27
+    check("token 估算写入（固定值）", att.tokens_est == 1024)
 
     check("不存在的文件报错", "文件不存在" in str(_exc(make_path_attachment, "/nonexistent/x.png")))
     check("不支持的格式报错", "不支持" in str(_exc(make_path_attachment, write("b.txt", b"hello"))))
 
-    # 超过 32MiB（稀疏文件快速构造）
+    # 33MiB：内联超限但 Files API file_id 可承载 → 允许构造（上限已提到 64MiB）
+    mid = os.path.join(_TMP, "mid.png")
+    with open(mid, "wb") as f:
+        f.write(png_bytes(1, 1))
+        f.truncate(33 * 1024 * 1024)
+    att_mid = make_path_attachment(mid)
+    check("33MiB 允许（走 Files API）", att_mid.size_bytes > 32 * 1024 * 1024)
+
+    # 超过 64MiB（Files API 单图上限，稀疏文件快速构造）
     big = os.path.join(_TMP, "big.png")
     with open(big, "wb") as f:
         f.write(png_bytes(1, 1))
-        f.truncate(33 * 1024 * 1024)
+        f.truncate(65 * 1024 * 1024)
     err = _exc(make_path_attachment, big)
-    check("超大文件报错", "32 MiB" in str(err))
+    check("超大文件报错（64 MiB 上限）", "64 MiB" in str(err))
 
     att_url = make_url_attachment("https://example.com/x.jpg?size=1", detail="auto")
     check("URL 附件", att_url.is_url and att_url.source.startswith("http"))

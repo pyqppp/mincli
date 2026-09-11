@@ -454,7 +454,7 @@ def test_multimodal():
     print("== 多模态：上传 / 守卫 / 回退 / 历史重放 / 文件管理 ==")
     png = _make_png(os.path.join(_TMP, "m.png"))
 
-    # 1) 上传成功 → file 块 + 模型自动切换
+    # 1) 上传成功 → file 块（flash 原生支持图片，模型不切换）
     script = [
         [FakeChunk(content="图", usage=SimpleNamespace(prompt_tokens=100, completion_tokens=5))],
         FakeChatResponse(content="图题"),
@@ -466,7 +466,7 @@ def test_multimodal():
     node = ctrl.send_message("描述图片", events.append)
     check("发送成功", node is not None)
     check("file_id 已写入节点", node.user_images[0].file_id == "file-api-0")
-    check("模型自动切换 vision", ctrl.current_model == "deepseek-v4-flash-vision-exp")
+    check("Flash 原生支持图片（模型不切换）", ctrl.current_model == "deepseek-flash")
     check("上传调用 1 次", len(ctrl.client.files.calls) == 1)
     sent = ctrl.client.chat.completions.calls[0]["messages"]
     blocks = sent[-1]["content"]
@@ -495,7 +495,7 @@ def test_multimodal():
     ))
     check("回退提示发出", any(e.kind == "status" and "内联" in e.message for e in events2))
 
-    # 3) 自定义模型（非 flash/pro）→ 报错 + 图片放回待发送
+    # 3) 不支持图片的模型（如 gpt-4o）→ 报错 + 图片放回待发送
     script3 = [
         [FakeChunk(content="x", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
         FakeChatResponse(content="t"),
@@ -507,8 +507,22 @@ def test_multimodal():
     node3 = ctrl3.send_message("看图", events3.append)
     check("自定义模型被拒", node3 is None)
     check("图片放回待发送", len(ctrl3.pending_images) == 1)
-    check("发出 error 事件", any(e.kind == "error" and "vision" in e.message for e in events3))
+    check("发出 error 事件（提示不支持图片）", any(
+        e.kind == "error" and "不支持图片" in e.message for e in events3
+    ))
     check("节点已回滚", ctrl3.tree.root is None)
+
+    # 3b) Pro 不支持图片 → 提示手动切换，且不自动改模型
+    ctrl3b = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3b.set_model("pro")
+    events3b = []
+    ctrl3b.add_pending_images([png])
+    node3b = ctrl3b.send_message("看图", events3b.append)
+    check("Pro 收到图片被拒", node3b is None and ctrl3b.current_model == "deepseek-v4-pro")
+    check("Pro 提示切到 flash", any(
+        e.kind == "error" and "/set model flash" in e.message for e in events3b
+    ))
+    check("Pro 图片放回待发送", len(ctrl3b.pending_images) == 1)
 
     # 4) 历史重放：第一轮回退 base64，第二轮补传 → file 块
     script4 = [
@@ -593,7 +607,10 @@ def test_multimodal():
     c9 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     check("set_detail low", c9.set_detail("low") and c9.image_detail == "low")
     check("set_detail 非法拒绝", not c9.set_detail("huge"))
-    check("set_model vision 别名", c9.set_model("vision") and c9.current_model == "deepseek-v4-flash-vision-exp")
+    check("set_model vision 别名 → flash", c9.set_model("vision") and c9.current_model == "deepseek-flash")
+    check("旧名 deepseek-v4-flash 改写为 flash",
+          c9.set_model("deepseek-v4-flash") and c9.current_model == "deepseek-flash")
+    check("set_model pro", c9.set_model("pro") and c9.current_model == "deepseek-v4-pro")
 
 
 def test_usage_stats():
@@ -756,6 +773,162 @@ def test_workflows():
     check("工作流：修订不存在名字报错", ctrl4.wf_revise("nope", "x").get("status") == "error")
 
 
+def test_pricing_config():
+    """定价配置：pricing.json 覆盖价格/峰谷/图片 token，非法内容回退默认。"""
+    import datetime
+    import json
+
+    import mincli.pricing as pricing
+    from mincli.config import DEEPSEEK_PRICING
+
+    original_path = pricing.PRICING_PATH
+    tmp = tempfile.mkdtemp(prefix="mincli_pricing_")
+    missing = os.path.join(tmp, "missing.json")
+    path = os.path.join(tmp, "pricing.json")
+    try:
+        # 1) 无配置文件 → 内置默认（2026-09 降价后的价格）
+        pricing.PRICING_PATH = missing
+        pricing.load_pricing(force=True)
+        check("定价：无配置用内置默认",
+              pricing.model_pricing("deepseek-flash")["miss"] == (1.0, 2.0)
+              and pricing.model_pricing("deepseek-flash")["output"] == (4.0, 8.0))
+        check("定价：默认图片固定值 1024", pricing.image_tokens_per_image() == 1024)
+        check("峰谷：默认周一 10 点高峰",
+              pricing.is_peak_hour(datetime.datetime(2026, 9, 14, 10, 0)))
+        check("峰谷：默认周一 13 点空闲",
+              not pricing.is_peak_hour(datetime.datetime(2026, 9, 14, 13, 0)))
+        check("峰谷：默认周六 10 点空闲（周末不算高峰）",
+              not pricing.is_peak_hour(datetime.datetime(2026, 9, 12, 10, 0)))
+
+        # 2) 配置文件覆盖：单数字/数组/部分字段/图片 token/峰谷规则
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "peak": {"days": [6, 7], "ranges": [[0, 24]], "timezone_offset_hours": 8},
+                "models": {
+                    "deepseek-flash": {"miss": 9.9, "hit": [0.01, 0.02]},
+                    "deepseek-v4-pro": {"output": [1.0, 2.0]},
+                },
+                "image_tokens": 384,
+            }, f, ensure_ascii=False)
+        pricing.PRICING_PATH = path
+        data = pricing.load_pricing(force=True)
+        check("定价：配置文件被加载", data["path"] == path)
+        check("定价：单数字覆盖为不分峰谷",
+              pricing.model_pricing("deepseek-flash")["miss"] == (9.9, 9.9))
+        check("定价：数组覆盖保留空闲/高峰",
+              pricing.model_pricing("deepseek-flash")["hit"] == (0.01, 0.02))
+        check("定价：未覆盖字段沿用内置",
+              pricing.model_pricing("deepseek-flash")["output"]
+              == DEEPSEEK_PRICING["deepseek-flash"]["output"])
+        check("定价：未列出的模型沿用内置",
+              pricing.model_pricing("deepseek-v4-pro")["miss"] == (4.5, 9.0))
+        check("定价：pro 单字段覆盖", pricing.model_pricing("deepseek-v4-pro")["output"] == (1.0, 2.0))
+        check("定价：图片 token 覆盖", pricing.image_tokens_per_image() == 384)
+        check("峰谷：覆盖后周六全天高峰",
+              pricing.is_peak_hour(datetime.datetime(2026, 9, 12, 3, 0)))
+        check("峰谷：覆盖后周一不再高峰",
+              not pricing.is_peak_hour(datetime.datetime(2026, 9, 14, 10, 0)))
+        check("定价：价格计算使用覆盖值",
+              pricing.estimate_input_price("deepseek-flash", 1_000_000, 0.0, peak=False) == 9.9)
+
+        # 3) 损坏文件 → 回退默认
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{bad json")
+        pricing.load_pricing(force=True)
+        check("定价：文件损坏回退默认",
+              pricing.model_pricing("deepseek-flash")["miss"] == (1.0, 2.0)
+              and pricing.image_tokens_per_image() == 1024)
+    finally:
+        pricing.PRICING_PATH = original_path
+        pricing.load_pricing(force=True)
+
+
+def test_model_migration():
+    """旧模型名自动改写（会话加载 + 简写归一）。"""
+    from mincli.config import MODEL_FLASH, MODEL_PRO, normalize_model_name
+
+    check("归一：简写 flash", normalize_model_name("flash") == MODEL_FLASH)
+    check("归一：简写 vision → flash", normalize_model_name("vision") == MODEL_FLASH)
+    check("归一：旧名 vision-exp → flash",
+          normalize_model_name("deepseek-v4-flash-vision-exp") == MODEL_FLASH)
+    check("归一：旧名 chat → flash", normalize_model_name("deepseek-chat") == MODEL_FLASH)
+    check("归一：pro 保持", normalize_model_name("deepseek-v4-pro") == MODEL_PRO)
+    check("归一：未知名原样", normalize_model_name("gpt-4o") == "gpt-4o")
+
+    if os.path.exists(TestController.SAVE_FILE):
+        os.remove(TestController.SAVE_FILE)
+    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl.tree.create_root("问题", "回答", "", "标题", 1, 1)
+    ctrl.current_model = "deepseek-v4-flash-vision-exp"  # 模拟旧会话
+    ctrl.save_session()
+    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    check("旧会话模型自动改写", ctrl2.current_model == MODEL_FLASH)
+    check("记录改写来源", ctrl2.model_migrated_from == "deepseek-v4-flash-vision-exp")
+    if os.path.exists(TestController.SAVE_FILE):
+        os.remove(TestController.SAVE_FILE)
+
+
+def test_image_limits():
+    """图片请求限制校验（数量/像素/内联大小/总量）。"""
+    from mincli.tools.images import ImageAttachment
+
+    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl.tree.create_root("q", "a", "", "t", 1, 1)
+    node = ctrl.tree.current_node
+
+    def att(name="i.png", w=100, h=100, size=1024, file_id=None, is_url=False):
+        return ImageAttachment(
+            source=name, detail="auto", name=name, size_bytes=size,
+            width=w, height=h, file_id=file_id, is_url=is_url,
+        )
+
+    check("限制：正常图片通过", ctrl._validate_request_images(node) is None)
+    node.user_images = [att(w=9000, h=100)]
+    check("限制：单边超 8192 被拒", "尺寸超限" in (ctrl._validate_request_images(node) or ""))
+    node.user_images = [att(w=5000, h=100)] * 15
+    check("限制：≥15 张时 4096 上限生效", "4096" in (ctrl._validate_request_images(node) or ""))
+    node.user_images = [att(size=40 * 1024 * 1024)]
+    check("限制：内联单图超 32MiB 被拒", "内联上限" in (ctrl._validate_request_images(node) or ""))
+    node.user_images = [att(size=40 * 1024 * 1024, file_id="file-api-x")]
+    check("限制：file_id 图片不受 32MiB 限制", ctrl._validate_request_images(node) is None)
+    node.user_images = [att(size=25 * 1024 * 1024)] * 3
+    check("限制：内联总量超 64MiB 被拒", "内联图片总量超限" in (ctrl._validate_request_images(node) or ""))
+    node.user_images = [att(size=70 * 1024 * 1024, file_id="f")] * 3
+    check("限制：图片总量超 200MiB 被拒", "图片总大小超限" in (ctrl._validate_request_images(node) or ""))
+    node.user_images = [att()] * 601
+    check("限制：数量超 600 被拒", "图片数量超限" in (ctrl._validate_request_images(node) or ""))
+
+
+def test_open_path_with_os():
+    """跨平台打开器：按平台选择命令（用假 Popen，不真正启动进程）。"""
+    import mincli.helpers as helpers
+
+    calls = []
+
+    class FakePopen:
+        def __init__(self, cmd, *args, **kwargs):
+            calls.append(list(cmd))
+
+    original = helpers.subprocess.Popen
+    helpers.subprocess.Popen = FakePopen
+    try:
+        if sys.platform == "darwin":
+            check("打开器：macOS 用 open",
+                  helpers.open_path_with_os("/tmp/a.md") is None
+                  and calls[-1] == ["open", "/tmp/a.md"])
+            check("打开器：macOS 文本编辑器用 open -e",
+                  helpers.open_path_with_os("/tmp/a.md", prefer_text_editor=True) is None
+                  and calls[-1] == ["open", "-e", "/tmp/a.md"])
+        elif os.name != "nt":
+            check("打开器：Unix 用 xdg-open",
+                  helpers.open_path_with_os("/tmp/a.md") is None
+                  and calls[-1] == ["xdg-open", "/tmp/a.md"])
+        else:
+            check("打开器：Windows 走 os.startfile（不启动子进程）", True)
+    finally:
+        helpers.subprocess.Popen = original
+
+
 if __name__ == "__main__":
     test_simple_qa()
     test_tool_round()
@@ -770,5 +943,9 @@ if __name__ == "__main__":
     test_multimodal()
     test_usage_stats()
     test_workflows()
+    test_pricing_config()
+    test_model_migration()
+    test_image_limits()
+    test_open_path_with_os()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)
