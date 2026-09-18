@@ -33,7 +33,10 @@ async def read_file(filepath: str) -> str:
 
 @mcp.tool()
 async def fetch_webpage(url: str) -> str:
-    """抓取指定 URL 的网页内容并提取正文，返回网页标题和文本内容
+    """抓取指定 URL 的网页内容并提取正文
+
+    正文过长时会在上限处截断，并附「...(已截断，原文共 N 字符)」标注；
+    抓取或解析失败时返回带 HTTP 状态码的原因（如「HTTP 404 Not Found」）。
 
     Args:
         url: 网页 URL，如 https://example.com

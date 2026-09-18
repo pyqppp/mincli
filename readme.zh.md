@@ -140,6 +140,7 @@ mincli chat --help
 | `DEEPSEEK_API_KEY` | 是 | 无 | DeepSeek API 密钥 |
 | `MINCLI_SAVE_PATH` | 否 | `~/Documents/mincli_Conversations` | 对话导出目录 |
 | `MINCLI_SYSTEM_PROMPT_PATH` | 否 | 包内 `mincli/system_prompt.md` | 自定义系统提示词文件路径 |
+| `MINCLI_WEBPAGE_MAX_LENGTH` | 否 | `5000` | `fetch_webpage` 一次返回的正文长度上限（超出会截断并标注原文长度）。硬上限 `20000`，超范围或非法值回退默认 |
 
 ### 系统提示词
 
@@ -217,7 +218,7 @@ AI 在对话中视需要自主调用以下工具：
 | 工具 | 功能 | 参数 |
 |------|------|------|
 | `read_file` | 读取文件（txt/md/py/csv/pdf/docx） | `filepath` |
-| `fetch_webpage` | 抓取网页并提取正文 | `url` |
+| `fetch_webpage` | 抓取网页并提取正文（超过 `MINCLI_WEBPAGE_MAX_LENGTH` 会截断；失败时报告 HTTP 状态码） | `url` |
 | `list_directory` | 列出目录内容 | `directory`; `show_hidden`（可选） |
 | `write_file` | 写入/覆盖文件（需用户确认） | `filepath`; `content` |
 | `edit_file` | 搜索替换文件内容（需用户确认） | `filepath`; `old_string`; `new_string` |
@@ -495,7 +496,7 @@ DeepSeek 价格会频繁调整，且 2026-09-10 起 Flash 已降价、并改为*
 │       ├── files.py         # Files API 客户端（上传/列表/删除）
 │       └── thinking.py      # 审计系统提示词
 │
-└── tests/                   # Headless 测试（test_controller / test_tui / test_images）
+└── tests/                   # Headless 测试（test_controller / test_tui / test_images / test_web_fetch）
 ```
 
 ---

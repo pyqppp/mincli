@@ -141,6 +141,7 @@ What files are here?
 | `MINCLI_SAVE_PATH` | No | `~/Documents/mincli_Conversations` | Export directory |
 | `MINCLI_SYSTEM_PROMPT_PATH` | No | Package `mincli/system_prompt.md` | Path to a custom system prompt file |
 | `MINCLI_PRICING_PATH` | No | `~/.mincli/pricing.json` | Pricing / peak-hour / image-token overrides |
+| `MINCLI_WEBPAGE_MAX_LENGTH` | No | `5000` | Max characters `fetch_webpage` returns (longer pages are truncated with a notice). Hard cap `20000`; out-of-range or invalid values fall back to the default |
 
 ### System prompt
 
@@ -232,7 +233,7 @@ AI autonomously invokes these tools as needed:
 | Tool | Function | Parameters |
 |------|----------|------------|
 | `read_file` | Read file (txt/md/py/csv/pdf/docx) | `filepath` |
-| `fetch_webpage` | Fetch and extract web page | `url` |
+| `fetch_webpage` | Fetch and extract web page (truncated at `MINCLI_WEBPAGE_MAX_LENGTH`; failures report the HTTP status) | `url` |
 | `list_directory` | List directory contents | `directory`; `show_hidden` (opt) |
 | `write_file` | Write/overwrite file (user confirms) | `filepath`; `content` |
 | `edit_file` | Search & replace in file (user confirms) | `filepath`; `old_string`; `new_string` |
@@ -368,7 +369,7 @@ An API failure (rate limit, dropped connection, `Content Exists Risk` moderation
 │       ├── web_fetch.py     # Web scraping + search
 │       └── thinking.py      # Audit system prompt
 │
-└── tests/                   # Headless tests (test_controller / test_tui)
+└── tests/                   # Headless tests (test_controller / test_images / test_tui / test_web_fetch)
 ```
 
 ---

@@ -69,7 +69,28 @@ TITLE_MAX_TOKENS = 30
 TITLE_MAX_LENGTH = 30
 PREVIEW_USER_MSG_LEN = 100
 PREVIEW_ASSISTANT_MSG_LEN = 200
-WEBPAGE_MAX_LENGTH = 5000
+
+# 网页正文长度上限（fetch_webpage 一次返回给模型的字符数）
+# 默认 5000，可用环境变量 MINCLI_WEBPAGE_MAX_LENGTH 调整；为避免超长网页挤爆上下文，
+# 无论怎么配置都不会超过硬上限 WEBPAGE_MAX_LENGTH_LIMIT（默认值的 4 倍）。
+WEBPAGE_MAX_LENGTH_DEFAULT = 5000
+WEBPAGE_MAX_LENGTH_LIMIT = WEBPAGE_MAX_LENGTH_DEFAULT * 4  # 20000
+
+
+def webpage_max_length() -> int:
+    """当前生效的网页正文长度上限。
+
+    读取 MINCLI_WEBPAGE_MAX_LENGTH（.env 同样生效）：空值/非法值静默回退默认值；
+    结果夹在 [1, WEBPAGE_MAX_LENGTH_LIMIT] 之间，因此配置再大也突破不了硬上限。
+    """
+    raw = (os.getenv("MINCLI_WEBPAGE_MAX_LENGTH") or "").strip()
+    if not raw:
+        return WEBPAGE_MAX_LENGTH_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return WEBPAGE_MAX_LENGTH_DEFAULT
+    return max(1, min(value, WEBPAGE_MAX_LENGTH_LIMIT))
 
 # 上下文压缩（/compact）：压缩当前分支全部对话并新建摘要节点
 COMPACT_MAX_TOKENS = 8192         # 压缩摘要的最大输出 token 数（生成失败时回退 4096）
