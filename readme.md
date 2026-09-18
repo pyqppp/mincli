@@ -22,7 +22,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - ⌨️ **Command Completion** — type `/` to list commands; letters filter candidates; `Tab` cycles / completes; a completed command shows its usage help
 - 🛡️ **Confirm Dialogs** — destructive actions (`/delete`, `/mcp remove`) ask for confirmation; `←`/`→` switches buttons and the default is *Cancel*
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
-- ♻️ **Resumable Interruptions** — a failed turn keeps its node (partial answer, reasoning and finished tool results) marked `⚠ interrupted`; type `继续` to carry on instead of losing the turn
+- ♻️ **Resumable Interruptions** — press `Esc` (or `Ctrl+C` while busy) to stop generation or kill a running command at any time; a failed/interrupted turn keeps its node (partial answer, reasoning and finished tool results) marked `⚠ interrupted`; type `继续` to carry on instead of losing the turn
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
 - 📊 **Real-time Usage Bar** — cache hit rate, balance, next-input tokens and estimated price under the input box (derived from real API `usage`, so it matches the input/output shown at the end of a turn; pricing/peak hours/image tokens are configurable via `~/.mincli/pricing.json`)
 - ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking mode, reasoning effort mid-conversation
@@ -117,6 +117,7 @@ mincli chat --help
 | `Ctrl+J` / `Alt+Enter` | Newline |
 | `Tab` | Complete / cycle command completion candidates |
 | `↑` / `↓` | Scroll the answer area (when the input is empty); double-press and hold for 2× speed |
+| `Esc` / `Ctrl+C` (while busy) | Interrupt the current generation or running command (the partial turn is kept); `Ctrl+C` when idle quits, and a second `Ctrl+C` forces quit if a turn is stuck |
 | `Ctrl+C` | Quit (copy wins when text is selected) |
 
 ### In-conversation examples
@@ -142,6 +143,7 @@ What files are here?
 | `MINCLI_SAVE_PATH` | No | `~/Documents/mincli_Conversations` | Export directory |
 | `MINCLI_SYSTEM_PROMPT_PATH` | No | Package `mincli/system_prompt.md` | Path to a custom system prompt file |
 | `MINCLI_PRICING_PATH` | No | `~/.mincli/pricing.json` | Pricing / peak-hour / image-token overrides |
+| `MINCLI_EXEC_MAX_TIMEOUT` | No | `1800` | Upper bound (seconds) for `execute_command`'s `timeout`; raises the old 120s hard cap so long rendering/build tasks aren't cut off |
 | `MINCLI_WEBPAGE_MAX_LENGTH` | No | `5000` | Max characters `fetch_webpage` returns (longer pages are truncated with a notice). Hard cap `20000`; out-of-range or invalid values fall back to the default |
 
 ### System prompt
@@ -339,8 +341,9 @@ Workflow runs go through the exact same pipeline as a normal send (streaming, to
 
 ## Interrupted Generations & "Continue"
 
-An API failure (rate limit, dropped connection, `Content Exists Risk` moderation, timeout) no longer throws the turn away:
+An API failure (rate limit, dropped connection, `Content Exists Risk` moderation, timeout) no longer throws the turn away — and neither does a manual interrupt:
 
+- **Manual interrupt** — press `Esc` (or `Ctrl+C` while a turn is running) to stop the current generation or kill a running command. Streaming stops at the next chunk and the running command's process group is terminated, so a stuck rendering/build job doesn't have to wait for its timeout.
 - **The node is saved anyway** — whatever was already streamed (partial answer and reasoning), the tool calls/results that already finished, and the tokens spent are all written to the current node, which is marked `⚠ interrupted` in the tree.
 - **The chat log says so** — the failure reason is shown, followed by a note that the turn is saved and that typing `继续` (continue) resumes it.
 - **Just continue** — send `继续` (or any follow-up) under that node; the history sent to the model contains the partial answer and tool results, so it picks up where it stopped instead of starting over.

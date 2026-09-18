@@ -293,6 +293,17 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
 
     ctrl.confirm = lambda title, text: input(f"{title}: {text} (y/N): ").strip().lower() in ("y", "yes")
 
+    def run_send(message: str) -> None:
+        """发送消息；Ctrl+C 打断时保留已生成部分，长命令会被终止。"""
+        try:
+            ctrl.send_message(message, emit)
+        except KeyboardInterrupt:
+            ctrl.interrupt()  # 顺带终止仍在执行的命令进程组
+            print("\n⏹ 已打断本轮（已保留生成的部分，可直接输入「继续」）")
+        except Exception as e:
+            print(f"\n⚠️ {e}")
+            print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
+
     print("mincli 纯文本模式（输入 /exit 退出，/help 查看命令）")
     pending_wf: Optional[str] = None  # /wf use 挂载到下一次输入的工作流名
     try:
@@ -308,7 +319,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             if low in ("/exit", "/quit", "/q"):
                 break
             if low in ("/help", "/h"):
-                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文（新建摘要节点） | /tree 显示对话树 | /info 节点详情 | /import 导入文件/图片 | /files 管理图片文件 | /wf 工作流（list/save/use/run 等）")
+                print("命令: /exit 退出 | /clear 清空 | /compact 压缩上下文（新建摘要节点） | /tree 显示对话树 | /info 节点详情 | /import 导入文件/图片 | /files 管理图片文件 | /wf 工作流（list/save/use/run 等） | Ctrl+C 打断当前生成/命令")
                 continue
             if low.startswith("/import"):
                 # 跨平台参数解析：兼容 Windows 反斜杠路径（如 C:\a b\x.txt）
@@ -419,11 +430,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                     continue
                 to_send = _plain_wf(ctrl, text)
                 if to_send is not None:
-                    try:
-                        ctrl.send_message(to_send, emit)
-                    except Exception as e:
-                        print(f"\n⚠️ {e}")
-                        print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
+                    run_send(to_send)
                 continue
             if low == "/tree":
                 print(ctrl.tree.render_tree(
@@ -442,11 +449,7 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
                     continue
                 text = composed
                 print(f"▶ 已按工作流「{wf_name}」执行")
-            try:
-                ctrl.send_message(text, emit)
-            except Exception as e:
-                print(f"\n⚠️ {e}")
-                print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
+            run_send(text)
     finally:
         ctrl.save_session()
         ctrl.close()

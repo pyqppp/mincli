@@ -129,10 +129,33 @@ TEMPERATURE_MAX = 2.0
 
 # 命令执行工具（execute_command）
 EXEC_DEFAULT_TIMEOUT = 30          # 未传 timeout 时的默认截止时间（秒）
-EXEC_MAX_TIMEOUT = 120             # timeout 上限（与 MCP 客户端调用超时对齐，见 mcp_client.CALL_TIMEOUT）
+# timeout 上限（秒）。早期固定 120s，渲染/构建/安装等长任务会被硬截断，模型只能
+# 反复「启动休眠」轮询；现在默认放宽到 30 分钟，并可用 MINCLI_EXEC_MAX_TIMEOUT
+# 覆盖。真正卡死的命令由用户主动打断终止（见 controller.interrupt）。
+EXEC_MAX_TIMEOUT_DEFAULT = 1800
 EXEC_DEFAULT_MAX_OUTPUT = 8000     # 输出截断上限（字符），超出时保留首尾并落盘完整输出
 EXEC_MAX_OUTPUT = 50_000           # max_output 参数允许的最大值
 EXEC_ALLOWED_SHELLS = ("sh", "bash", "zsh")
+
+
+def exec_max_timeout() -> int:
+    """当前生效的 execute_command 超时上限（秒）。
+
+    读取 MINCLI_EXEC_MAX_TIMEOUT（.env 同样生效）：空值/非法值回退默认值；
+    结果至少为 1。上限同时决定 MCP 客户端调用超时（见 mcp_client.CALL_TIMEOUT）。
+    """
+    raw = (os.getenv("MINCLI_EXEC_MAX_TIMEOUT") or "").strip()
+    if not raw:
+        return EXEC_MAX_TIMEOUT_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return EXEC_MAX_TIMEOUT_DEFAULT
+    return max(1, value)
+
+
+# 模块级常量：多数调用点直接引用（导入时求值一次，启动后不再变化）
+EXEC_MAX_TIMEOUT = exec_max_timeout()
 
 # ---------------- 多模态（图片理解，deepseek-flash 原生支持） ----------------
 # 官方限制（2026-09）：格式按文件内容识别（不看扩展名/声明 MIME）；图片仅限 user 消息；

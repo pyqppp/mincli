@@ -21,6 +21,9 @@ CONNECT_TIMEOUT = 15
 # 否则命令的“超时返回部分输出”路径会被客户端提前截断成“工具调用失败”
 CALL_TIMEOUT = EXEC_MAX_TIMEOUT + 30
 
+# 内部工具：由 mincli 主进程调用（如打断时 cancel_command），不暴露给模型
+INTERNAL_TOOLS = frozenset({"cancel_command"})
+
 
 def _frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
@@ -97,6 +100,25 @@ class McpToolClient:
             content = f"[工具执行失败]\n{content}"
         return content
 
+    def cancel_running(self) -> bool:
+        """请求内置 server 终止当前正在执行的命令（供用户打断）。
+
+        第三方 server 没有该内部工具，返回 False（上层仍会停止后续流程，
+        但无法杀掉第三方 server 自己派生的进程）。
+        """
+        owner = self._tool_owner.get("cancel_command")
+        if owner is None or not self.ok:
+            return False
+        client = self._clients.get(owner)
+        if client is None:
+            return False
+        try:
+            # 独立超时：打断路径不能被长命令拖住（server 端在另一线程杀进程）
+            self._run_coro(client.call_tool("cancel_command", {}), timeout=10)
+            return True
+        except Exception:
+            return False
+
     def server_status(self) -> dict:
         """返回所有 server（内置 + 配置的第三方）的连接状态与工具数。"""
         names = {"mincli": "内置"}
@@ -105,7 +127,10 @@ class McpToolClient:
         for name in names:
             client = self._clients.get(name)
             if client is not None:
-                count = sum(1 for n in self._tool_owner if self._tool_owner[n] == name)
+                count = sum(
+                    1 for n in self._tool_owner
+                    if self._tool_owner[n] == name and n not in INTERNAL_TOOLS
+                )
                 status[name] = {"connected": True, "tools": count}
             else:
                 status[name] = {"connected": False, "tools": 0}
@@ -210,6 +235,9 @@ class McpToolClient:
                     print(f"⚠ 工具「{t.name}」与已有工具重名，来自「{name}」的工具已忽略")
                     continue
                 self._tool_owner[t.name] = name
+                if t.name in INTERNAL_TOOLS:
+                    # 内部工具：保留 owner 映射供客户端调用，但不加入模型工具列表
+                    continue
                 self._tool_defs.append({
                     "type": "function",
                     "function": {

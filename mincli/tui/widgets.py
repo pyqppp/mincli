@@ -31,6 +31,8 @@ class ChatInput(TextArea):
         Alt+Enter  插入换行（仅限能区分该按键的终端；iTerm2 传统模式下
                     Alt+Enter 会被当作 Enter 处理，见键盘协议说明）
         Ctrl+C     无选区时退出应用；输入框内有选区时先复制（TextArea 默认）
+                   生成/命令执行进行中则先打断当前轮
+        Esc        打断正在进行的生成/命令（空闲时无操作）
     """
 
     BINDINGS = [
@@ -40,6 +42,8 @@ class ChatInput(TextArea):
         Binding("tab", "complete_or_tab", "命令补全/Tab", show=False, priority=True),
         Binding("up", "scroll_answer(-1)", "上滚回答区", show=False),
         Binding("down", "scroll_answer(1)", "下滚回答区", show=False),
+        # TextArea 默认会吞掉 Esc（切焦点），这里优先接管为「打断生成」
+        Binding("escape", "interrupt_turn", "打断", show=False, priority=True),
     ]
 
     class Submitted(Message):
@@ -139,6 +143,10 @@ class ChatInput(TextArea):
                 self.action_cursor_down()
             return
         self.app._scroll_chat(delta)  # type: ignore[attr-defined]
+
+    def action_interrupt_turn(self) -> None:
+        """Esc：打断正在进行的生成/命令（空闲时无操作）。"""
+        self.app.action_interrupt()  # type: ignore[attr-defined]
 
     def on_text_area_changed(self, event) -> None:
         """内容变化时按行数自适应高度（3~8 行）并广播文本变化。"""

@@ -1095,6 +1095,139 @@ def test_open_path_with_os():
         helpers.subprocess.Popen = original
 
 
+def test_exec_timeout_config():
+    """execute_command 超时上限：默认放宽到 30 分钟，且可用环境变量覆盖。"""
+    from mincli import config
+
+    original = os.environ.get("MINCLI_EXEC_MAX_TIMEOUT")
+    try:
+        os.environ["MINCLI_EXEC_MAX_TIMEOUT"] = "600"
+        check("超时上限：可配置", config.exec_max_timeout() == 600)
+        os.environ["MINCLI_EXEC_MAX_TIMEOUT"] = "abc"
+        check("超时上限：非法值回退默认",
+              config.exec_max_timeout() == config.EXEC_MAX_TIMEOUT_DEFAULT)
+        os.environ.pop("MINCLI_EXEC_MAX_TIMEOUT", None)
+        check("超时上限：默认放宽（>=600s）", config.EXEC_MAX_TIMEOUT_DEFAULT >= 600)
+        check("超时上限：未设置用默认",
+              config.exec_max_timeout() == config.EXEC_MAX_TIMEOUT_DEFAULT)
+    finally:
+        if original is None:
+            os.environ.pop("MINCLI_EXEC_MAX_TIMEOUT", None)
+        else:
+            os.environ["MINCLI_EXEC_MAX_TIMEOUT"] = original
+
+
+def test_interrupt():
+    """用户主动打断：流式中止，已生成部分落盘为「中断」节点。"""
+    print("== 用户打断（流式中止 / 部分内容落盘） ==")
+    holder = {}
+
+    class InterruptStream:
+        def __init__(self):
+            self.n = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.n += 1
+            if self.n == 1:
+                return FakeChunk(content="前半句", reasoning_content="先想")
+            if self.n == 2:
+                holder["ctrl"].interrupt()
+                return FakeChunk(content="不该出现")
+            raise StopIteration
+
+        def close(self):
+            holder["closed"] = True
+
+    ctrl = TestController(
+        FakeClient([InterruptStream()]),
+        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+    )
+    holder["ctrl"] = ctrl
+    node, events = collect(ctrl, "写个长回答")
+    check("打断：节点保留", node is not None)
+    check("打断：部分正文落盘", node.assistant_msg == "前半句")
+    check("打断：部分思考落盘", node.reasoning == "先想")
+    check("打断：节点标记中断", "打断" in (node.error or ""))
+    kinds = [e.kind for e in events]
+    check("打断：发出 done 事件", "done" in kinds)
+    check("打断：打断后不再渲染后续内容",
+          "不该出现" not in "".join(e.content for e in events))
+    check("打断：流已关闭", holder.get("closed") is True)
+    check("打断：本轮标志保持置位",
+          ctrl._interrupt_requested is True)
+
+
+def test_exec_cancel():
+    """execute_command：cancel_running_commands 立即终止进程组。"""
+    print("== 命令执行打断（终止进程组） ==")
+    if sys.platform == "win32":
+        check("命令打断：Windows 跳过", True)
+        return
+    import threading
+    import time
+
+    from mincli.tools import execute as exec_mod
+
+    with exec_mod._RUNNING_LOCK:
+        exec_mod._RUNNING_PROCS.clear()
+    result = {}
+
+    def run():
+        result["out"] = exec_mod.execute_command("sleep 30", timeout=60)
+
+    t = threading.Thread(target=run)
+    t.start()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        with exec_mod._RUNNING_LOCK:
+            if exec_mod._RUNNING_PROCS:
+                break
+        time.sleep(0.02)
+    killed = exec_mod.cancel_running_commands()
+    t.join(timeout=5)
+    check("命令打断：进程组被终止", killed >= 1)
+    check("命令打断：执行线程及时结束", not t.is_alive())
+    check("命令打断：返回了结果（非挂起）", bool(result.get("out")))
+    with exec_mod._RUNNING_LOCK:
+        check("命令打断：注册表已清理", not exec_mod._RUNNING_PROCS)
+
+
+def test_mcp_internal_tools():
+    """MCP 内部工具：cancel_command 注册但不对模型暴露。"""
+    print("== MCP 内部工具（cancel_command 不暴露给模型） ==")
+    import asyncio
+
+    from mincli.mcp_client import INTERNAL_TOOLS, McpToolClient
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+            self.description = ""
+            self.input_schema = {}
+
+    class _Result:
+        def __init__(self, names):
+            self.tools = [_Tool(n) for n in names]
+
+    class _SdkClient:
+        async def list_tools(self):
+            return _Result(["read_file", "cancel_command"])
+
+    client = McpToolClient()
+    client._clients = {"mincli": _SdkClient()}
+    asyncio.run(client._register_tools())
+    names = [t["function"]["name"] for t in client.tools()]
+    check("内部工具：cancel_command 已注册 owner",
+          "cancel_command" in client.tool_names())
+    check("内部工具：不暴露给模型",
+          "cancel_command" not in names and "read_file" in names)
+    check("内部工具：INTERNAL_TOOLS 含 cancel_command",
+          "cancel_command" in INTERNAL_TOOLS)
+
+
 if __name__ == "__main__":
     test_simple_qa()
     test_tool_round()
@@ -1115,5 +1248,9 @@ if __name__ == "__main__":
     test_model_migration()
     test_image_limits()
     test_open_path_with_os()
+    test_exec_timeout_config()
+    test_interrupt()
+    test_exec_cancel()
+    test_mcp_internal_tools()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

@@ -25,11 +25,15 @@ def stream_response(
     tools: Optional[List[Dict]] = None,
     silent: bool = False,
     on_chunk: Optional[Callable[[str, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> StreamResult:
     """流式请求 DeepSeek，返回聚合结果。
 
     on_chunk(content_delta, reasoning_delta) 每收到一个增量回调一次，
     用于 UI 实时渲染。silent=True 或未传 on_chunk 时只聚合、不回调。
+
+    should_stop() 返回 True 时在下一个 chunk 处停止读取并关闭连接（用户手动
+    打断）：已聚合的 content/reasoning 会照常返回，供上层落盘为「中断」节点。
 
     出错时返回 StreamResult(error=...)，不抛异常。
     """
@@ -95,8 +99,19 @@ def stream_response(
             kwargs["tools"] = tools
 
         response = client.chat.completions.create(**kwargs)
-        for chunk in response:
-            _process_chunk(chunk)
+        try:
+            for chunk in response:
+                if should_stop is not None and should_stop():
+                    break
+                _process_chunk(chunk)
+        finally:
+            # 提前打断时释放底层 HTTP 连接；正常读完时 close 是幂等的
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
         if accumulated_tool_calls:
             return StreamResult(

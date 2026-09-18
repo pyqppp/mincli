@@ -125,6 +125,7 @@ DeepSeek 树状对话 TUI
 - **左侧**：对话树（点击节点切换，点小三角收起/展开）
 - **中间**：消息流（Markdown 流式渲染）
 - **底部**：多行输入框（**Enter** 发送，**Ctrl+J** 换行）
+- **Esc** / 生成中 **Ctrl+C**：打断当前生成或正在执行的命令
 - **Ctrl+C**：退出（自动保存会话）
 
 直接输入问题开始对话，输入 `/help` 查看命令。
@@ -265,8 +266,11 @@ class ChatApp(App):
 
     BINDINGS = [
         # Ctrl+C 在所有平台统一：有选中文字时先复制（Textual 屏幕级绑定
-        # 优先，ChatInput/输入框选区、聊天区选区均可复制），无选中时退出
-        Binding("ctrl+c", "quit", "退出"),
+        # 优先，ChatInput/输入框选区、聊天区选区均可复制），无选中时退出。
+        # 生成/命令执行进行中则先打断当前轮（见 action_quit/action_interrupt）。
+        Binding("ctrl+c", "quit", "退出/打断"),
+        # Esc 打断当前生成（ChatInput 内因 TextArea 会吞 Esc，另加优先绑定）
+        Binding("escape", "interrupt", "打断", show=False),
         Binding(
             "caps_lock,num_lock,scroll_lock",
             "ignore_lock",
@@ -282,6 +286,9 @@ class ChatApp(App):
         self._injected_controller = controller
         self.ctrl: ChatController | None = None
         self._stream_active = False
+        # 是否有生成/命令执行进行中（Ctrl+C / Esc 据此决定「打断」还是「退出」）
+        self._turn_active = False
+        self._default_placeholder = ""
         self._reasoning_open = False  # 流式中当前思考块是否仍打开（正文出现则关闭）
         self._answer_started = False  # 正文的 "**mincli：**" 头部是否已输出
         self._full_view = False  # 全览模式：节点树全宽（隐藏回答区）
@@ -314,6 +321,35 @@ class ChatApp(App):
     def action_ignore_lock(self) -> None:
         """忽略锁定键（Caps Lock / Num Lock / Scroll Lock）。"""
         pass
+
+    async def action_quit(self) -> None:
+        """Ctrl+C：有进行中的生成/命令时先打断；已请求打断仍未结束时强制退出。"""
+        if self._turn_active and self.ctrl is not None:
+            if not self.ctrl.interrupt_pending:
+                self.action_interrupt()
+                return
+            # 已请求过打断（例如流式卡住不返回）：再按一次直接退出
+        self.exit()
+
+    def action_interrupt(self) -> None:
+        """打断当前轮的流式生成 / 正在执行的命令（Esc 或忙碌时 Ctrl+C）。
+
+        空闲时（没有进行中的轮次）不做任何事，交给其他 Esc 处理逻辑。
+        """
+        if self.ctrl is None or not self._turn_active:
+            return
+        self.ctrl.interrupt()
+        self.notify("⏹ 正在打断当前生成/命令…", timeout=3)
+
+    def _set_turn_active(self, active: bool) -> None:
+        """切换「生成中」状态：占用期间输入框占位提示如何打断。"""
+        self._turn_active = active
+        inp = self.query_one("#chat-input", ChatInput)
+        if not self._default_placeholder:
+            self._default_placeholder = str(inp.placeholder or "")
+        inp.placeholder = (
+            "生成中… 按 Esc 打断（Ctrl+C 亦可）" if active else self._default_placeholder
+        )
 
     def copy_to_clipboard(self, text: str) -> None:
         """复制文本到系统剪贴板。
@@ -1147,7 +1183,8 @@ class ChatApp(App):
 - `/delete <节点ID> [...]` — 删除一个或多个节点及其子节点（需确认；子节点随父节点级联删除）
 
 **快捷键**
-- **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行 · **Ctrl+C** 退出
+- **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行
+- **Esc** / 生成中 **Ctrl+C** 打断当前生成或正在执行的命令（再按一次 **Ctrl+C** 强制退出） · **Ctrl+C** 退出
 """
         )
 
@@ -1916,6 +1953,7 @@ class ChatApp(App):
         self._stream_active = False
         self._reasoning_open = False
         self._answer_started = False
+        self._set_turn_active(True)
         self.run_worker(
             lambda: self._run_message(text),
             name="chat-message",
@@ -1929,6 +1967,8 @@ class ChatApp(App):
             self.ctrl.send_message(text, self._emit_from_thread)
         except Exception as e:
             self.call_from_thread(self._append_error, str(e))
+        finally:
+            self.call_from_thread(self._set_turn_active, False)
 
     def _emit_from_thread(self, ev: ControllerEvent) -> None:
         self.call_from_thread(self._handle_event, ev)
@@ -2064,6 +2104,7 @@ class ChatApp(App):
             await self._chat_shrink_lists()
             self._rebuild_tree()  # 节点保留，刷新树（中断节点带 ⚠ 标记）
             self._refresh_import_status()
+            self._set_turn_active(False)
         elif ev.kind == "done":
             node = ev.node
             if node is not None:
@@ -2075,6 +2116,7 @@ class ChatApp(App):
             if node is not None:
                 self._select_tree_node(node.id)
             self._refresh_usage_bar()
+            self._set_turn_active(False)
 
     def _append_error(self, message: str) -> None:
         self._cancel_flush()  # 出错后不再渲染残留流式缓冲

@@ -450,6 +450,92 @@ async def test_interrupted_node_kept():
         await pilot.press("ctrl+c")
 
 
+async def test_interrupt_binding():
+    """Esc / 忙碌时 Ctrl+C：触发控制器打断，空闲后恢复。"""
+    import time
+
+    class SlowController(FakeController):
+        def __init__(self):
+            super().__init__()
+            self.interrupted = False
+            self.started = False
+
+        def interrupt(self):
+            self.interrupted = True
+            return True
+
+        def send_message(self, text, emit):
+            node = self.tree.create_root(text, "", "", "慢回答", 0, 0)
+            emit(ControllerEvent.node_created(node))
+            self.started = True
+            for _ in range(250):
+                if self.interrupted:
+                    break
+                time.sleep(0.02)
+            emit(ControllerEvent.stream("部分", ""))
+            node.assistant_msg = "部分"
+            emit(ControllerEvent.done(node))
+            return node
+
+    ctrl = SlowController()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        inp = app.query_one("#chat-input", ChatInput)
+        check("打断：ChatInput 有 escape 优先绑定",
+              any(b.key == "escape" for b in ChatInput.BINDINGS))
+        check("打断：App 有 Ctrl+C 与 escape 绑定",
+              {b.key for b in ChatApp.BINDINGS} >= {"ctrl+c", "escape"})
+
+        await pilot.press("写", "个")
+        await pilot.press("enter")
+        for _ in range(60):
+            await pilot.pause()
+            if app._turn_active and ctrl.started:
+                break
+        check("打断：生成中处于忙碌状态", app._turn_active)
+        check("打断：输入框提示如何打断",
+              "Esc" in str(inp.placeholder))
+
+        await pilot.press("escape")
+        for _ in range(60):
+            await pilot.pause()
+            if ctrl.interrupted:
+                break
+        check("Esc 触发控制器打断", ctrl.interrupted)
+
+        for _ in range(120):
+            await pilot.pause()
+            if not app._turn_active:
+                break
+        check("打断后回到空闲状态", not app._turn_active)
+        await pilot.press("ctrl+c")
+
+
+async def test_quit_forces_exit_after_interrupt():
+    """Ctrl+C：忙碌时首次只打断；已请求打断仍未结束时再次强制退出。"""
+    ctrl = FakeController()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(30):
+            await pilot.pause()
+            if app.ctrl is ctrl:
+                break
+        app._turn_active = True
+
+        exits: list = []
+        real_exit = app.exit
+        app.exit = lambda *a, **k: exits.append(True)  # type: ignore[method-assign]
+        try:
+            await app.action_quit()
+            check("退出：忙碌时首次 Ctrl+C 只打断不退出", not exits)
+            check("退出：首次 Ctrl+C 置位打断标志", ctrl.interrupt_pending)
+
+            await app.action_quit()
+            check("退出：再次 Ctrl+C 强制退出", bool(exits))
+        finally:
+            app.exit = real_exit  # type: ignore[method-assign]
+
+
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
     test_markdown_safety()
@@ -1021,6 +1107,8 @@ async def main() -> int:
 
     await test_reasoning_quote_after_tool()
     await test_interrupted_node_kept()
+    await test_interrupt_binding()
+    await test_quit_forces_exit_after_interrupt()
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

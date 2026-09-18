@@ -16,7 +16,10 @@ from mincli.tools.file_ops import (
     write_file_content, edit_file_content,
 )
 from mincli.tools.web_fetch import fetch_webpage as _fetch_webpage
-from mincli.tools.execute import execute_command as _execute_command
+from mincli.tools.execute import (
+    cancel_running_commands as _cancel_running_commands,
+    execute_command as _execute_command,
+)
 
 mcp = MCPServer("mincli")
 
@@ -87,11 +90,11 @@ async def execute_command(
     shell: str = "sh",
     max_output: int = EXEC_DEFAULT_MAX_OUTPUT,
 ) -> str:
-    """在用户电脑上执行 shell 命令。AI 安全审核、高危命令强制确认与用户确认均由 mincli 主进程（本 server 的启动方）在执行前完成，本 server 不独立提供安全防护。命令以非交互方式运行（stdin 已关闭），交互式命令（vim、ssh、python REPL 等）会因无输入而立即结束。默认工作目录为 mincli 启动目录（可用 /set workspace 修改，也可用 cwd 参数临时指定）。若预计输出很长，请在命令中限制输出（如追加 | head、>/dev/null）以节省 token
+    """在用户电脑上执行 shell 命令。AI 安全审核、高危命令强制确认与用户确认均由 mincli 主进程（本 server 的启动方）在执行前完成，本 server 不独立提供安全防护。命令以非交互方式运行（stdin 已关闭），交互式命令（vim、ssh、python REPL 等）会因无输入而立即结束。默认工作目录为 mincli 启动目录（可用 /set workspace 修改，也可用 cwd 参数临时指定）。若预计输出很长，请在命令中限制输出（如追加 | head、>/dev/null）以节省 token。渲染、构建、测试、安装等耗时较长的命令，请显式传入较大的 timeout 一次跑完，不要用 sleep 轮询等待。
 
     Args:
         command: 要执行的 shell 命令（可用 && 串联多条）
-        timeout: 执行截止时间（秒），默认 30，上限 120。超时后整个进程组会被强制终止，已产生的部分输出仍会返回
+        timeout: 执行截止时间（秒），默认 30，上限可配置（MINCLI_EXEC_MAX_TIMEOUT，默认 1800）；长任务请显式调大。超时后整个进程组会被强制终止，已产生的部分输出仍会返回
         cwd: 可选。工作目录（绝对路径或 ~ 开头）；留空时使用 /set workspace 设置的目录，未设置则用 mincli 启动目录
         env: 可选。额外环境变量字典，如 {"PATH": "/usr/local/bin:..."}，叠加到当前环境
         shell: 可选。使用的 shell：sh、bash 或 zsh，默认 sh
@@ -101,6 +104,17 @@ async def execute_command(
         _execute_command, command, timeout,
         cwd=cwd, env=env or None, shell=shell, max_output=max_output,
     )
+
+
+@mcp.tool()
+async def cancel_command() -> str:
+    """终止当前正在执行的 shell 命令进程组。
+
+    仅由 mincli 主进程在用户主动打断时通过内部调用使用；不向模型暴露
+    （客户端会将其从工具列表中过滤掉）。
+    """
+    killed = await asyncio.to_thread(_cancel_running_commands)
+    return f"已终止 {killed} 个正在执行的命令"
 
 
 def main() -> None:

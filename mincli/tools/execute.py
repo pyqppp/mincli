@@ -6,6 +6,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 from typing import Dict, Optional, Tuple
 
 from openai import OpenAI
@@ -148,6 +149,43 @@ def _truncate_output(body: str, max_chars: int) -> str:
     return head + marker + tail
 
 
+# 正在执行的命令进程注册表（仅在同一进程内共享，即内置 MCP server 进程）。
+# execute_command 在 Popen 成功后登记、结束时注销；cancel_running_commands 由
+# 内部工具 cancel_command 调用，从另一个线程终止进程组，实现「用户主动打断」。
+_RUNNING_PROCS: Dict[int, subprocess.Popen] = {}
+_RUNNING_LOCK = threading.Lock()
+
+
+def _register_proc(proc: subprocess.Popen) -> None:
+    with _RUNNING_LOCK:
+        _RUNNING_PROCS[proc.pid] = proc
+
+
+def _unregister_proc(proc: subprocess.Popen) -> None:
+    with _RUNNING_LOCK:
+        _RUNNING_PROCS.pop(proc.pid, None)
+
+
+def cancel_running_commands() -> int:
+    """终止当前正在执行的所有命令进程组，返回被终止的进程数。
+
+    超时逻辑的复用：以 SIGKILL 杀掉整个进程组（含子 shell 派生的孙进程）。
+    进程可能在遍历期间自然结束，逐个捕获异常即可。
+    """
+    if not hasattr(os, "killpg"):
+        return 0
+    with _RUNNING_LOCK:
+        procs = list(_RUNNING_PROCS.values())
+    killed = 0
+    for proc in procs:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return killed
+
+
 def execute_command(
     command: str,
     timeout: int = EXEC_DEFAULT_TIMEOUT,
@@ -184,40 +222,44 @@ def execute_command(
             errors="replace",
             cwd=workdir,
             env=proc_env,
-            start_new_session=True,  # 独立进程组：超时可整组终止，避免孤儿进程
+            start_new_session=True,  # 独立进程组：超时/打断可整组终止，避免孤儿进程
         )
     except Exception as e:
         return f"{platform_line}\n[命令执行失败] {e}"
 
+    _register_proc(proc)
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        # 终止整个进程组（含子 shell 派生的孙进程）
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            pass
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", "replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", "replace")
-        body = _truncate_output(_compose_body(stdout, stderr, None), max_output)
-        return f"{platform_line}\n[命令超时（{timeout}秒），已强制终止整个进程组，以上为已产生的部分输出]\n{body}"
-    except Exception as e:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
-        return f"{platform_line}\n[命令执行失败] {e}"
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            # 终止整个进程组（含子 shell 派生的孙进程）
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+            stdout = e.stdout or ""
+            stderr = e.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", "replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            body = _truncate_output(_compose_body(stdout, stderr, None), max_output)
+            return f"{platform_line}\n[命令超时（{timeout}秒），已强制终止整个进程组，以上为已产生的部分输出]\n{body}"
+        except Exception as e:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            return f"{platform_line}\n[命令执行失败] {e}"
 
-    body = _truncate_output(_compose_body(stdout, stderr, proc.returncode), max_output)
-    return f"{platform_line}\n{body}"
+        body = _truncate_output(_compose_body(stdout, stderr, proc.returncode), max_output)
+        return f"{platform_line}\n{body}"
+    finally:
+        _unregister_proc(proc)
 
 
 # ---------------- 审核 ----------------

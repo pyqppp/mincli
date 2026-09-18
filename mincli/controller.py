@@ -175,6 +175,9 @@ class ChatController:
         self.file_confirm: bool = True
         # 命令执行默认工作目录（/set workspace 设置；None 时用 mincli 启动目录）
         self.workspace: Optional[str] = None
+        # 用户主动打断标志：streaming 循环在每个 chunk 处检查，工具调用后也会检查。
+        # 每次 send_message 开始时复位；interrupt() 置位并顺带终止正在执行的命令。
+        self._interrupt_requested: bool = False
 
         # 多模态：待发送图片（/import 导入的图片填充；发送后绑定到节点并清空）
         self.pending_images: List[ImageAttachment] = []
@@ -234,6 +237,31 @@ class ChatController:
         if self._mcp:
             self._mcp.close()
             self._mcp = None
+
+    # ---------------- 打断 ----------------
+
+    def interrupt(self) -> bool:
+        """请求打断当前轮生成/命令执行（线程安全，可从 UI 线程调用）。
+
+        - 置位打断标志：流式循环在下一个 chunk 处停止读取（见 stream_response
+          的 should_stop），工具执行后也会检查并结束本轮；
+        - 立即请求内置 MCP server 终止正在运行的命令进程组，长任务不用再等
+          超时（第三方 server 无该内部工具，只会停止后续流程）。
+
+        返回是否发起了打断请求（当前是否处于可打断状态由 UI 侧感知）。
+        """
+        self._interrupt_requested = True
+        if self._mcp is not None:
+            try:
+                self._mcp.cancel_running()
+            except Exception:
+                pass
+        return True
+
+    @property
+    def interrupt_pending(self) -> bool:
+        """本轮是否已请求过打断（UI 用于「再按一次强制退出」）。"""
+        return self._interrupt_requested
 
     # ---------------- 持久化 ----------------
 
@@ -1019,7 +1047,11 @@ class ChatController:
 
         多模态：待发送图片先上传为 Files API file_id（请求体极小、序列化稳定、
         不破坏前缀缓存），上传失败回退 base64 内联；图片消息自动切换视觉模型。
+
+        用户可随时通过 interrupt() 打断（停止流式输出 / 终止正在执行的命令），
+        已生成部分同样落盘为「中断」节点，可直接继续。
         """
+        self._interrupt_requested = False
         if self.imported_content:
             user_input = self.imported_content + "\n\n" + user_input
             self.imported_content = None
@@ -1087,8 +1119,29 @@ class ChatController:
                 accumulated_content += content_delta
             emit(ControllerEvent.stream(content_delta, reasoning_delta))
 
+        def _finalize(reason: str) -> ConversationNode:
+            """把当前已生成的部分落盘为「中断」节点（打断/错误共用）。"""
+            return self._finalize_interrupted(
+                node, reason, emit,
+                content=accumulated_content,
+                reasoning=accumulated_reasoning,
+                input_tokens=accumulated_in_tok,
+                output_tokens=accumulated_out_tok,
+                cache_hit_tokens=accumulated_cache_hit,
+                cache_miss_tokens=accumulated_cache_miss,
+                last_prompt_tokens=last_prompt_tok,
+                last_output_tokens=last_output_tok,
+                tool_messages=tool_messages,
+            )
+
+        def _interrupted() -> bool:
+            return self._interrupt_requested
+
         try:
             while True:
+                if _interrupted():
+                    emit(ControllerEvent.status("⏹ 已打断生成"))
+                    return _finalize("用户已打断")
                 sr = stream_response(
                     self.client,
                     messages,
@@ -1099,7 +1152,19 @@ class ChatController:
                     reasoning_effort=self.reasoning_effort,
                     tools=self.llm_tools,
                     on_chunk=_on_chunk,
+                    should_stop=_interrupted,
                 )
+                if _interrupted():
+                    # 本轮已流出的思考/用量也计入中断节点（正文经 _on_chunk 已累积）
+                    accumulated_reasoning += sr.reasoning or ""
+                    accumulated_in_tok += sr.input_tokens
+                    accumulated_out_tok += sr.output_tokens
+                    accumulated_cache_hit += sr.cache_hit_tokens
+                    accumulated_cache_miss += sr.cache_miss_tokens
+                    last_prompt_tok = sr.input_tokens
+                    last_output_tok = sr.output_tokens
+                    emit(ControllerEvent.status("⏹ 已打断生成"))
+                    return _finalize("用户已打断")
                 if sr.error:
                     # file_id 失效兜底：消息含 file 块且尚未降级过时，清掉 file_id 用 base64 重试一次
                     if not file_degraded and self._messages_contain_file_blocks(messages):
@@ -1191,6 +1256,11 @@ class ChatController:
                     messages.extend(tool_results)
                     tool_messages.append(assistant_msg)
                     tool_messages.extend(tool_results)
+                    # 工具批次跑完后再检查打断：保持 assistant.tool_calls 与
+                    # 结果消息一一对应（历史合法），已执行的命令也一并落盘
+                    if _interrupted():
+                        emit(ControllerEvent.status("⏹ 已打断生成"))
+                        return _finalize("用户已打断")
                     continue
 
                 if sr.content is not None:
@@ -1211,6 +1281,12 @@ class ChatController:
                     last_output_tokens=last_output_tok,
                     tool_messages=tool_messages,
                 )
+        except KeyboardInterrupt:
+            # 纯文本模式下 Ctrl+C 会直接中断阻塞调用：同样保留已生成的部分，
+            # 再抛出交给前端（TUI 走 interrupt() 标志，不会走到这里）。
+            self._interrupt_requested = True
+            _finalize("用户已打断")
+            raise
         except Exception as e:
             # 未预期的异常：节点仍然保留（含已生成的部分内容），
             # 异常继续抛给调用方显示（调用方负责提示用户）
@@ -1683,6 +1759,8 @@ class ChatController:
         details = f"路径: {filepath}\n操作: {mode}\n内容: {line_count} 行, {len(content)} 字符\n预览:\n{preview}"
         if self.file_confirm and not self.confirm(f"即将{'覆盖' if exists else '写入'}文件", details):
             return "用户已取消操作"
+        if self._interrupt_requested:
+            return "用户已打断，未写入文件"
         if self._mcp is not None and "write_file" in self._mcp_tool_names:
             return self._mcp.call("write_file", {"filepath": filepath, "content": content})
         return "写文件工具不可用"
@@ -1706,6 +1784,8 @@ class ChatController:
             details += f"  + {line}\n"
         if self.file_confirm and not self.confirm("即将修改文件", details):
             return "用户已取消操作"
+        if self._interrupt_requested:
+            return "用户已打断，未修改文件"
         if self._mcp is not None and "edit_file" in self._mcp_tool_names:
             return self._mcp.call(
                 "edit_file",
@@ -1724,11 +1804,14 @@ class ChatController:
                 call_args[key] = args[key]
         if self.workspace and not call_args.get("cwd"):
             call_args["cwd"] = self.workspace
-        mcp_call = (
-            (lambda: self._mcp.call("execute_command", call_args))
-            if self._mcp is not None and "execute_command" in self._mcp_tool_names
-            else (lambda: "执行命令工具不可用")
-        )
+
+        def mcp_call() -> str:
+            """执行命令；若在审核/确认期间用户已打断，则不再启动进程。"""
+            if self._mcp is None or "execute_command" not in self._mcp_tool_names:
+                return "执行命令工具不可用"
+            if self._interrupt_requested:
+                return "用户已打断，未执行此命令"
+            return self._mcp.call("execute_command", call_args)
 
         def _ctx_line() -> str:
             parts = [f"工作目录: {cwd or '（启动目录）'}"]
