@@ -536,6 +536,94 @@ async def test_quit_forces_exit_after_interrupt():
             app.exit = real_exit  # type: ignore[method-assign]
 
 
+def test_stream_segment_sealable():
+    """封段边界判定：只在不会破坏 Markdown 结构的位置封段。"""
+    from mincli.tui.app import stream_segment_sealable
+
+    check("封段判定：行尾 + 无围栏 → 可封",
+          stream_segment_sealable("第一行\n第二行\n"))
+    check("封段判定：未到行尾 → 不可封",
+          not stream_segment_sealable("没有换行"))
+    check("封段判定：未闭合围栏 → 不可封",
+          not stream_segment_sealable("正文\n```python\ncode\n"))
+    check("封段判定：闭合围栏后 → 可封",
+          stream_segment_sealable("正文\n```python\ncode\n```\n"))
+    check("封段判定：列表项后 → 不可封",
+          not stream_segment_sealable("正文\n- 列表项\n"))
+    check("封段判定：有序列表项后 → 不可封",
+          not stream_segment_sealable("正文\n3. 第三项\n"))
+    check("封段判定：表格行后 → 不可封",
+          not stream_segment_sealable("正文\n| a | b |\n"))
+    check("封段判定：思考引用前缀不影响判定",
+          stream_segment_sealable("> 思考第一行\n> 思考第二行\n"))
+
+
+async def test_stream_segment_sealing():
+    """超长流式输出自动封段：单段有界、内容不丢、引用不嵌套。"""
+    from mincli.tui import app as appmod
+    from mincli.tui.app import REASONING_HEADER_MD
+
+    ctrl = FakeController()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if app.ctrl is ctrl:
+                break
+        await app._chat_reset("")
+        app._stream_active = True
+        app._answer_started = True
+        app._reasoning_open = False
+        # 带换行的长思考（换行 → 有安全边界），约 12000 字
+        piece = "这是一段很长的思考内容，用于验证封段逻辑是否生效，并确认内容不会丢失。\n"
+        n_batches = 150
+        for _ in range(n_batches):
+            app._stream_buf_reasoning = piece
+            await app._flush_stream_buffer()
+            await pilot.pause()
+        segs = [b for b in app._chat_blocks if isinstance(b, Markdown)]
+        check("封段：长思考被切成多段", len(segs) > 1)
+        check("封段：单段长度有界",
+              all(len(s.source) <= appmod.STREAM_SEG_MAX_CHARS + 400 for s in segs))
+        check("封段：段计数复位（当前段未超限）",
+              app._stream_seg_chars <= appmod.STREAM_SEG_MAX_CHARS + len(piece))
+        source = app._chat_source()
+        check("封段：内容不丢（末批仍在）", source.count("验证封段逻辑是否生效") == n_batches)
+        check("封段：思考标题可重复",
+              source.count(REASONING_HEADER_MD) == len(segs))
+        check("封段：无嵌套引用（无 >>）", ">>" not in source)
+
+
+async def test_adaptive_flush_interval():
+    """自适应刷新间隔：随刷新耗时上升、有上下限、快时回落。"""
+    from mincli.tui.app import (
+        FLUSH_INTERVAL_MAX, FLUSH_INTERVAL_MIN, ChatApp as _App,
+    )
+
+    ctrl = FakeController()
+    app = _App(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if app.ctrl is ctrl:
+                break
+        app._flush_cpu_ema = 0.0
+        app._adapt_flush_interval(0.001)
+        check("自适应刷新：极快刷新回落到下限",
+              app._flush_interval == FLUSH_INTERVAL_MIN)
+        app._adapt_flush_interval(0.5)
+        check("自适应刷新：慢刷新拉长间隔",
+              app._flush_interval > FLUSH_INTERVAL_MIN)
+        for _ in range(20):
+            app._adapt_flush_interval(1.0)
+        check("自适应刷新：间隔有上限",
+              app._flush_interval <= FLUSH_INTERVAL_MAX)
+        for _ in range(40):
+            app._adapt_flush_interval(0.001)
+        check("自适应刷新：刷新变快后回落",
+              app._flush_interval == FLUSH_INTERVAL_MIN)
+
+
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
     test_markdown_safety()
@@ -1109,6 +1197,9 @@ async def main() -> int:
     await test_interrupted_node_kept()
     await test_interrupt_binding()
     await test_quit_forces_exit_after_interrupt()
+    test_stream_segment_sealable()
+    await test_stream_segment_sealing()
+    await test_adaptive_flush_interval()
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

@@ -157,6 +157,63 @@ COMMAND_HELP: dict[str, str] = {
 # 各自独立成块，正文穿插其间正常显示）
 REASONING_HEADER_MD = "> 思考过程"
 
+# ---------------- 流式渲染性能（长输出卡顿的根因治理） ----------------
+# Textual 的 Markdown.append 每次都会把「仍在增长的尾部块」整体重新解析并重建
+# 组件（见 Markdown.append → _update_from_block：remove + 重新 mount）。流式
+# 输出越长，这个尾部块越大，单次刷新越慢，累计就是 O(n²) —— 思考过程动辄上万
+# 字，于是越写越卡，最终主线程被刷新压满、整个界面卡死。
+#
+# 治理办法：不让单个 Markdown 段无限增长。超过 STREAM_SEG_MAX_CHARS 后，在
+# 「安全边界」（行尾、代码围栏配对、非列表/表格行）封存当前段，后续内容进入
+# 新段。这样每次刷新只重建一个有界的尾块，整体回到 O(n)；封段处最多多出一个
+# 段间距，Markdown 结构不会被截断。
+STREAM_SEG_MAX_CHARS = 2000      # 达到该长度且边界安全 → 封段
+STREAM_SEG_FORCE_CHARS = 4000    # 迟迟找不到安全边界时的兜底封段阈值（仍避开未闭合围栏）
+FLUSH_INTERVAL_BASE = 0.08       # 刷新间隔基准（秒）
+FLUSH_INTERVAL_MIN = 0.05        # 自适应刷新间隔下限（秒）
+FLUSH_INTERVAL_MAX = 0.35        # 自适应刷新间隔上限（秒）
+
+# 列表项行首（有序/无序），封段处若正好落在列表项上会把列表拆成两段、序号重排
+_LIST_ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s")
+
+
+def _strip_quote_prefix(line: str) -> str:
+    """去掉思考过程块引用的 `> ` 前缀，便于按原始 Markdown 语义判断结构。"""
+    s = line.lstrip()
+    if s.startswith(">"):
+        s = s[1:].lstrip()
+    return s
+
+
+def stream_segment_fences_balanced(raw: str) -> bool:
+    """当前流式段的 ``` 围栏是否成对（不成对时封段会把代码块截成两半）。"""
+    fences = 0
+    for ln in raw.split("\n"):
+        if _strip_quote_prefix(ln).startswith("```"):
+            fences += 1
+    return fences % 2 == 0
+
+
+def stream_segment_sealable(raw: str) -> bool:
+    """判断能否在“批次之间”安全封段（不破坏 Markdown 结构）。
+
+    安全条件：以换行结尾（不切在行中间）、围栏成对、最后一个非空行不是列表项
+    或表格行（否则会把列表/表格拆成两段）。
+    """
+    if not raw.endswith("\n"):
+        return False
+    if not stream_segment_fences_balanced(raw):
+        return False
+    last = ""
+    for ln in reversed(raw.split("\n")):
+        s = _strip_quote_prefix(ln).strip()
+        if s and not s.startswith("```"):
+            last = s
+            break
+    if last.startswith("|"):
+        return False
+    return not _LIST_ITEM_RE.match(last)
+
 
 def escape_leading_quote_markers(line: str) -> str:
     """转义行首的 Markdown 引用标记（`>`），避免与我们自己加的 `> ` 前缀叠加。
@@ -303,11 +360,16 @@ class ChatApp(App):
         self._completion_index = 0
         # 流式渲染节流：SSE 按 token 级产生事件，逐事件 append 会导致
         # Markdown 组件反复 mount/布局/重绘，主线程跟不上 → 渲染卡顿。
-        # 这里把增量累积到缓冲，每 80ms 批量渲染一次，大幅降低渲染次数。
+        # 这里把增量累积到缓冲批量渲染；间隔按单次刷新的真实 CPU 耗时自适应
+        # （见 _adapt_flush_interval），再叠加按段封段限制单块增长。
         self._stream_buf_content = ""  # 待渲染的正文增量缓冲
         self._stream_buf_reasoning = ""  # 待渲染的思考增量缓冲
-        self._flush_interval = 0.08  # 批量渲染间隔（秒）
+        self._flush_interval = FLUSH_INTERVAL_BASE  # 批量渲染间隔（秒，按刷新耗时自适应）
+        self._flush_cpu_ema = 0.0  # 单次刷新 CPU 耗时的指数滑动平均（用于自适应间隔）
         self._flush_timer = None  # 批量渲染定时器（textual Timer）
+        # 当前流式 Markdown 段的规模（用于封段，见 STREAM_SEG_MAX_CHARS 注释）
+        self._stream_seg_chars = 0  # 已 append 到当前段的字符数
+        self._stream_seg_raw = ""  # 当前段的原始文本（未加 `> ` 前缀），用于结构判断
         self._balance_txt: Optional[str] = None  # 最近一次拉取的账户余额（字符串）
         # 工作流（/wf）：已挂载到“下一次输入”的工作流名（发送后自动解除）
         self._pending_wf: Optional[str] = None
@@ -708,9 +770,12 @@ class ChatApp(App):
 
         新段里没有任何已打开的引用块，因此思考块状态一并复位：否则下一轮
         思考会以为「块还开着」，丢掉「思考过程」标题和 `> ` 前缀。
+        封段同时复位流式段计数（新段从头累计，见 _should_seal_segment）。
         """
         self._chat_md = None
         self._reasoning_open = False
+        self._stream_seg_chars = 0
+        self._stream_seg_raw = ""
 
     async def _chat_add_toolcard(self, card: ToolCard) -> None:
         """工具卡片插到当前段之后，并固化当前段（后续正文进新段）。"""
@@ -726,6 +791,8 @@ class ChatApp(App):
         self._chat_md = None
         self._active_tool_card = None
         self._reasoning_open = False  # 新段没有打开的引用块
+        self._stream_seg_chars = 0
+        self._stream_seg_raw = ""
         if text:
             md = Markdown(text)
             md.styles.height = "auto"
@@ -2011,6 +2078,8 @@ class ChatApp(App):
             self._flush_timer = None
         self._stream_buf_content = ""
         self._stream_buf_reasoning = ""
+        self._stream_seg_chars = 0
+        self._stream_seg_raw = ""
 
     async def _flush_stream_buffer(self) -> None:
         """把缓冲中的流式增量一次性渲染（节流合并的核心）。"""
@@ -2023,7 +2092,54 @@ class ChatApp(App):
         if not content and not reasoning:
             return
         async with self._chat_lock:
-            await self._render_stream_chunk(content, reasoning)
+            t0 = time.process_time()
+            try:
+                await self._render_stream_chunk(content, reasoning)
+            finally:
+                self._adapt_flush_interval(time.process_time() - t0)
+
+    def _adapt_flush_interval(self, cpu: float) -> None:
+        """按本次刷新的真实 CPU 耗时自适应调整刷新间隔。
+
+        刷新越贵 → 间隔越长，保证渲染占用不超过约 1/4 的 CPU，长输出时也不会
+        把消息泵压满；刷新变便宜后自动回落。用 process_time（纯 CPU）而非
+        墙上时间，避免把等待/空闲算进去。
+        """
+        if cpu <= 0:
+            return
+        if self._flush_cpu_ema <= 0:
+            self._flush_cpu_ema = cpu
+        else:
+            self._flush_cpu_ema = self._flush_cpu_ema * 0.7 + cpu * 0.3
+        target = self._flush_cpu_ema * 4
+        self._flush_interval = min(FLUSH_INTERVAL_MAX, max(FLUSH_INTERVAL_MIN, target))
+
+    def _should_seal_segment(self) -> bool:
+        """当前流式段是否该封段（限制单块增长，见 STREAM_SEG_MAX_CHARS 注释）。"""
+        if self._stream_seg_chars < STREAM_SEG_MAX_CHARS:
+            return False
+        raw = self._stream_seg_raw
+        if stream_segment_sealable(raw):
+            return True
+        # 兜底：超长单行/长代码块迟迟等不到安全边界时也封段；但未闭合围栏
+        # 绝不在中间截断（宁可慢一点，也不能把代码块拆坏）。
+        return (
+            self._stream_seg_chars >= STREAM_SEG_FORCE_CHARS
+            and stream_segment_fences_balanced(raw)
+        )
+
+    async def _seal_stream_segment(self) -> None:
+        """封存当前流式 Markdown 段，后续内容写入新段。
+
+        _chat_fix_segment 会复位段计数与 _reasoning_open：若封段发生在思考
+        中途，下一批思考会重新带「思考过程」标题与 `> ` 前缀，自成一块。
+        """
+        await self._chat_fix_segment()
+
+    def _track_stream_segment(self, text: str) -> None:
+        """累计当前流式段的规模与原始文本（用于封段判断）。"""
+        self._stream_seg_chars += len(text)
+        self._stream_seg_raw += text
 
     async def _render_stream_chunk(self, content: str, reasoning: str) -> None:
         """渲染一批流式增量（正文 + 思考），逻辑与原逐 chunk 渲染等价但按批执行。
@@ -2031,6 +2147,9 @@ class ChatApp(App):
         多轮工具调用：一轮「思考→正文→工具调用」结束后会再来一轮
         「思考→正文」；每轮思考各自开启一个带「思考过程」标题的灰色块引用，
         正文穿插其间按普通文本显示。
+
+        单段超过 STREAM_SEG_* 阈值时先封段再写，避免尾块无限增长导致 O(n²)
+        重渲染卡顿（见文件顶部常量注释）。
         """
         chat = self._chat_container()
         if not self._stream_active:
@@ -2040,6 +2159,8 @@ class ChatApp(App):
         if reasoning:
             # 思考过程：灰色块引用；一轮思考期间跨批次直接拼接不重复标题，
             # 上一轮思考已被正文关闭（_reasoning_open=False）时开启新块
+            if self._reasoning_open and self._should_seal_segment():
+                await self._seal_stream_segment()
             if not self._reasoning_open:
                 self._reasoning_open = True
                 await self._chat_stream_append(
@@ -2048,12 +2169,16 @@ class ChatApp(App):
                 )
             else:
                 await self._chat_stream_append(self._reasoning_chunk_md(reasoning))
+            self._track_stream_segment(reasoning)
         if content:
+            if self._should_seal_segment():
+                await self._seal_stream_segment()
             self._reasoning_open = False  # 正文出现 → 当前思考块结束
             if not self._answer_started:
                 self._answer_started = True
                 await self._chat_stream_append("\n\n**mincli：**\n\n")
             await self._chat_stream_append(content)
+            self._track_stream_segment(content)
         await self._chat_shrink_lists()
 
     async def _handle_event_inner(self, ev: ControllerEvent) -> None:
