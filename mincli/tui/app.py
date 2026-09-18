@@ -360,7 +360,7 @@ class ChatApp(App):
         # 悬停弹窗放独立布局层（见 chat.tcss #import-popup），固定显示在状态条上方
         # markup=False：这里显示文件名/工作流名，方括号或 `x="y"` 会被当标签解析而报错
         yield Static("", id="import-popup", markup=False)
-        # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停显示完整列表），右=下次输入估算
+        # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停显示完整列表），右=下次输入
         with Horizontal(id="usage-bar"):
             yield Static("", id="usage-left", markup=False)
             yield Static("", id="usage-center", markup=False)
@@ -409,7 +409,7 @@ class ChatApp(App):
             self.ctrl.save_session()
             self.ctrl.close()
 
-    # ---------------- 输入栏状态条（缓存命中率 / 余额 / 下次输入估算） ----------------
+    # ---------------- 输入栏状态条（缓存命中率 / 余额 / 下次输入） ----------------
 
     def _start_balance_refresh(self) -> None:
         """启动账户余额定时刷新（首次立即拉取一次）。"""
@@ -441,7 +441,7 @@ class ChatApp(App):
         self._refresh_usage_bar()
 
     def _refresh_usage_bar(self) -> None:
-        """刷新输入栏下方状态条（左：缓存命中率+余额；右：下次输入估算）。"""
+        """刷新输入栏下方状态条（左：缓存命中率+余额；右：下次输入 token 与预计价格）。"""
         if self.ctrl is None:
             return
         stats = self.ctrl.usage_stats()

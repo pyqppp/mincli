@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Optional
 
 from openai import OpenAI
 
-from mincli.helpers import estimate_tokens
+from mincli.helpers import estimate_prompt_tokens, estimate_tokens
 from mincli.models import StreamResult
 
 
@@ -33,7 +33,7 @@ def stream_response(
 
     出错时返回 StreamResult(error=...)，不抛异常。
     """
-    estimated_input = estimate_tokens(messages)
+    estimated_input = estimate_prompt_tokens(messages, tools)
     full_content = ""
     reasoning_text = ""
     usage_input = 0

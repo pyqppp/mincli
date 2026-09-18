@@ -24,6 +24,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
 - ♻️ **Resumable Interruptions** — a failed turn keeps its node (partial answer, reasoning and finished tool results) marked `⚠ interrupted`; type `继续` to carry on instead of losing the turn
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
+- 📊 **Real-time Usage Bar** — cache hit rate, balance, next-input tokens and estimated price under the input box (derived from real API `usage`, so it matches the input/output shown at the end of a turn; pricing/peak hours/image tokens are configurable via `~/.mincli/pricing.json`)
 - ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking mode, reasoning effort mid-conversation
 - 🧩 **Two Models** — `deepseek-flash` (DeepSeek-V4.1-Flash: fast, native multimodal image understanding) and `deepseek-v4-pro` (flagship, text only)
 
@@ -154,6 +155,22 @@ The system prompt lives in its own file and is auto-loaded on every startup. Res
 | 3 | Package `mincli/system_prompt.md` (default, ships with the project) |
 
 Edit the matching file to customize the default prompt — it takes effect on the next launch. `mincli info` shows which prompt file is actually in use. If none of the files are available, a minimal built-in fallback prompt is used.
+
+### Real-time usage bar
+
+The two-column bar under the input box (DeepSeek API only) updates live:
+
+**Left: cache hit rate + balance**
+- Cache hit rate = `usage.prompt_cache_hit_tokens ÷ (prompt_cache_hit_tokens + prompt_cache_miss_tokens)` for the current node (DeepSeek context caching is automatic; hits are billed at the cache-hit price)
+- Balance comes from `GET /user/balance` (`total_balance`, CNY preferred), refreshed every 60 s
+
+**Right: next input + estimated price**
+- Next input tokens: for a normal node = **last request's real** `usage.prompt_tokens` + that round's `usage.completion_tokens` (tool definitions are already inside `prompt_tokens`; the answer and its reasoning are sent back as history on the next request and billed the same way), so it lines up with the input/output shown at the end of a turn (measured error ≤5 tokens). Multi-round tool turns use the **last** round, not the turn total. Nodes without usage (`/compact` summary nodes, old sessions, turns that never finished) fall back to a local estimate — tiktoken over messages plus the tool-definition overhead — which over-counts Chinese (1.6–1.9× the real value), so treat it as order-of-magnitude only
+- Estimated price = tokens × unit price ÷ 1,000,000, using the current peak/off-peak window (Beijing time, **weekdays** 9-12 and 14-18 are peak) weighted by the cache hit rate (hits at the cache-hit price, the rest at the miss price)
+
+> Note: the input/output tokens shown at the end of a turn are DeepSeek's real `usage`, **summed over every API call** of that turn (what the turn cost); the bar's "next input" only counts the last call (the next request's context).
+> The local estimator (tiktoken `cl100k_base`) is not DeepSeek's tokenizer: plain Chinese is over-counted ~1.6×, LaTeX-heavy math ~1.9×, English ~1.0×. The **tool definitions** sent on every request (2 built-in + all MCP server tools; 21 tools ≈ 6.8k tokens) are part of the API's `prompt_tokens` and are added to the fallback estimate.
+> `/compact` reports before/after as a tiktoken estimate of the messages alone (no tool definitions), so those numbers differ from the bar by design.
 
 ### Pricing (`~/.mincli/pricing.json`)
 

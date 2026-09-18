@@ -46,6 +46,7 @@ from mincli.config import (
 from mincli.helpers import (
     convert_formulas,
     estimate_input_price,
+    estimate_prompt_tokens,
     estimate_tokens,
     generate_conversation_title,
     get_balance,
@@ -618,10 +619,13 @@ class ChatController:
         """输入栏状态条数据（纯本地计算，不联网）。
 
         缓存命中率取当前节点累计的 usage.prompt_cache_hit/miss_tokens。
-        「下一次输入」token 量统一基于当前节点的完整消息链实时估算
-        （estimate_tokens）。这样在树状对话中切换分支、或压缩摘要后，
-        估算值始终反映当前真实上下文，不会停留在旧分支的 API usage
-        代理值上。用户新输入内容量小，忽略不计。
+        「下一次输入」优先用真实 usage 推算：普通节点 = 本节点**最后一次请求**
+        的 prompt_tokens + 该轮 output_tokens（工具定义已计在 prompt_tokens 里，
+        回答与思考会在下一次请求里作为历史回传并同样计费），因此与对话结束
+        显示的「输入/输出」严格同口径（实测误差 ≤5 token）。只有拿不到 usage
+        的节点（/compact 新建的摘要节点、旧存档、请求还没跑完）才回退到本地
+        估算 estimate_prompt_tokens（= tiktoken 估算 + 工具定义开销，中文会
+        高估，仅供参考）。用户新输入内容量小，忽略不计。
         预计价格按 DeepSeek 峰谷分时定价 × 缓存命中率折算。
         """
         stats: dict = {
@@ -639,10 +643,16 @@ class ChatController:
         total = hit + miss
         if total > 0:
             stats["cache_hit_rate"] = hit / total
-        try:
-            next_in = estimate_tokens(self.tree.get_messages_for_node(node))
-        except Exception:
-            next_in = 0
+        if node.last_prompt_tokens > 0:
+            # 真实 usage 口径：再发一次就是「上次的 prompt + 本轮回答（含回传的思考）」
+            next_in = node.last_prompt_tokens + node.last_output_tokens
+        else:
+            try:
+                next_in = estimate_prompt_tokens(
+                    self.tree.get_messages_for_node(node), self.llm_tools
+                )
+            except Exception:
+                next_in = 0
         stats["next_input_tokens"] = next_in
         stats["estimated_price"] = estimate_input_price(
             self.current_model, next_in, stats["cache_hit_rate"], stats["peak"]
@@ -1064,6 +1074,9 @@ class ChatController:
         accumulated_out_tok = 0
         accumulated_cache_hit = 0
         accumulated_cache_miss = 0
+        # 最后一轮（产出最终回答的那次请求）的真实 usage：状态条「下次输入」用它推算
+        last_prompt_tok = 0
+        last_output_tok = 0
         tool_messages: List[Dict] = []
         file_degraded = False  # file_id 失效降级重试标志（只重试一次）
 
@@ -1118,6 +1131,8 @@ class ChatController:
                         output_tokens=accumulated_out_tok + sr.output_tokens,
                         cache_hit_tokens=accumulated_cache_hit + sr.cache_hit_tokens,
                         cache_miss_tokens=accumulated_cache_miss + sr.cache_miss_tokens,
+                        last_prompt_tokens=sr.input_tokens,
+                        last_output_tokens=sr.output_tokens,
                         tool_messages=tool_messages,
                     )
 
@@ -1128,6 +1143,9 @@ class ChatController:
                 accumulated_out_tok += sr.output_tokens
                 accumulated_cache_hit += sr.cache_hit_tokens
                 accumulated_cache_miss += sr.cache_miss_tokens
+                # 覆盖式记录（不是累加）：状态条只关心最后一次请求的真实 prompt
+                last_prompt_tok = sr.input_tokens
+                last_output_tok = sr.output_tokens
 
                 if sr.tool_calls:
                     assistant_msg: Dict[str, Any] = {
@@ -1189,6 +1207,8 @@ class ChatController:
                     output_tokens=accumulated_out_tok,
                     cache_hit_tokens=accumulated_cache_hit,
                     cache_miss_tokens=accumulated_cache_miss,
+                    last_prompt_tokens=last_prompt_tok,
+                    last_output_tokens=last_output_tok,
                     tool_messages=tool_messages,
                 )
         except Exception as e:
@@ -1202,6 +1222,8 @@ class ChatController:
                 output_tokens=accumulated_out_tok,
                 cache_hit_tokens=accumulated_cache_hit,
                 cache_miss_tokens=accumulated_cache_miss,
+                last_prompt_tokens=last_prompt_tok,
+                last_output_tokens=last_output_tok,
                 tool_messages=tool_messages,
             )
             raise
@@ -1211,6 +1233,8 @@ class ChatController:
         node.reasoning = accumulated_reasoning
         node.input_tokens = accumulated_in_tok
         node.output_tokens = accumulated_out_tok
+        node.last_prompt_tokens = last_prompt_tok
+        node.last_output_tokens = last_output_tok
         node.cache_hit_tokens = accumulated_cache_hit
         node.cache_miss_tokens = accumulated_cache_miss
         node.title = title
@@ -1404,6 +1428,8 @@ class ChatController:
         output_tokens: int = 0,
         cache_hit_tokens: int = 0,
         cache_miss_tokens: int = 0,
+        last_prompt_tokens: int = 0,
+        last_output_tokens: int = 0,
         tool_messages: Optional[List[Dict]] = None,
     ) -> ConversationNode:
         """生成失败/中断时保留节点（含已生成的部分内容），供用户接着「继续」。
@@ -1420,6 +1446,8 @@ class ChatController:
         node.error = error
         node.input_tokens = input_tokens
         node.output_tokens = output_tokens
+        node.last_prompt_tokens = last_prompt_tokens
+        node.last_output_tokens = last_output_tokens
         node.cache_hit_tokens = cache_hit_tokens
         node.cache_miss_tokens = cache_miss_tokens
         if tool_messages:

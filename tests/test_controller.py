@@ -486,21 +486,29 @@ def test_compact():
     for i in range(1, 6):
         collect(ctrl, f"问题{i}")
 
-    # 压缩——压缩前状态条应基于当前节点完整消息链实时估算
+    # 压缩——压缩前状态条是普通节点：真实 usage 口径（最后一次请求 prompt + 该轮输出）
     before_node = ctrl.tree.current_node
     before_us = ctrl.usage_stats()
-    from mincli.helpers import estimate_tokens
+    from mincli.helpers import estimate_prompt_tokens, estimate_tokens
     events = []
     stats = ctrl.compact_history(emit=events.append)
     check("压缩返回统计", stats is not None)
     check(
-        "压缩前状态条=实时消息链估算",
+        "压缩前状态条=最后一次请求 usage 口径",
         before_us["next_input_tokens"]
-        == estimate_tokens(ctrl.tree.get_messages_for_node(before_node)),
+        == before_node.last_prompt_tokens + before_node.last_output_tokens,
     )
-    # 压缩后：状态条「下次输入」= 摘要节点实际发送的估算（= 压缩报告 after）
+    # 压缩后：摘要节点没有 API usage，回退到「含工具定义」的本地估算
     after_us = ctrl.usage_stats()
-    check("压缩后状态条=压缩报告 after", after_us["next_input_tokens"] == stats["after_tokens"])
+    summary_node = ctrl.tree.current_node
+    check("摘要节点无 usage（回退估算）",
+          summary_node.last_prompt_tokens == 0 and summary_node.input_tokens == 0)
+    check(
+        "压缩后状态条=摘要上下文估算+工具定义",
+        after_us["next_input_tokens"]
+        == estimate_prompt_tokens(ctrl.tree.get_messages_for_node(summary_node), ctrl.llm_tools)
+        and after_us["next_input_tokens"] > stats["after_tokens"],
+    )
     check("压缩后状态条显著变小", after_us["next_input_tokens"] < before_us["next_input_tokens"])
     check("全部压缩（main+4轮=5节点）", stats["nodes_compressed"] == 5)
     check("新建摘要节点", stats["node_id"] is not None and stats["node_id"] in ctrl.tree.nodes)
@@ -753,20 +761,54 @@ def test_usage_stats():
     node = ctrl.tree.current_node
     check("节点缓存统计已写入", node.cache_hit_tokens == 180 and node.cache_miss_tokens == 20)
     check("节点 token 统计", node.input_tokens == 200 and node.output_tokens == 30)
+    check("记录最后一次请求 usage", node.last_prompt_tokens == 200 and node.last_output_tokens == 30)
 
     stats = ctrl.usage_stats()
     check("缓存命中率=90%", stats["cache_hit_rate"] is not None and abs(stats["cache_hit_rate"] - 0.9) < 1e-9)
-    # 下次输入 = 当前节点完整消息链的实时估算（树状对话/压缩后口径一致）
-    from mincli.helpers import estimate_input_price, is_peak_hour, estimate_tokens
-    node = ctrl.tree.current_node
-    expect_next = estimate_tokens(ctrl.tree.get_messages_for_node(node))
-    check("下次输入=当前消息链实时估算", stats["next_input_tokens"] == expect_next)
+    # 下次输入 = 真实 usage 口径：本节点最后一次请求的 prompt + 该轮输出
+    from mincli.helpers import (
+        estimate_input_price, is_peak_hour, estimate_tokens,
+        estimate_prompt_tokens, estimate_tools_tokens,
+    )
+    expect_next = node.last_prompt_tokens + node.last_output_tokens
+    check("下次输入=最后一次请求 prompt+输出", stats["next_input_tokens"] == expect_next == 230)
     check("预计价格非空", stats["estimated_price"] is not None and stats["estimated_price"] > 0)
     expect = estimate_input_price(ctrl.current_model, expect_next, 0.9, is_peak_hour())
     check("预计价格公式正确", abs(stats["estimated_price"] - expect) < 1e-9)
     check("模型标记正确", stats["model"] == ctrl.current_model)
 
+    # 没有真实 usage 的节点（摘要节点/旧存档/中断）：回退到含工具定义的本地估算
+    msgs = ctrl.tree.get_messages_for_node(node)
+    est = estimate_prompt_tokens(msgs, ctrl.llm_tools)
+    check("回退估算计入工具定义", estimate_tools_tokens(ctrl.llm_tools) > 0 and est > estimate_tokens(msgs))
+    saved = (node.last_prompt_tokens, node.last_output_tokens)
+    node.last_prompt_tokens = node.last_output_tokens = 0
+    check("无 usage 时回退到含工具定义的估算",
+          ctrl.usage_stats()["next_input_tokens"] == est)
+    node.last_prompt_tokens, node.last_output_tokens = saved
+
+    # 多轮工具调用：状态条用「最后一次请求」，页脚仍显示整轮累加
+    tool_round = [FakeChunk(
+        tool_calls=[FakeToolCall(
+            index=0, id="call_1", name="write_file",
+            arguments='{"filepath": "/tmp/mincli_test.txt", "content": "hi"}',
+        )],
+        usage=SimpleNamespace(prompt_tokens=500, completion_tokens=40,
+                              prompt_cache_hit_tokens=0, prompt_cache_miss_tokens=500),
+    )]
+    answer_round = [FakeChunk(content="写好了。", usage=SimpleNamespace(
+        prompt_tokens=900, completion_tokens=50,
+        prompt_cache_hit_tokens=800, prompt_cache_miss_tokens=100))]
+    ctrl.client.chat.completions.script = [tool_round, answer_round, FakeChatResponse(content="标题3")]
+    ctrl.confirm = lambda title, text: True
+    node3, _ = collect(ctrl, "帮我写文件")
+    check("多轮：页脚=各轮累加", node3.input_tokens == 1400 and node3.output_tokens == 90)
+    check("多轮：最后一次请求单独记录", node3.last_prompt_tokens == 900 and node3.last_output_tokens == 50)
+    check("多轮：下次输入用最后一次请求",
+          ctrl.usage_stats()["next_input_tokens"] == 950)
+
     # 会话持久化保留缓存统计
+    ctrl.tree.current_node = node
     if os.path.exists(TestController.SAVE_FILE):
         os.remove(TestController.SAVE_FILE)
     ctrl.save_session()
@@ -774,6 +816,9 @@ def test_usage_stats():
     check("重载后缓存统计保留", ctrl2.tree.current_node is not None
           and ctrl2.tree.current_node.cache_hit_tokens == 180
           and ctrl2.tree.current_node.cache_miss_tokens == 20)
+    check("重载后 last_* usage 保留", ctrl2.tree.current_node.last_prompt_tokens == 200
+          and ctrl2.tree.current_node.last_output_tokens == 30
+          and ctrl2.usage_stats()["next_input_tokens"] == 230)
     if os.path.exists(TestController.SAVE_FILE):
         os.remove(TestController.SAVE_FILE)
 

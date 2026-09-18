@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import shlex
 import subprocess
 import sys
@@ -173,6 +174,39 @@ def estimate_tokens(messages: list) -> int:
                 tokens += 1
     tokens += 3
     return tokens
+
+
+def estimate_tools_tokens(tools: Optional[list]) -> int:
+    """估算随请求一起发送的工具定义（tools 参数）占用的 prompt token 数。
+
+    DeepSeek 的 ``usage.prompt_tokens`` 把 tools 定义也算进去（实测当前
+    mincli 的 21 个工具约 6.7k token），而 ``estimate_tokens`` 只数 messages，
+    因此需要单独相加，否则「下次输入」估算会系统性偏低约 5~7k。
+    """
+    if not tools:
+        return 0
+    try:
+        payload = json.dumps(tools, ensure_ascii=False)
+    except Exception:
+        return 0
+    return estimate_tokens([{"role": "system", "content": payload}])
+
+
+def estimate_prompt_tokens(messages: list, tools: Optional[list] = None) -> int:
+    """估算一次请求真正计费的 prompt token 数（messages + tools 定义）。
+
+    与 ``estimate_tokens`` 的唯一差异是补上 tools 定义的开销：DeepSeek 的
+    ``usage.prompt_tokens`` 把 tools 定义算进去（实测当前 mincli 的 21 个工具
+    约 6.8k token，只带 2 个内置工具也要 461），而 ``estimate_tokens`` 只数
+    messages，漏掉它会让「下次输入」估算系统性偏低约 3~7k。
+
+    注意：mincli 会把历史思考（reasoning_content）一起回传，实测在**带 tools**
+    时这部分同样计费（不带 tools 时为 0），所以这里照常统计、不做剔除。
+
+    仍受 tiktoken 与 DeepSeek 分词器差异影响（中文实测高估 1.6~1.9 倍），
+    因此只用于没有真实 usage 可用的场景（如 /compact 新建的摘要节点）。
+    """
+    return estimate_tokens(messages) + estimate_tools_tokens(tools)
 
 
 def generate_conversation_title(client: OpenAI, user_msg: str) -> str:

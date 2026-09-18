@@ -30,6 +30,13 @@ class ConversationNode:
     title: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    # 本轮「最后一次请求」的真实 usage：该次请求的 prompt_tokens 与其输出 token。
+    # 状态条「下次输入」= last_prompt_tokens + last_output_tokens：下一次请求就是
+    # 「同样的 prompt + 本轮回答（含思考，mincli 会把它回传且带 tools 时同样计费）」，
+    # 与对话结束显示的输入/输出同口径。为 0（摘要节点、旧存档、请求没跑完）时
+    # 回退到本地估算 estimate_prompt_tokens。
+    last_prompt_tokens: int = 0
+    last_output_tokens: int = 0
     # 本节点各次 API 请求的上下文缓存统计（DeepSeek usage 字段）
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
@@ -81,6 +88,8 @@ class ConversationNode:
             "title": self.title,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_output_tokens": self.last_output_tokens,
             "cache_hit_tokens": self.cache_hit_tokens,
             "cache_miss_tokens": self.cache_miss_tokens,
             "tool_messages": self.tool_messages,
@@ -99,6 +108,8 @@ class ConversationNode:
             title=data["title"],
             input_tokens=data["input_tokens"],
             output_tokens=data["output_tokens"],
+            last_prompt_tokens=data.get("last_prompt_tokens", 0),
+            last_output_tokens=data.get("last_output_tokens", 0),
             cache_hit_tokens=data.get("cache_hit_tokens", 0),
             cache_miss_tokens=data.get("cache_miss_tokens", 0),
             tool_messages=data.get("tool_messages", []),
