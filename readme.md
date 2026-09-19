@@ -22,7 +22,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - ⌨️ **Command Completion** — type `/` to list commands; letters filter candidates; `Tab` cycles / completes; a completed command shows its usage help
 - 🛡️ **Confirm Dialogs** — destructive actions (`/delete`, `/mcp remove`) ask for confirmation; `←`/`→` switches buttons and the default is *Cancel*
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
-- ♻️ **Resumable Interruptions** — press `Esc` (or `Ctrl+C` while busy) to stop generation or kill a running command at any time; a failed/interrupted turn keeps its node (partial answer, reasoning and finished tool results) marked `⚠ interrupted`; type `继续` to carry on instead of losing the turn
+- ♻️ **Resumable Interruptions** — press `Esc` (or `Ctrl+C` while busy) to stop generation or kill a running command at any time; a failed/interrupted turn keeps its node (partial answer, reasoning and finished tool results); type `继续` to carry on instead of losing the turn
 - 📄 **Export as Markdown** — `/save` exports any node as `.md`
 - 📊 **Real-time Usage Bar** — cache hit rate, balance, next-input tokens and estimated price under the input box (derived from real API `usage`, so it matches the input/output shown at the end of a turn; pricing/peak hours/image tokens are configurable via `~/.mincli/pricing.json`)
 - ⚙️ **Dynamic Config** — `/set` changes system prompt, temperature, model, thinking mode, reasoning effort mid-conversation
@@ -344,8 +344,8 @@ Workflow runs go through the exact same pipeline as a normal send (streaming, to
 An API failure (rate limit, dropped connection, `Content Exists Risk` moderation, timeout) no longer throws the turn away — and neither does a manual interrupt:
 
 - **Manual interrupt** — press `Esc` (or `Ctrl+C` while a turn is running) to stop the current generation or kill a running command. Streaming stops at the next chunk and the running command's process group is terminated, so a stuck rendering/build job doesn't have to wait for its timeout.
-- **The node is saved anyway** — whatever was already streamed (partial answer and reasoning), the tool calls/results that already finished, and the tokens spent are all written to the current node, which is marked `⚠ interrupted` in the tree.
-- **The chat log says so** — on an API failure the reason is shown, followed by a note that the turn is saved and that typing `继续` (continue) resumes it.
+- **The node is saved anyway** — whatever was already streamed (partial answer and reasoning), the tool calls/results that already finished, and the tokens spent are all written to the current node.
+- **The chat log says so** — on an API failure the reason is shown, followed by a note that the turn is saved.
 - **Just continue** — send `继续` (or any follow-up) under that node; the history sent to the model contains the partial answer and tool results, so it picks up where it stopped instead of starting over.
 - **Empty answers are never sent back** — if nothing was generated, no empty assistant message is sent to the model (the API would reject it); your question still stays in context.
 - Reopening an interrupted node shows whatever was saved before the interruption; delete it with `/delete <node-id>` when you no longer need it.

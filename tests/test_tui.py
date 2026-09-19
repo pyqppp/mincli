@@ -302,7 +302,6 @@ def test_quote_marker_safety():
         ChatApp,
         escape_leading_quote_markers,
         quote_block_text,
-        quote_warning,
     )
 
     check("未转义的叠加确实会形成嵌套引用（回归用例有效）",
@@ -334,10 +333,6 @@ def test_quote_marker_safety():
     quoted = quote_block_text("第一行\n> 第二行")
     check("多行状态逐行引用", quoted.count("\n> ") == 1 and quoted.startswith("> 第一行"))
     check("多行状态无嵌套引用", _max_quote_depth(quoted) == 1)
-    warn = quote_warning("第一条\n> 第二条")
-    check("告警首行带 ⚠️ 且其余行留在引用内", warn.startswith("> ⚠️ 第一条")
-          and warn.splitlines()[1] == "> \\> 第二条")
-    check("告警块无嵌套引用", _max_quote_depth(warn) == 1)
 
 
 async def test_reasoning_quote_after_tool():
@@ -421,12 +416,17 @@ async def test_interrupted_node_kept():
 
         source = app._chat_source()
         check("中断后正文仍在（部分回答未丢）", "前半句" in source)
-        check("中断后提示已保存可继续", "本轮已保存到当前节点" in source)
+        check("中断后提示已保存", "本轮已保存到当前节点" in source)
         check("中断原因显示在正文里", "Content Exists Risk" in source)
+        check("API 报错提示：不含 emoji",
+              "⚠️" not in source and "💾" not in source)
+        check("API 报错提示：不再提示「继续」",
+              "可直接输入「继续」接着生成" not in source)
 
         tree = app.query_one("#tree", Tree)
         labels = [str(tree.root.label)] + [str(n.label) for n in tree.root.children]
-        check("树中保留中断节点并标 ⚠", any("⚠ 中断" in lb for lb in labels))
+        check("树中保留中断节点", any("中断标题" in lb for lb in labels))
+        check("树中不再有中断标记", not any("⚠" in lb for lb in labels))
         check("中断节点仍是当前节点", ctrl.tree.current_node is not None
               and ctrl.tree.current_node.error != "")
 

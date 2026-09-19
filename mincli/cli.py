@@ -286,8 +286,8 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
         elif ev.kind == "tool":
             print(f"\n[工具: {ev.tool_name}]")
         elif ev.kind == "error":
-            print(f"\n⚠️ {ev.message}")
-            print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
+            print(f"\n{ev.message}")
+            print("本轮已保存到当前节点。")
         elif ev.kind == "done":
             print()
 
@@ -301,8 +301,8 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
             ctrl.interrupt()  # 顺带终止仍在执行的命令进程组
             print("\n⏹ 已打断本轮（已保留生成的部分，可直接输入「继续」）")
         except Exception as e:
-            print(f"\n⚠️ {e}")
-            print("💾 本轮已保存到当前节点，直接输入「继续」可接着生成")
+            print(f"\n{e}")
+            print("本轮已保存到当前节点。")
 
     print("mincli 纯文本模式（输入 /exit 退出，/help 查看命令）")
     pending_wf: Optional[str] = None  # /wf use 挂载到下一次输入的工作流名

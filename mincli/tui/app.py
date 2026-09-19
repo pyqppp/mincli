@@ -252,14 +252,6 @@ def quote_block_text(text: str) -> str:
     return "\n".join(out)
 
 
-def quote_warning(message: str, prefix: str = "⚠️") -> str:
-    """告警块引用：首行带 `⚠️` 前缀，多行内容其余各行仍留在同一引用块内。"""
-    lines = quote_block_text(message).split("\n")
-    head = lines[0]
-    head_text = head[2:] if head.startswith("> ") else head.lstrip(">")
-    return "\n".join([f"> {prefix} {head_text}".rstrip(), *lines[1:]])
-
-
 # 青色主题：整体围绕青色设计（对应原命令行版的青色风格），
 # 回答区背景近黑灰色、整体色相略偏蓝。
 # 默认主题的 $accent 是橙色（输入框/弹窗边框）、滚动条背景是纯黑（ansi_black），
@@ -694,8 +686,6 @@ class ChatApp(App):
             return
         current_id = self.ctrl.tree.current_node.id if self.ctrl.tree.current_node else None
         root_label = f"main: {root.title}"
-        if getattr(root, "error", ""):
-            root_label += "  ⚠ 中断"
         tree_w.root.label = _markup_escape(root_label)
         tree_w.root.data = "main"
         tree_w.root.expand()
@@ -709,8 +699,6 @@ class ChatApp(App):
             label = f"➤ {node.id}: {node.title}"
         else:
             label = f"{node.id}: {node.title}"
-        if getattr(node, "error", ""):
-            label += "  ⚠ 中断"  # 生成中断但仍已保存的节点，方便回来「继续」
         n = parent.add(_markup_escape(label), data=node.id)
         n.expand()
         for child in node.children:
@@ -2215,13 +2203,11 @@ class ChatApp(App):
             await self._chat_stream_append("\n" + quote_block_text(ev.message) + "\n")
             await self._chat_shrink_lists()
         elif ev.kind == "error":
-            await self._chat_stream_append(f"\n\n{quote_warning(ev.message)}\n")
-            # 出错不再回滚节点：本轮已保存（含已生成的部分内容），提示可继续
-            await self._chat_stream_append(
-                ">\n> 💾 本轮已保存到当前节点，可直接输入「继续」接着生成。\n"
-            )
+            await self._chat_stream_append(f"\n\n{quote_block_text(ev.message)}\n")
+            # 出错不再回滚节点：本轮已保存（含已生成的部分内容）
+            await self._chat_stream_append(">\n> 本轮已保存到当前节点。\n")
             await self._chat_shrink_lists()
-            self._rebuild_tree()  # 节点保留，刷新树（中断节点带 ⚠ 标记）
+            self._rebuild_tree()  # 节点保留，刷新树
             self._refresh_import_status()
             self._set_turn_active(False)
         elif ev.kind == "done":
@@ -2240,8 +2226,8 @@ class ChatApp(App):
     def _append_error(self, message: str) -> None:
         self._cancel_flush()  # 出错后不再渲染残留流式缓冲
         asyncio.ensure_future(self._chat_append(
-            f"\n\n{quote_warning(message)}\n"
-            ">\n> 💾 本轮已保存到当前节点，可直接输入「继续」接着生成。\n"
+            f"\n\n{quote_block_text(message)}\n"
+            ">\n> 本轮已保存到当前节点。\n"
         ))
 
     # ---------------- 确认对话框（供 controller 工具调用） ----------------
