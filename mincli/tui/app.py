@@ -841,12 +841,6 @@ class ChatApp(App):
         if node.reasoning:
             content += "\n\n" + self._build_reasoning_md(node.reasoning) + "\n\n"
         content += f"**mincli：**\n\n{node.assistant_msg}\n\n"
-        if getattr(node, "error", ""):
-            # 生成中断但已保存的节点：标出失败原因，并提示可以接着让模型继续
-            content += (
-                f"{quote_warning('生成中断：' + node.error)}\n>\n"
-                "> 本轮内容已保存，可直接输入「继续」接着生成。\n\n"
-            )
         content += (
             f"---\n\n"
             f"*📊 输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*"

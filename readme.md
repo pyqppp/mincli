@@ -345,10 +345,10 @@ An API failure (rate limit, dropped connection, `Content Exists Risk` moderation
 
 - **Manual interrupt** — press `Esc` (or `Ctrl+C` while a turn is running) to stop the current generation or kill a running command. Streaming stops at the next chunk and the running command's process group is terminated, so a stuck rendering/build job doesn't have to wait for its timeout.
 - **The node is saved anyway** — whatever was already streamed (partial answer and reasoning), the tool calls/results that already finished, and the tokens spent are all written to the current node, which is marked `⚠ interrupted` in the tree.
-- **The chat log says so** — the failure reason is shown, followed by a note that the turn is saved and that typing `继续` (continue) resumes it.
+- **The chat log says so** — on an API failure the reason is shown, followed by a note that the turn is saved and that typing `继续` (continue) resumes it.
 - **Just continue** — send `继续` (or any follow-up) under that node; the history sent to the model contains the partial answer and tool results, so it picks up where it stopped instead of starting over.
 - **Empty answers are never sent back** — if nothing was generated, no empty assistant message is sent to the model (the API would reject it); your question still stays in context.
-- Reopening an interrupted node shows the failure reason; delete it with `/delete <node-id>` when you no longer need it.
+- Reopening an interrupted node shows whatever was saved before the interruption; delete it with `/delete <node-id>` when you no longer need it.
 
 > If the failure was content moderation, resending the same context may be rejected again — rephrasing or starting a fresh node works better.
 

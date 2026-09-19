@@ -429,6 +429,12 @@ async def test_interrupted_node_kept():
         check("树中保留中断节点并标 ⚠", any("⚠ 中断" in lb for lb in labels))
         check("中断节点仍是当前节点", ctrl.tree.current_node is not None
               and ctrl.tree.current_node.error != "")
+
+        # 节点视图不再渲染「生成中断/已保存可继续」提示，但部分回答仍在
+        node_view = app._node_content(ctrl.tree.current_node)
+        check("中断节点视图：不再显示中断提示",
+              "生成中断" not in node_view and "本轮内容已保存" not in node_view)
+        check("中断节点视图：仍保留部分回答", "前半句" in node_view)
         check("状态条等控件关闭 markup",
               all(not app.query_one(sel, Static)._render_markup
                   for sel in ("#usage-left", "#usage-center", "#usage-right",
