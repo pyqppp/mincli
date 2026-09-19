@@ -16,6 +16,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - 🖥️ **Textual TUI** — sidebar conversation tree + streaming Markdown chat log + multi-line input box
 - 🚀 **Streaming Output** — real-time Markdown rendering; tables wrap to terminal width
 - 🌲 **Tree Conversations** — main line + branch nodes with globally unique IDs; click nodes to switch, jump with `/<id>`
+- **Multiple conversation trees** — keep several independent trees (`/tree` to create / switch / delete); each has an id and a fixed colour that re-themes the whole UI, and mounts its own capabilities (dialogue / system tools / external MCP tools)
 - 🧠 **Thinking Mode** — full V4 reasoning chain display, toggleable on the fly
 - 🔧 **Tool Calling** — AI autonomously invokes tools: read/write/edit files, fetch web pages, list directories, execute commands (user-confirmed)
 - 🔁 **Workflows (`/wf`)** — save one finished task (or a whole run of turns) as a reusable workflow that lives on disk; `/wf use` attaches it to your next message, `/wf run` executes it right away — no need to re-describe repetitive work
@@ -78,11 +79,7 @@ Config load order (high → low):
 
 ### 4. Launch
 ```bash
-# Recommended: Textual TUI
 mincli chat
-
-# Plain text fallback (no TUI, no extra dependencies)
-mincli chat --no-tui
 
 # Python module
 python -m mincli chat
@@ -92,6 +89,49 @@ python main.py chat
 ```
 
 ---
+
+## Multiple Conversation Trees
+
+mincli keeps several independent conversation trees at once. Each tree owns its dialogue, mounted capabilities, audit level, working directory and input draft; model, temperature, thinking mode and system prompt are shared globally.
+
+- **No names, only ids and colours**: ids increase monotonically and are never reused (delete tree 2 and the next new tree is 4). Colours are bound to the id (1 cyan, 2 purple, 3 green, 4 orange, 5 pink, 6 blue, 7 yellow, 8 red, then it wraps), so deleting a tree never recolours the others.
+- **The whole UI re-themes with the active tree**: background and panels stay the same near-black, while primary/accent, borders, Markdown headings and scrollbars rotate. The current tree id sits at the right of the top header (plus "done" / "error" when a background generation finishes).
+- **Sidebar top area**: the first row holds "会话" and "全览"; up to three tree rows follow (four rows total). More trees scroll inside that area; click a row or press `Ctrl/Alt+1~8` to switch.
+- **First launch with no tree**: a creation wizard opens and you pick the capabilities to mount. Cancelling quits the program. Use `/tree new` later to add more.
+
+### Capabilities (per tree)
+
+The wizard has three groups:
+
+| Capability | Meaning |
+|------------|---------|
+| Dialogue | Mandatory (the AI conversation itself), cannot be unchecked |
+| System tools | One group switch: read/write files, list dirs, run commands, fetch web pages, plus the 2 conversation-tree query tools |
+| External MCP tools | Grouped per server, checked tool by tool; nothing is checked by default |
+
+- Only the checked tools are sent to the model, so unrelated tools do not eat context; unmounted capabilities are invisible to the model and cannot be called.
+- If MCP is still connecting, the wizard shows "connecting MCP…" and fills the tool list once ready; you can also create the tree first and use `/tree <id> tools` later.
+- The list is a whitelist: new tools added by a server do not appear in existing trees, and a checked tool that disappears from its server is skipped with a notice.
+- After `/mcp reload` the mounted tools become active again (matched by name).
+
+### Background generation
+
+Only one tree may generate at a time:
+
+- While tree 1 generates you can switch to tree 2 to look around, but sending there is refused with "conversation tree 1 is generating" until it finishes or you press `Esc`.
+- Generation continues in the background after switching (content is still saved). Its tool-confirmation dialogs still pop up, titled with the tree they come from.
+- When a background tree finishes, its sidebar row shows "done" / "error", the header badge updates, and switching to it shows the full result.
+
+### Storage
+
+```
+~/.mincli/trees/index.json    # ids, per-tree colour, active tree, global settings
+~/.mincli/trees/<id>.json     # everything belonging to one tree
+```
+
+One file per tree: a corrupted tree cannot break the others, and create/switch/delete only touch small files. Trees are saved when switching, after each turn and on exit; deleting a tree removes its file too (confirmed).
+
+> The old single-session file `~/.mincli_session.json` is no longer read or written (it stays on disk and is never deleted automatically).
 
 ## Quick Start
 
@@ -118,6 +158,8 @@ mincli chat --help
 | `Tab` | Complete / cycle command completion candidates |
 | `↑` / `↓` | Scroll the answer area (when the input is empty); double-press and hold for 2× speed |
 | `Esc` / `Ctrl+C` (while busy) | Interrupt the current generation or running command (the partial turn is kept); `Ctrl+C` when idle quits, and a second `Ctrl+C` forces quit if a turn is stuck |
+| `Ctrl+1~8` / `Alt+1~8` | Switch directly to that conversation tree (some terminals do not report Ctrl+digit as a distinct key; use Alt+digit there) |
+| Click a sidebar tree row | Switch to that conversation tree |
 | `Ctrl+C` | Quit (copy wins when text is selected) |
 
 ### In-conversation examples
@@ -141,6 +183,7 @@ What files are here?
 |----------|----------|---------|-------------|
 | `DEEPSEEK_API_KEY` | Yes | — | DeepSeek API key |
 | `MINCLI_SAVE_PATH` | No | `~/Documents/mincli_Conversations` | Export directory |
+| `MINCLI_TREES_PATH` | No | `~/.mincli/trees` | Conversation-tree storage (index + one file per tree) |
 | `MINCLI_SYSTEM_PROMPT_PATH` | No | Package `mincli/system_prompt.md` | Path to a custom system prompt file |
 | `MINCLI_PRICING_PATH` | No | `~/.mincli/pricing.json` | Pricing / peak-hour / image-token overrides |
 | `MINCLI_EXEC_MAX_TIMEOUT` | No | `1800` | Upper bound (seconds) for `execute_command`'s `timeout`; raises the old 120s hard cap so long rendering/build tasks aren't cut off |
@@ -202,7 +245,6 @@ CLI flags:
 | `--thinking` | off | Enable thinking mode |
 | `--effort` | `high` | Reasoning effort: `low` \| `high` \| `max` |
 | `--temp` | `1.0` | Temperature |
-| `--no-tui` | off | Plain-text chat loop (no Textual TUI) |
 
 ---
 
@@ -232,7 +274,11 @@ CLI flags:
 | `/mcp reload` | Reload MCP server config |
 | `/import <path-or-URL> [...]` | Import file (txt/md/py/csv/pdf/docx), fetch web page, or add images — multiple targets at once; image files become pending images; `/import clear` clears pending imports. Path parsing is cross-platform: Windows backslash paths (`C:\Users\me\a.txt`) and quoted/paths-with-spaces both work |
 | `/<node-id>` (e.g. `/a3`) | Jump to node directly |
-| `/tree` | List all nodes |
+| `/tree` | List all conversation trees (id / colour / node count / mounted capabilities) |
+| `/tree <id>` | Switch to that conversation tree (or click its sidebar row, or press Ctrl/Alt+1~8) |
+| `/tree new` | Create a conversation tree (pick its capabilities in the wizard) |
+| `/tree delete <id>` | Delete a whole tree (confirmed; ids are never reused) |
+| `/tree <id> tools` | Change the capabilities mounted in that tree |
 | `/info [node-id]` | Show node details |
 | `/up` | Go to parent node |
 | `/home` | Jump to root |
@@ -294,7 +340,6 @@ Connecting to MCP (handshake with the bundled server subprocess, plus remote con
 - While connecting, the status bar under the input shows "MCP 连接中…" and `/mcp list` reports "连接中…" for the pending servers.
 - If you send a message before connecting finishes, that turn first shows "正在连接 MCP 服务…" and waits for readiness, so every request carries one complete, consistent tool list.
 - Connection results (servers ready, tool count, failures) arrive as TUI notifications instead of being printed to stdout.
-- Plain-text mode (`--no-tui`) still waits for MCP at startup so logs do not interleave with the `input()` prompt.
 
 Other startup costs were trimmed too: `trafilatura` (web fetch, ~0.2s) and the MCP SDK are now imported only on first use.
 
@@ -347,7 +392,6 @@ Workflow runs go through the exact same pipeline as a normal send (streaming, to
 - Workflows are stored apart from the session in `~/.mincli/workflows.json` (override with `MINCLI_WORKFLOWS_PATH`).
 - On macOS, `/wf edit <name>` without a request opens the spec in a system editor and auto-imports it on save; other platforms use the model-revision form.
 - Re-running `/wf save <name>` overwrites (with confirmation) — redo the task first, then re-save to update a workflow.
-- `--no-tui` text mode supports `/wf list/show/save/use/run/delete/rename/edit` (edit = model revision only).
 
 ---
 
@@ -379,7 +423,7 @@ An API failure (rate limit, dropped connection, `Content Exists Risk` moderation
 ├── mincli/                  # Core package
 │   ├── __init__.py          # Version
 │   ├── __main__.py          # python -m mincli entry
-│   ├── cli.py               # Typer CLI: chat (TUI / --no-tui), info
+│   ├── cli.py               # Typer CLI: chat (multi-tree TUI), info
 │   ├── config.py            # Constants + config loading
 │   ├── system_prompt.md     # Default system prompt (auto-loaded on startup)
 │   ├── controller.py        # ChatController (logic + event stream)
@@ -408,8 +452,8 @@ An API failure (rate limit, dropped connection, `Content Exists Risk` moderation
 
 ## FAQ
 
-**Q: "Session file corrupted" on startup?**  
-A: Delete `~/.mincli_session.json` and restart.
+**Q: "Corrupted tree file" on startup?**  
+A: Delete `~/.mincli/trees/<id>.json` and restart (the index entry is pruned on the next launch); the other trees are unaffected.
 
 **Q: Thinking mode on but no reasoning shown?**  
 A: Make sure using `flash`/`pro` model with `--thinking` enabled.

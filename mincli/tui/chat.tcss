@@ -18,31 +18,116 @@ Horizontal {
     background: $surface;
 }
 
-#sidebar-title {
-    height: 1;
-    padding: 0 1;
-    text-style: bold;
-    color: $text-muted;
-}
-
-/* 侧栏头部：标题 + 「全览/分栏」切换按钮 */
+/* 侧栏头部：标题 + 「全览/分栏」切换按钮压在同一行（比历史版本省 2 行高度），
+   下面的 #tree-list 就用省出来的空间放对话树列表 */
 #sidebar-header {
-    height: 3;
+    height: 1;
     width: 1fr;
-    align: center middle;
-    border-bottom: solid $primary 30%;
-    background: $surface;
+    background: $panel;
 }
 
 #sidebar-header #sidebar-title {
     width: 1fr;
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    text-style: bold;
 }
 
 #fullview-btn {
     width: auto;
-    min-width: 8;
+    min-width: 6;
+    height: 1;
+    margin: 0 1 0 0;
+    border: none;
+    background: $surface;
+    color: $primary;
+}
+
+/* 对话树列表：最多 3 行（加头部 1 行 = 最多 4 行），树更多时这一栏内部滚动 */
+/* 不加分隔线：这一栏的行数上限是硬要求（1 行标题 + 最多 3 行树），
+   多出来的第 5 行会破坏「最长 4 行」；标题行用 $panel 底色与列表区分 */
+#tree-list {
+    /* 高度由代码按行数设置：<=3 棵时 auto（收缩），>3 棵时固定 3 行（内部滚动）。
+       不能用 max-height 代替——那会把超出的行挤成 0 高度而不是产生滚动区 */
+    height: auto;
+    width: 1fr;
+    scrollbar-size-vertical: 1;
+}
+
+/* 顶部右侧的当前对话树徽标（编号 + 生成/完成状态） */
+#tree-badge {
+    dock: right;
+    width: 22;
+    height: 1;
+    padding: 0 1;
+    content-align: right middle;
+    color: $primary;
+    text-style: bold;
+}
+
+/* 建树 / 改能力向导 */
+TreeWizardScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#wizard-box {
+    width: 78;
+    max-width: 95%;
+    height: auto;
+    max-height: 80%;
+    border: round $accent 70%;
+    background: $surface;
+    padding: 0 1;
+}
+
+#wizard-title {
+    height: 1;
+    color: $primary;
+    text-style: bold;
+}
+
+#wizard-note {
+    height: auto;
+    color: $text-muted;
+}
+
+#wizard-body {
+    height: auto;
+    max-height: 18;
+    margin: 1 0;
+}
+
+.wizard-group {
+    height: 1;
+    color: $primary;
+    text-style: bold;
+    margin: 1 0 0 0;
+}
+
+.wizard-server {
+    height: 1;
+    color: $text-muted;
+    margin: 1 0 0 1;
+}
+
+.wizard-hint {
+    height: auto;
+    color: $text-muted;
+}
+
+.wizard-tool {
+    margin: 0 0 0 2;
+}
+
+#wizard-buttons {
     height: 3;
-    margin: 0 1;
+    align: right middle;
+}
+
+#wizard-buttons Button {
+    margin: 0 0 0 2;
 }
 
 /* 全览模式：隐藏右侧回答区，节点树全宽显示（输入框保留） */

@@ -7,6 +7,7 @@ import os
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
+from textual.widget import Widget
 from textual.widgets import Static, TextArea
 
 from mincli.helpers import split_path_args
@@ -159,6 +160,103 @@ class ChatInput(TextArea):
         if target != self._target_height:
             self._target_height = target
             self.styles.height = target
+
+
+class TreeRow(Widget):
+    """侧栏对话树列表的一行：行首色块 + 「编号 对话」+ 后台状态 + 当前树高亮。
+
+    色块用 1 列宽的控件底色实现（不是用方块字符拼出来的），因此不引入任何
+    图形符号；当前树的整行高亮沿用主题色（主题随当前树切换）。
+
+    注意不要继承 Horizontal：chat.tcss 里有全局 `Horizontal { height: 1fr }`，
+    会让每行在受限高度里被压扁（树多于 3 棵时行会叠在一起），这里用
+    `layout: horizontal` 自己排布。
+    """
+
+    DEFAULT_CSS = """
+    TreeRow {
+        layout: horizontal;
+        height: 1;
+        width: 1fr;
+    }
+
+    TreeRow .tree-swatch {
+        width: 1;
+        height: 1;
+    }
+
+    TreeRow .tree-name {
+        width: 1fr;
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+
+    TreeRow:hover {
+        background: $primary 12%;
+    }
+
+    TreeRow.active {
+        background: $primary 30%;
+    }
+
+    TreeRow.active .tree-name {
+        color: $text;
+        text-style: bold;
+    }
+    """
+
+    class Selected(Message):
+        """点击某一行对话树（请求切换）。"""
+
+        def __init__(self, number: int) -> None:
+            super().__init__()
+            self.number = number
+
+    def __init__(
+        self,
+        number: int,
+        color: int,
+        label: str,
+        active: bool = False,
+        mark: str = "",
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.number = number
+        self.color = color
+        self._label = label
+        self._mark = mark
+        self._active = active
+        self._swatch: Static | None = None
+        self._name: Static | None = None
+
+    def compose(self):
+        self._swatch = Static("", classes="tree-swatch")
+        self._name = Static("", classes="tree-name", markup=False)
+        yield self._swatch
+        yield self._name
+
+    def on_mount(self) -> None:
+        from mincli.tui.theme import TREE_PALETTE
+
+        index = max(0, min(len(TREE_PALETTE) - 1, int(self.color) - 1))
+        if self._swatch is not None:
+            self._swatch.styles.background = TREE_PALETTE[index]["primary"]
+        if self._name is not None:
+            text = self._label
+            if self._mark == "done":
+                text += "  完成"
+            elif self._mark == "error":
+                text += "  出错"
+            self._name.update(text)
+        self.set_class(self._active, "active")
+
+    def on_click(self, event) -> None:
+        event.stop()
+        self.post_message(self.Selected(self.number))
 
 
 class ToolCard(Static):

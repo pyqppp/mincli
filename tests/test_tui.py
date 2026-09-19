@@ -100,10 +100,6 @@ class _FakeClient:
 class FakeController(ChatController):
     """真实 ChatController + 固定事件流（不联网）。"""
 
-    SAVE_FILE = os.path.join(
-        tempfile.mkdtemp(prefix="mincli_tui_test_"), "session.json"
-    )
-
     # 工作流提炼/修订的固定产出（不联网）
     WF_STUB_DOC = (
         "目标：测试工作流\n\n"
@@ -113,15 +109,21 @@ class FakeController(ChatController):
         "1. 读取 {path} 并总结\n"
     )
 
-    def __init__(self):
+    def __init__(self, with_tree: bool = True, trees_dir: str | None = None):
         wf_dir = tempfile.mkdtemp(prefix="mincli_tui_wf_")
         self.WORKFLOWS_FILE = os.path.join(wf_dir, "workflows.json")
+        # 每个控制器一个独立树目录：树会落盘，共享目录会让用例互相污染
+        self.TREES_DIR = trees_dir or tempfile.mkdtemp(prefix="mincli_tui_trees_")
         super().__init__(
             client=_FakeClient([]),
             default_system="sys",
             default_temperature=1.0,
             auto_start_mcp=False,
+            trees_dir=self.TREES_DIR,
         )
+        # 默认先建一棵树：没有树时 App 启动会弹建树向导，绝大多数用例不测这个
+        if with_tree and not self.has_trees:
+            self.create_tree()
         self.saved = False
         self.closed = False
         self.mcp_start_count = 0
@@ -692,11 +694,12 @@ async def test_mcp_background_ui():
         check("MCP：连接日志转成通知", bool(notified) and "boom" in notified[0])
 
         ctrl._mcp.release.set()  # 放行后台等待，模拟连接完成
+        left = ""
         for _ in range(60):
             await pilot.pause()
-            if not ctrl.mcp_connecting:
+            left = str(app.query_one("#usage-left", Static).content)
+            if not ctrl.mcp_connecting and "MCP 连接中" not in left:
                 break
-        left = str(app.query_one("#usage-left", Static).content)
         check("MCP：就绪后状态条提示消失", "MCP 连接中" not in left)
 
 
@@ -712,6 +715,251 @@ async def test_first_view_deferred():
             if "答案" in app._chat_source():
                 break
         check("启动：首帧之后恢复当前节点内容", "答案" in app._chat_source())
+
+
+async def test_tree_sidebar_ui():
+    """多对话树：侧栏列表 / 徽标 / 主题 / 切换 / 草稿。"""
+    ctrl = FakeController()
+    ctrl.create_tree(system_tools=False, mcp_tools=["tavily_search"])   # 树 2
+    ctrl.tree.create_root("二问", "二答", "", "标题二", 1, 1)
+    ctrl.create_tree()                                                  # 树 3
+    ctrl.tree.create_root("三问", "三答", "", "标题三", 1, 1)
+    ctrl.switch_tree(2)
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if app._tree_rows:
+                break
+        rows = app._tree_rows
+        check("侧栏：三棵树各一行", len(rows) == 3 and [r.number for r in rows] == [1, 2, 3])
+        check("侧栏：当前树那一行高亮", [r.has_class("active") for r in rows] == [False, True, False])
+        check("侧栏：行标签是「编号 对话」", str(rows[1]._name.content).strip() == "2 对话")
+        check("侧栏：色块用该树的颜色",
+              rows[1]._swatch.styles.background is not None)
+        list_w = app.query_one("#tree-list", VerticalScroll)
+        check("侧栏：那一栏不超过 3 行（加标题行共 4 行）", list_w.region.height <= 3)
+        check("侧栏：三行都完整可见",
+              all(r.region.height == 1 and list_w.region.contains_region(r.region)
+                  for r in rows))
+        check("顶部：徽标显示当前树", "树 2" in str(app.query_one("#tree-badge", Static).content))
+        check("主题：随当前树切换", app.theme == "mincli-tree-2")
+
+        # Ctrl+3 → 切到树 3
+        await pilot.press("ctrl+3")
+        for _ in range(20):
+            await pilot.pause()
+            if ctrl.active_number == 3 and "三答" in app._chat_source():
+                break
+        check("快捷键：Ctrl+3 切到树 3", ctrl.active_number == 3)
+        check("切换后显示该树节点内容", "三答" in app._chat_source())
+        check("切换后主题跟着换", app.theme == "mincli-tree-3")
+        check("切换后徽标跟着换", "树 3" in str(app.query_one("#tree-badge", Static).content))
+
+        # 草稿按树隔离
+        inp = app.query_one("#chat-input", ChatInput)
+        inp.load_text("树 3 写到一半")
+        await pilot.pause()
+        app._save_draft()
+        await app._switch_tree(2)
+        for _ in range(10):
+            await pilot.pause()
+        check("草稿：切走后再回来是空的（树 2 没写过）", inp.text == "")
+        await app._switch_tree(3)
+        for _ in range(10):
+            await pilot.pause()
+        check("草稿：切回树 3 恢复未发送内容", inp.text == "树 3 写到一半")
+
+        # /tree 列表
+        await app._handle_command("/tree")
+        for _ in range(10):
+            await pilot.pause()
+        src = app._chat_source()
+        check("命令：/tree 列出全部对话树", "树 1" in src and "树 2" in src and "树 3" in src)
+        check("命令：/tree 标注当前树", "（当前）" in src)
+        check("命令：/tree 显示挂载的能力", "无系统工具" in src or "外置工具" in src)
+
+        # 超过 3 棵：这一栏高度不变，改为内部滚动
+        ctrl.create_tree()
+        ctrl.create_tree()
+        app._refresh_tree_ui()
+        for _ in range(20):
+            await pilot.pause()
+            if len(app._tree_rows) == 5:
+                break
+        check("侧栏：5 棵树都在列表里", len(app._tree_rows) == 5)
+        list_w = app.query_one("#tree-list", VerticalScroll)
+        check("侧栏：5 棵树时高度仍是 3 行", list_w.region.height == 3)
+        check("侧栏：5 棵树时改为内部滚动", list_w.max_scroll_y > 0)
+
+        # 树少时这一栏收缩（2 棵 = 2 行，1 棵 = 1 行）
+        for expected in (2, 1):
+            while len(ctrl.tree_numbers()) > expected:
+                ctrl.delete_tree(ctrl.tree_numbers()[-1])
+            app._refresh_tree_ui()
+            for _ in range(20):
+                await pilot.pause()
+                if len(app._tree_rows) == expected:
+                    break
+            check(f"侧栏：{expected} 棵树时那一栏收缩到 {expected} 行",
+                  app.query_one("#tree-list", VerticalScroll).region.height == expected)
+
+
+async def test_tree_wizard_bootstrap():
+    """没有树时启动：弹出建树向导，选完能力后建树并进入。"""
+    from mincli.tui.tree_wizard import TreeWizardScreen
+
+    ctrl = FakeController(with_tree=False)
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 35)) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if isinstance(app.screen, TreeWizardScreen):
+                break
+        check("无树：启动即弹建树向导", isinstance(app.screen, TreeWizardScreen))
+        check("无树：输入框提示先建树",
+              "请先新建对话树" in str(app.query_one("#chat-input", ChatInput).placeholder))
+        check("无树：徽标提示未创建", "未创建对话树" in str(app.query_one("#tree-badge", Static).content))
+        check("无树：侧栏那一栏只剩标题 1 行",
+              app.query_one("#tree-list", VerticalScroll).region.height == 0)
+
+        # 取消勾选系统工具，然后确定
+        screen = app.screen
+        screen.query_one("#cap-system").value = False
+        await pilot.pause()
+        screen.query_one("#wizard-ok", Button).press()
+        for _ in range(20):
+            await pilot.pause()
+            if ctrl.has_trees:
+                break
+        check("向导：确定后建出编号 1 的树", ctrl.tree_numbers() == [1])
+        check("向导：能力按勾选结果挂载", ctrl.tree_caps(1)["system_tools"] is False)
+        check("向导：关闭后回到主界面", not isinstance(app.screen, TreeWizardScreen))
+        check("向导：建树后输入框提示恢复",
+              "请先新建对话树" not in str(app.query_one("#chat-input", ChatInput).placeholder))
+
+
+async def test_tree_wizard_cancel_exits():
+    """没有树时取消建树向导 → 退出程序（不允许停在无法使用的界面）。"""
+    from mincli.tui.tree_wizard import TreeWizardScreen
+
+    ctrl = FakeController(with_tree=False)
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 35)) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if isinstance(app.screen, TreeWizardScreen):
+                break
+        check("取消：向导已弹出", isinstance(app.screen, TreeWizardScreen))
+        await pilot.press("escape")
+        for _ in range(20):
+            await pilot.pause()
+            if not app.is_running:
+                break
+        check("取消：程序退出", not app.is_running)
+        check("取消：没有建出任何树", not ctrl.has_trees)
+
+
+async def test_tree_wizard_mcp_refresh():
+    """建树向导开着时 MCP 连完：占位提示换成真实的工具复选框。"""
+    from mincli.tui.tree_wizard import TreeWizardScreen
+
+    class FakeMcp:
+        connecting = True
+        ready = False
+        ok = False
+
+        def tools(self):
+            return []
+
+        def tool_names(self):
+            return set()
+
+        def tool_owner(self, name):
+            return None
+
+        def tools_by_server(self):
+            return {}
+
+        def configured_servers(self):
+            return ["tavily"]
+
+        def server_status(self):
+            return {}
+
+        def reload(self):
+            pass
+
+        def cancel_running(self):
+            return True
+
+        def close(self):
+            pass
+
+    ctrl = FakeController(with_tree=False)
+    ctrl._mcp = FakeMcp()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 35)) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if isinstance(app.screen, TreeWizardScreen):
+                break
+        screen = app.screen
+        check("向导：MCP 未就绪时显示占位提示",
+              "正在连接" in str(screen.query_one("#wizard-hint", Static).content))
+
+        # 模拟后台连接完成，并触发 UI 侧的就绪回调
+        ctrl._mcp.connecting = False
+        ctrl._mcp.ready = True
+        ctrl._mcp.ok = True
+        ctrl._mcp.tools_by_server = lambda: {
+            "mincli": ["read_file"], "tavily": ["tavily_search"]
+        }
+        app._on_mcp_ready_ui()
+        for _ in range(10):
+            await pilot.pause()
+        hint = str(screen.query_one("#wizard-hint", Static).content)
+        check("向导：连完后占位提示消失", "正在连接" not in hint)
+        check("向导：外置工具复选框自动补上", "tavily_search" in screen._boxes)
+        check("向导：内置工具不单独列出（归入系统工具）", "read_file" not in screen._boxes)
+
+
+async def test_tree_background_events():
+    """后台那棵树的事件不渲染到当前消息区，只提示完成。"""
+    ctrl = FakeController()
+    ctrl.create_tree()          # 树 2
+    ctrl.switch_tree(2)
+    app = ChatApp(controller=ctrl)
+    notified = []
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.notify = lambda message, **kwargs: notified.append(message)
+        for _ in range(10):
+            await pilot.pause()
+        before = app._chat_source()
+        ev = ControllerEvent.stream("别的树的流式内容", "")
+        ev.tree = 1
+        await app._handle_event(ev)
+        await pilot.pause()
+        check("后台事件：流式内容不串进当前消息区",
+              "别的树的流式内容" not in app._chat_source())
+        done = ControllerEvent.done(None)
+        done.tree = 1
+        await app._handle_event(done)
+        for _ in range(10):
+            await pilot.pause()
+        check("后台事件：完成时给出提示", any("对话树 1" in m and "完成" in m for m in notified))
+        check("后台事件：当前视图未被改动", app._chat_source() == before)
+
+        # 树 1 在后台生成期间，当前树（2）不允许发送
+        notified.clear()
+        app._turn_active = True
+        ctrl._gen_tree = 1
+        await app._send_user_text("趁它忙我也要发")
+        await pilot.pause()
+        check("后台生成期间：当前树发送被拒绝",
+              any("正在生成" in m for m in notified))
+        check("后台生成期间：消息没有进入会话",
+              "趁它忙我也要发" not in app._chat_source())
 
 
 async def main() -> int:
@@ -1292,6 +1540,11 @@ async def main() -> int:
     await test_adaptive_flush_interval()
     await test_mcp_background_ui()
     await test_first_view_deferred()
+    await test_tree_sidebar_ui()
+    await test_tree_wizard_bootstrap()
+    await test_tree_wizard_cancel_exits()
+    await test_tree_wizard_mcp_refresh()
+    await test_tree_background_events()
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

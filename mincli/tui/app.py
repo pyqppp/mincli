@@ -25,8 +25,8 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Markdown, Static, Tree
+from textual.widgets._header import HeaderIcon, HeaderTitle
 
 # 防御 Textual 选区提取越界：流式渲染会重建 Markdown 块，拖选跨越重建
 # 瞬间时，锚点行号可能等于/超过新内容行数 → Selection.extract 直接索引
@@ -116,7 +116,9 @@ from mincli.helpers import open_path_with_os, split_path_args
 from mincli.tools.files import FilesAPIError
 from mincli.tools.images import image_placeholder_text
 from mincli.tui.confirm import ConfirmScreen
-from mincli.tui.widgets import ChatInput, ToolCard
+from mincli.tui.theme import TREE_THEMES, color_label, theme_name
+from mincli.tui.tree_wizard import TreeWizardScreen
+from mincli.tui.widgets import ChatInput, ToolCard, TreeRow
 
 WELCOME = """# mincli
 
@@ -142,7 +144,7 @@ COMMAND_HELP: dict[str, str] = {
     "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
     "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
     "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show\n修改运行配置",
-    "/tree": "显示完整对话树",
+    "/tree": "用法: /tree | /tree <编号> | /tree new | /tree delete <编号> | /tree <编号> tools\n列出/新建/切换/删除对话树，或修改某棵树挂载的能力；每棵树有独立编号与界面颜色，对话框（/tree 列表）会同时给出编号、颜色与工具数",
     "/info": "用法: /info [节点ID]\n查看节点详情（默认当前节点）",
     "/up": "返回父节点",
     "/home": "跳回根节点",
@@ -252,57 +254,33 @@ def quote_block_text(text: str) -> str:
     return "\n".join(out)
 
 
-# 青色主题：整体围绕青色设计（对应原命令行版的青色风格），
-# 回答区背景近黑灰色、整体色相略偏蓝。
-# 默认主题的 $accent 是橙色（输入框/弹窗边框）、滚动条背景是纯黑（ansi_black），
-# 这里统一改为：主色青蓝、强调色亮青色、滑条深青蓝。
-MINCLI_THEME = Theme(
-    name="mincli-cyan",
-    primary="#00d0dc",       # 主色：青蓝（选中/链接/边框/按钮）
-    secondary="#008394",     # 辅助：深青蓝
-    accent="#00e5ff",        # 强调：亮青色（输入框聚焦边框 / 弹窗边框）
-    warning="#ffb454",
-    error="#ff6b81",
-    success="#3dd68c",
-    foreground="#ffffff",    # 正文文字：纯白（树/输入框/AI 回答不再偏青）
-    background="#0a0d10",    # 全局背景（回答区）：近黑灰色、微带蓝
-    surface="#101a20",       # 侧栏/输入框/弹窗面板：深蓝灰
-    panel="#15222b",
-    variables={
-        # 正文纯白（部分控件走 $text）
-        "text": "#ffffff",
-        # 滚动条：纯黑背景 → 深青蓝；滑块 → 青蓝
-        "scrollbar": "#1e6272",
-        "scrollbar-hover": "#2b8494",
-        "scrollbar-active": "#00e5ff",
-        "scrollbar-background": "#07141a",
-        "scrollbar-background-hover": "#0a1c24",
-        "scrollbar-background-active": "#0a1c24",
-        "scrollbar-corner-color": "#07141a",
-        # 边框：未聚焦也从纯黑改为深青蓝
-        "border": "#00dce6",
-        "border-blurred": "#14323a",
-        # 光标与选区
-        "block-cursor-background": "#00e5ff",
-        "block-cursor-foreground": "#041114",
-        "block-cursor-text-style": "none",
-        "input-selection-background": "#00e5ff 35%",
-        "screen-selection-background": "#00e5ff 35%",
-        # Markdown 标题（围绕青蓝）
-        "markdown-h1-color": "#00e5ff",
-        "markdown-h1-text-style": "bold",
-        "markdown-h2-color": "#00d0dc",
-        "markdown-h2-text-style": "underline",
-        "markdown-h3-color": "#00d0dc",
-        "markdown-h4-color": "#00d0dc",
-        "markdown-h5-color": "#00d0dc",
-        "markdown-h6-color": "#00d0dc",
-        # 链接与 Footer
-        "link-color": "#00e5ff",
-        "link-color-hover": "#7ff3ff",
-        "footer-key-foreground": "#00e5ff",
-    },
-)
+# 8 套对话树主题（编号 = 颜色，见 mincli/tui/theme.py）：
+# 树 1 就是原有的青色主题，2-8 号依次紫、绿、橙、粉、蓝、黄、红，
+# 第 9 棵起循环复用。背景/面板色 8 套一致，只轮换主色与强调色。
+
+
+class ChatHeader(Header):
+    """顶栏：左侧标题，右侧显示当前对话树编号与后台完成状态。
+
+    Header 默认会用 HeaderClockSpace 占住右侧 10 列（本项目未启用时钟），
+    这里把它换成自己的徽标——宽度自动让给标题区，不会重叠。
+    """
+
+    def compose(self) -> ComposeResult:
+        yield HeaderIcon().data_bind(Header.icon)
+        yield HeaderTitle()
+        yield Static("", id="tree-badge", markup=False)
+
+
+# Ctrl/Alt + 1..8 直接切换对话树。Alt 是兜底：不少终端（含 macOS
+# Terminal.app 默认设置）不会把 Ctrl+数字上报成独立按键，能上报时两者都可用。
+_TREE_SWITCH_BINDINGS = [
+    Binding(f"ctrl+{i}", f"switch_tree({i})", f"切到对话树 {i}", show=False)
+    for i in range(1, 9)
+] + [
+    Binding(f"alt+{i}", f"switch_tree({i})", f"切到对话树 {i}", show=False)
+    for i in range(1, 9)
+]
 
 
 class ChatApp(App):
@@ -327,11 +305,12 @@ class ChatApp(App):
             show=False,
             priority=True,
         ),
-    ]
+    ] + _TREE_SWITCH_BINDINGS
 
     def __init__(self, controller: ChatController | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.register_theme(MINCLI_THEME)
+        for theme in TREE_THEMES:
+            self.register_theme(theme)
         self._injected_controller = controller
         self.ctrl: ChatController | None = None
         self._stream_active = False
@@ -344,6 +323,8 @@ class ChatApp(App):
         self._last_scroll_t = 0.0  # 上下键滚动：上次按键时间（用于双击加速）
         self._scroll_fast_until = 0.0  # 双击按住 → 2 倍速滚动截止时间
         self._chat_lock = asyncio.Lock()  # 串行化聊天区 update/append（流式渲染 vs 节点切换）
+        # 侧栏对话树列表（#tree-list 里的 TreeRow，最多显示 3 行，超出滚动）
+        self._tree_rows: list[TreeRow] = []
         # 聊天区（#chat-log 容器）：多段正文 Markdown + 工具卡片，按时间穿插。
         self._chat_md: Markdown | None = None  # 当前正在流式的正文 Markdown 段
         self._chat_blocks: list = []  # 有序：Markdown 段 或 ToolCard
@@ -398,12 +379,8 @@ class ChatApp(App):
     def _set_turn_active(self, active: bool) -> None:
         """切换「生成中」状态：占用期间输入框占位提示如何打断。"""
         self._turn_active = active
-        inp = self.query_one("#chat-input", ChatInput)
-        if not self._default_placeholder:
-            self._default_placeholder = str(inp.placeholder or "")
-        inp.placeholder = (
-            "生成中… 按 Esc 打断（Ctrl+C 亦可）" if active else self._default_placeholder
-        )
+        self._refresh_input_placeholder()
+        self._refresh_tree_badge()
 
     def copy_to_clipboard(self, text: str) -> None:
         """复制文本到系统剪贴板。
@@ -434,12 +411,14 @@ class ChatApp(App):
         super().notify(message, **kwargs)
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield ChatHeader()
         with Horizontal():
             with Vertical(id="sidebar"):
                 with Horizontal(id="sidebar-header"):
                     yield Static("会话", id="sidebar-title")
-                    yield Button("⛶ 全览", id="fullview-btn", compact=True)
+                    yield Button("全览", id="fullview-btn", compact=True)
+                # 对话树列表：最多 3 行，超出这栏内部滚动（见 chat.tcss）
+                yield VerticalScroll(id="tree-list")
                 yield Tree("全部", id="tree")
             yield VerticalScroll(id="chat-log")
         with Vertical(id="cmd-popup"):
@@ -458,7 +437,7 @@ class ChatApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
-        self.theme = "mincli-cyan"  # 应用青色主题
+        self.theme = theme_name(1)  # 默认树 1 的青色；_refresh_tree_ui 会按当前树覆盖
         if self._injected_controller is not None:
             self.ctrl = self._injected_controller
         else:
@@ -483,8 +462,7 @@ class ChatApp(App):
         self._import_popup_w = self.query_one("#import-popup", Static)
         self._rebuild_tree()
         self.query_one("#chat-input", ChatInput).focus()
-        if self.ctrl.session_loaded:
-            self.notify("已加载上次会话记录", timeout=4)
+        self._refresh_tree_ui()
         self._start_balance_refresh()
         self._refresh_usage_bar()
         self._refresh_import_status()
@@ -492,6 +470,9 @@ class ChatApp(App):
         # Markdown 要 0.5s 左右，没必要挡在界面出现之前），界面先出来，
         # 内容紧接着补上——见 _restore_current_view。
         self.call_after_refresh(self._restore_current_view)
+        # 一棵树都没有：界面先出来，再弹建树向导（取消则退出程序）
+        if not self.ctrl.has_trees:
+            self.call_after_refresh(lambda: self._open_tree_wizard(initial=True))
 
     async def _restore_current_view(self) -> None:
         """首帧渲染完成后显示当前节点内容（无节点时显示欢迎页）。"""
@@ -500,18 +481,286 @@ class ChatApp(App):
         # 首帧到这里的间隙里用户已经发了消息：别用旧节点内容盖掉当前视图
         if self._turn_active or self._stream_active:
             return
+        if not self.ctrl.has_trees:
+            await self._chat_reset(WELCOME)
+            return
         node = self.ctrl.tree.current_node
         if node is not None:
             await self._switch_to(node.id)
         else:
             await self._chat_reset(WELCOME)
+        self._load_draft()
 
     def on_unmount(self) -> None:
         self._cancel_flush()
         self._wf_stop_edit()
         if self.ctrl is not None:
+            self._save_draft()
             self.ctrl.save_session()
             self.ctrl.close()
+
+    # ---------------- 对话树：侧栏列表 / 顶部徽标 / 配色 / 草稿 ----------------
+
+    def _apply_tree_theme(self) -> None:
+        """按当前树的颜色切换整机主题（背景与面板色不变，只换主色系）。"""
+        if self.ctrl is None:
+            return
+        try:
+            self.theme = theme_name(self.ctrl.tree_color())
+        except Exception:
+            self.theme = theme_name(1)
+
+    def _refresh_tree_ui(self) -> None:
+        """刷新与「当前是哪棵树」相关的界面：主题、侧栏列表、顶部徽标、输入提示。"""
+        if self.ctrl is None:
+            return
+        self._apply_tree_theme()
+        self._refresh_tree_badge()
+        self._refresh_input_placeholder()
+        try:
+            self.run_worker(
+                self._rebuild_tree_list(),
+                name="tree-list",
+                group="tree-list",   # 独立分组：exclusive 只取消上一次列表重建，
+                exclusive=True,      # 不会误伤生成/余额等默认分组的 worker
+                exit_on_error=False,
+            )
+        except Exception:
+            pass
+
+    async def _rebuild_tree_list(self) -> None:
+        """重建侧栏对话树列表（行数不定，只能异步挂载/卸载）。"""
+        if self.ctrl is None:
+            return
+        try:
+            container = self.query_one("#tree-list", VerticalScroll)
+        except Exception:
+            return
+        await container.remove_children()
+        numbers = self.ctrl.tree_numbers()
+        active = self.ctrl.active_number
+        if not numbers:
+            # 一棵树都没有：这一栏不占行（只剩上面那行「会话/全览」）。
+            # 此时界面由建树向导 + 徽标/输入框提示引导，不需要占位文字。
+            self._tree_rows = []
+            try:
+                container.styles.height = 0
+            except Exception:
+                pass
+            return
+        rows = []
+        for number in numbers:
+            rows.append(
+                TreeRow(
+                    number,
+                    self.ctrl.tree_color(number),
+                    f"{number} 对话",
+                    active=(number == active),
+                    mark=self.ctrl.tree_marks.get(number, ""),
+                )
+            )
+        self._tree_rows = rows
+        await container.mount_all(rows)
+        # 高度：树少时收缩（1 棵 = 1 行），超过 3 棵固定 3 行改为内部滚动。
+        # 注意不能用「height: auto + max-height」代替：那样超出的行会被挤成
+        # 0 高度而不是产生滚动区（Textual 会把子控件压进可视高度里）。
+        try:
+            container.styles.height = 3 if len(rows) > 3 else "auto"
+        except Exception:
+            pass
+        # 当前树滚进视野（列表最多显示 3 行）
+        if active in numbers:
+            index = numbers.index(active)
+            try:
+                container.scroll_to(y=max(0, index - 2), animate=False)
+            except Exception:
+                pass
+
+    def _refresh_tree_badge(self) -> None:
+        """顶部标题右侧的当前对话树徽标（编号 + 生成/完成/出错状态）。"""
+        if self.ctrl is None:
+            return
+        try:
+            badge = self.query_one("#tree-badge", Static)
+        except Exception:
+            return
+        if not self.ctrl.has_trees:
+            badge.update("未创建对话树")
+            return
+        number = self.ctrl.active_number
+        parts = [f"树 {number}"]
+        if self.ctrl.generating_number == number:
+            parts.append("生成中")
+        for mark_number, mark in sorted(self.ctrl.tree_marks.items())[:2]:
+            text = "完成" if mark == "done" else "出错"
+            if mark_number != number:
+                text = f"树 {mark_number} {text}"
+            parts.append(text)
+        badge.update(" · ".join(parts))
+
+    def _refresh_input_placeholder(self) -> None:
+        inp = self.query_one("#chat-input", ChatInput)
+        if not self._default_placeholder:
+            self._default_placeholder = str(inp.placeholder or "")
+        if self.ctrl is not None and not self.ctrl.has_trees:
+            inp.placeholder = "请先新建对话树（/tree new）"
+        elif self._turn_active:
+            inp.placeholder = "生成中… 按 Esc 打断（Ctrl+C 亦可）"
+        else:
+            inp.placeholder = self._default_placeholder
+
+    def _save_draft(self) -> None:
+        """把输入框当前内容记到「当前树」的草稿（切树/退出前调用）。"""
+        if self.ctrl is None:
+            return
+        try:
+            self.ctrl.draft = self.query_one("#chat-input", ChatInput).text
+        except Exception:
+            pass
+
+    def _load_draft(self) -> None:
+        """切换到某棵树后恢复它自己的草稿。"""
+        if self.ctrl is None:
+            return
+        try:
+            inp = self.query_one("#chat-input", ChatInput)
+        except Exception:
+            return
+        text = self.ctrl.draft or ""
+        if inp.text != text:
+            inp.load_text(text)
+            try:
+                inp.move_cursor((inp.document.line_count - 1, len(inp.document.lines[-1])))
+            except Exception:
+                pass
+        self._update_command_popup(inp.text)
+
+    def _reset_view_state(self) -> None:
+        """切树前清掉与上一棵树绑定的视图状态（流式缓冲/工具卡片等）。"""
+        self._cancel_flush()
+        self._stream_active = False
+        self._reasoning_open = False
+        self._answer_started = False
+        self._active_tool_card = None
+
+    async def _render_active_tree(self) -> None:
+        """把界面切到当前树的当前节点（无节点则显示欢迎页）。"""
+        if self.ctrl is None:
+            return
+        self._reset_view_state()
+        tree = self.ctrl.tree
+        node = tree.current_node if tree is not None else None
+        if node is not None:
+            await self._chat_reset(self._node_content(node))
+            await self._chat_shrink_lists(scroll=False)
+            self._answer_started = True
+        else:
+            await self._chat_reset(WELCOME)
+        self._rebuild_tree()
+        if node is not None:
+            self._select_tree_node(node.id)
+        self._load_draft()
+        self._refresh_usage_bar()
+        self._refresh_import_status()
+
+    async def _switch_tree(self, number: int, notify: bool = True) -> bool:
+        """切换到指定对话树（正在生成的那棵树会继续在后台跑）。"""
+        if self.ctrl is None:
+            return False
+        if number == self.ctrl.active_number:
+            return True
+        if not self.ctrl.switch_tree(number):
+            self.notify(f"对话树 {number} 不存在", severity="warning")
+            return False
+        self._refresh_tree_ui()
+        await self._render_active_tree()
+        if notify:
+            self.notify(
+                f"已进入对话树 {number}（{color_label(self.ctrl.tree_color())}）"
+            )
+        return True
+
+    def action_switch_tree(self, number="1") -> None:
+        """Ctrl/Alt + 1..8：直接切换对话树。"""
+        try:
+            target = int(number)
+        except (TypeError, ValueError):
+            return
+        asyncio.ensure_future(self._switch_tree(target))
+
+    async def on_tree_row_selected(self, event: TreeRow.Selected) -> None:
+        """点击侧栏某一行对话树 → 切换过去。"""
+        await self._switch_tree(int(event.number))
+
+    # ---------------- 建树 / 改能力向导 ----------------
+
+    def _open_tree_wizard(
+        self, initial: bool = False, edit_number: int | None = None
+    ) -> None:
+        """弹出建树向导（initial=True 表示启动时没有树，取消则退出程序）。"""
+        if self.ctrl is None:
+            return
+        if edit_number is None:
+            heading = "新建对话树"
+            note = (
+                "对话能力必选；系统工具与外置 MCP 工具按需勾选。"
+                "建好后可用 /tree N tools 修改。"
+            )
+            caps = {"system_tools": True, "mcp_tools": []}
+        else:
+            heading = f"对话树 {edit_number} 的能力"
+            note = "改动对下一次请求生效。"
+            caps = self.ctrl.tree_caps(edit_number)
+        screen = TreeWizardScreen(
+            heading=heading,
+            note=note,
+            groups=self.ctrl.available_tool_groups(),
+            servers=self.ctrl.external_servers(),
+            initial=caps,
+            mcp_ready=self.ctrl.mcp_ready,
+        )
+
+        def on_done(result) -> None:
+            if result is None:
+                if initial:
+                    self.notify("未创建对话树，退出程序")
+                    self.exit()
+                return
+            if edit_number is None:
+                number = self.ctrl.create_tree(
+                    result["system_tools"], result["mcp_tools"]
+                )
+                asyncio.ensure_future(self._after_tree_created(number))
+            else:
+                self.ctrl.set_tree_caps(
+                    edit_number, result["system_tools"], result["mcp_tools"]
+                )
+                self._refresh_tree_ui()
+                self.notify(f"对话树 {edit_number} 的能力已更新")
+
+        self.push_screen(screen, callback=on_done)
+
+    async def _after_tree_created(self, number: int) -> None:
+        self._refresh_tree_ui()
+        await self._render_active_tree()
+        self.notify(
+            f"已创建对话树 {number}（{color_label(self.ctrl.tree_color())}）"
+        )
+
+    def _refresh_wizard_tools(self) -> None:
+        """MCP 连完后把工具列表补进正开着的建树向导。"""
+        if self.ctrl is None:
+            return
+        try:
+            screen = self.screen
+        except Exception:
+            return
+        if isinstance(screen, TreeWizardScreen):
+            screen.refresh_tools(
+                self.ctrl.available_tool_groups(),
+                self.ctrl.external_servers(),
+                self.ctrl.mcp_ready,
+            )
 
     # ---------------- MCP 后台连接 ----------------
 
@@ -543,9 +792,14 @@ class ChatApp(App):
             self.ctrl.wait_mcp_ready()
         finally:
             try:
-                self.call_from_thread(self._refresh_usage_bar)
+                self.call_from_thread(self._on_mcp_ready_ui)
             except Exception:
                 pass
+
+    def _on_mcp_ready_ui(self) -> None:
+        """MCP 连接结束：刷新状态条，并把刚取到的工具列表补进建树向导。"""
+        self._refresh_usage_bar()
+        self._refresh_wizard_tools()
 
     def _on_mcp_log(self, message: str) -> None:
         """MCP 客户端日志（后台线程）→ 主线程通知。
@@ -954,7 +1208,7 @@ class ChatApp(App):
         self._full_view = on
         self.query_one("#chat-log", VerticalScroll).set_class(on, "overview-hidden")
         self.query_one("#sidebar").set_class(on, "overview")
-        self.query_one("#fullview-btn", Button).label = "⧉ 分栏" if on else "⛶ 全览"
+        self.query_one("#fullview-btn", Button).label = "分栏" if on else "全览"
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """侧栏「全览/分栏」按钮：切换全览模式。"""
@@ -1285,9 +1539,15 @@ class ChatApp(App):
 - `/model list` — 查看内置与已注册模型
 - `/model register <模型名> <URL> [-p provider] [-k key_var]` — 注册新模型（OpenAI 兼容 API）
 
-**树状命令**
+**对话树（多棵树各自独立）**
+- `/tree` — 列出全部对话树（编号、颜色、节点数、挂载能力）
+- `/tree <编号>` — 切换到该树（也可点侧栏那一行，或按 Ctrl/Alt+1~8）
+- `/tree new` — 新建对话树（向导里勾选挂载的能力）
+- `/tree delete <编号>` — 删除整棵树（需确认，编号不再复用）
+- `/tree <编号> tools` — 修改某棵树挂载的能力（对下一次请求生效）
+
+**节点命令（当前树内）**
 - `/<节点ID>`（如 /a3）— 直接跳转到指定节点
-- `/tree` — 显示完整对话树
 - `/info [节点ID]` — 查看节点详情
 - `/up` — 返回父节点
 - `/home` — 跳回根节点
@@ -1380,6 +1640,7 @@ class ChatApp(App):
             lines = [
                 "**当前配置**",
                 "",
+                f"- **对话树**: 树 {ctrl.active_number}（{color_label(ctrl.tree_color())}，共 {len(ctrl.tree_numbers())} 棵）",
                 f"- **系统提示词**: {ctrl.current_system}",
                 f"- **温度**: {ctrl.current_temperature}",
                 f"- **模型**: {ctrl.current_model}",
@@ -1402,7 +1663,7 @@ class ChatApp(App):
         current_id = tree.current_node.id if tree.current_node else None
 
         if low == "/tree":
-            await self._chat_append(f"```\n{tree.render_tree(current_id)}\n```")
+            await self._cmd_tree_list(parts[1:])
             return True
         if low.startswith("/info"):
             nid = parts[1] if len(parts) > 1 else current_id
@@ -1460,6 +1721,89 @@ class ChatApp(App):
             )
             return True
         return False
+
+    async def _cmd_tree_list(self, args: list) -> None:
+        """对话树命令族：/tree | /tree N | /tree new | /tree delete N | /tree N tools。"""
+        ctrl = self.ctrl
+        usage = (
+            "用法: `/tree` 列出全部 · `/tree N` 切换 · `/tree new` 新建 · "
+            "`/tree delete N` 删除 · `/tree N tools` 修改能力"
+        )
+        if not args:
+            numbers = ctrl.tree_numbers()
+            if not numbers:
+                await self._chat_append(
+                    f"**对话树**\n\n（尚未创建）\n\n{usage}"
+                )
+                return
+            lines = ["**对话树**", ""]
+            for number in numbers:
+                summary = ctrl.tree_summary(number)
+                mark = ctrl.tree_marks.get(number)
+                state = ""
+                if mark == "done":
+                    state = "（后台完成）"
+                elif mark == "error":
+                    state = "（后台出错）"
+                here = "（当前）" if number == ctrl.active_number else ""
+                caps = ctrl.tree_caps(number)
+                tools = "系统工具" if caps["system_tools"] else "无系统工具"
+                if caps["mcp_tools"]:
+                    tools += f" + {len(caps['mcp_tools'])} 个外置工具"
+                lines.append(
+                    f"- **树 {number}** · {color_label(ctrl.tree_color(number))} · "
+                    f"{summary['nodes']} 个节点 · {tools}{state}{here}"
+                )
+            lines.append("")
+            lines.append(usage)
+            await self._chat_append("\n".join(lines))
+            return
+
+        sub = args[0].lower()
+        if sub == "new":
+            self._open_tree_wizard()
+            return
+        if sub in ("delete", "rm", "del"):
+            if len(args) < 2 or not args[1].isdigit():
+                self.notify("用法: /tree delete <编号>", severity="warning")
+                return
+            number = int(args[1])
+            if not ctrl.has_trees or number not in ctrl.tree_numbers():
+                self.notify(f"对话树 {number} 不存在", severity="warning")
+                return
+            summary = ctrl.tree_summary(number)
+            self._ask_confirm(
+                "删除对话树",
+                f"确定删除对话树 {number}（{summary['nodes']} 个节点）吗？\n"
+                "该树的数据文件会一并删除，编号不再复用。",
+                lambda ok, n=number: self._on_tree_delete_confirmed(n, ok),
+            )
+            return
+        if sub.isdigit():
+            number = int(sub)
+            if len(args) > 1 and args[1].lower() in ("tools", "tool", "cap", "caps"):
+                self._open_tree_wizard(edit_number=number)
+                return
+            await self._switch_tree(number)
+            return
+        self.notify(usage, severity="warning")
+
+    async def _on_tree_delete_confirmed(self, number: int, ok: bool) -> None:
+        if not ok:
+            self.notify("已取消删除")
+            return
+        if self._turn_active and self.ctrl.generating_number == number:
+            self.notify("这棵树正在生成，先按 Esc 打断再删除", severity="warning")
+            return
+        result = self.ctrl.delete_tree(number)
+        if not result.get("ok"):
+            self.notify(f"对话树 {number} 不存在", severity="error")
+            return
+        self._refresh_tree_ui()
+        await self._render_active_tree()
+        self.notify(f"已删除对话树 {number}")
+        if not self.ctrl.has_trees:
+            self._open_tree_wizard()
 
     async def _on_delete_confirmed(self, nids: list, ok: bool) -> None:
         """确认弹窗回调：ok=True 时批量删除（App 消息泵空闲时才被调用）。"""
@@ -2053,9 +2397,22 @@ class ChatApp(App):
 
         若已挂载工作流（/wf use），先把它合成为“按工作流执行”的消息再发送，
         挂载随之解除（一次性）。
+
+        多对话树：同一时刻只允许一棵树在生成。别的树在后台生成时切过来可以看，
+        但发送会被拒绝并提示是哪个编号的树在占用。
         """
         if self.ctrl is None:
             self.notify("控制器未就绪（请检查 DEEPSEEK_API_KEY）", severity="error", timeout=5)
+            return
+        if not self.ctrl.has_trees:
+            self.notify("请先新建对话树（/tree new）", severity="warning")
+            return
+        if self._turn_active:
+            busy = self.ctrl.generating_number
+            where = f"对话树 {busy}" if busy else "当前轮"
+            self.notify(
+                f"{where} 正在生成，等它结束或按 Esc 打断后再发送", severity="warning"
+            )
             return
         if self._pending_wf:
             wf_name = self._pending_wf
@@ -2076,6 +2433,7 @@ class ChatApp(App):
         self._reasoning_open = False
         self._answer_started = False
         self._set_turn_active(True)
+        self._refresh_tree_badge()
         self.run_worker(
             lambda: self._run_message(text),
             name="chat-message",
@@ -2098,12 +2456,18 @@ class ChatApp(App):
     async def _handle_event(self, ev: ControllerEvent) -> None:
         """主线程处理控制器事件。
 
+        多对话树：事件带发起生成的那棵树编号；用户切走之后，属于别的树的事件
+        一律不渲染到消息区（只在侧栏留「完成/出错」标记），否则流式内容会串台。
+
         stream 事件（SSE 按 token 级产生，频率极高）先累积到缓冲，由定时器
         每 80ms 批量渲染一次，避免每个 token 都触发 Markdown 组件的
         mount/布局/重绘 → 渲染卡顿、主线程事件积压。
         低频事件（node_created/tool/status/done/error）先冲刷缓冲再即时处理，
         保证渲染顺序正确。
         """
+        if self.ctrl is not None and ev.tree and ev.tree != self.ctrl.active_number:
+            self._handle_background_event(ev)
+            return
         if ev.kind == "stream":
             if ev.content:
                 self._stream_buf_content += ev.content
@@ -2296,6 +2660,19 @@ class ChatApp(App):
             self._refresh_usage_bar()
             self._set_turn_active(False)
 
+    def _handle_background_event(self, ev: ControllerEvent) -> None:
+        """后台那棵树的事件：不渲染到消息区，只在侧栏/顶部留状态。
+
+        生成在后台照常进行（节点内容与磁盘都会更新），切回去时按节点内容
+        重新渲染，所以这里丢弃流式增量是安全的。
+        """
+        if ev.kind in ("done", "error"):
+            self._refresh_tree_ui()
+            label = "已完成" if ev.kind == "done" else "出错"
+            self.notify(
+                f"对话树 {ev.tree} {label}（点击侧栏可切过去查看）", timeout=6
+            )
+
     def _append_error(self, message: str) -> None:
         self._cancel_flush()  # 出错后不再渲染残留流式缓冲
         asyncio.ensure_future(self._chat_append(
@@ -2320,8 +2697,20 @@ class ChatApp(App):
 
         与 _ask_confirm 不同：本方法经 call_from_thread 以独立 asyncio 任务
         运行（不占用 App 消息泵），所以可以阻塞等待 Future。
+
+        多对话树：确认来自后台生成的那棵树时（用户可能正看着别的树），标题里
+        标明树编号，避免不知道这个弹窗是谁触发的。
         """
+        title = self._scoped_confirm_title(title)
         return self.call_from_thread(self._confirm_async, title, text)
+
+    def _scoped_confirm_title(self, title: str) -> str:
+        if self.ctrl is None:
+            return title
+        number = self.ctrl.generating_number
+        if number and number != self.ctrl.active_number:
+            return f"对话树 {number}：{title}"
+        return title
 
     async def _confirm_async(self, title: str, text: str) -> bool:
         """主线程弹确认框并阻塞等待结果（仅限独立任务上下文，勿在消息处理器内 await）。

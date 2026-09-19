@@ -1,8 +1,15 @@
 """ChatController —— mincli 纯逻辑层（无任何 UI 依赖）。
 
-管理对话树、设置、流式输出、工具调用与会话持久化。
-Textual TUI 与纯文本前端都通过本控制器驱动；UI 通过
-ControllerEvent 回调接收增量更新（流式内容 / 工具调用 / 状态 / 完成）。
+管理多棵对话树、设置、流式输出、工具调用与持久化。
+Textual TUI 通过本控制器驱动；UI 通过 ControllerEvent 回调接收增量更新
+（流式内容 / 工具调用 / 状态 / 完成）。
+
+多对话树：
+- 每棵树一个文件（见 mincli/trees.py），容量固定为「节点树 + 该树自己的设置」；
+- 模型/温度/思考模式/系统提示词等是全局设置，所有树共享；
+- 审核层级、file_confirm、工作目录、能力白名单、输入草稿是每棵树独立的；
+- 同一时刻只允许一棵树在生成：后台生成期间切走，生成继续，但另一棵树
+  必须等它结束才能发送（见 ChatApp._send_user_text）。
 """
 
 from __future__ import annotations
@@ -11,7 +18,9 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from openai import OpenAI
@@ -71,6 +80,7 @@ from mincli.tools.images import (
 )
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage
+from mincli.trees import TreeStore, color_of
 from mincli.workflows import (
     FALLBACK_MARK,
     Workflow,
@@ -82,9 +92,10 @@ from mincli.workflows import (
 )
 
 try:
-    from mincli.mcp_client import READY_TIMEOUT, McpToolClient
+    from mincli.mcp_client import BUNDLED_NAME, READY_TIMEOUT, McpToolClient
 except ImportError:  # pragma: no cover
     McpToolClient = None
+    BUNDLED_NAME = "mincli"
     READY_TIMEOUT = 30
 
 
@@ -109,6 +120,9 @@ class ControllerEvent:
     tool_summary: str = ""
     message: str = ""
     node: Optional[ConversationNode] = None
+    # 事件所属的对话树编号（由 send_message 统一盖章）。后台生成期间切走时，
+    # UI 据此丢弃不属于当前树的事件，避免流式内容串到别的树。
+    tree: int = 0
 
     @classmethod
     def stream(cls, content: str, reasoning: str) -> "ControllerEvent":
@@ -145,12 +159,31 @@ AUDIT_LABELS = {
 }
 
 
+@dataclass
+class TreeState:
+    """一棵对话树的运行时状态（编号 0 表示「尚未创建任何对话树」的占位）。"""
+
+    number: int
+    color: int
+    tree: ConversationTree
+    draft: str = ""
+    # 每棵树独立的运行设置（其余设置是全局的）
+    audit_level: int = 1
+    file_confirm: bool = True
+    workspace: Optional[str] = None
+    # 能力挂载：系统工具整组开关 + 外置 MCP 工具白名单（工具名）
+    system_tools: bool = True
+    mcp_tools: List[str] = field(default_factory=list)
+
+    @property
+    def is_placeholder(self) -> bool:
+        return self.number <= 0
+
+
 class ChatController:
-    """对话引擎：状态 + 对话树 + 流式输出 + 工具调用 + 持久化。"""
+    """对话引擎：状态 + 多对话树 + 流式输出 + 工具调用 + 持久化。"""
 
-    SAVE_FILE = os.path.expanduser("~/.mincli_session.json")
-
-    # 工作流持久化文件（测试子类可重写为临时路径，同 SAVE_FILE 模式）
+    # 工作流持久化文件（测试子类可重写为临时路径）
     WORKFLOWS_FILE = WORKFLOWS_PATH
 
     def __init__(
@@ -162,20 +195,17 @@ class ChatController:
         thinking_enabled: bool = False,
         reasoning_effort: str = "high",
         auto_start_mcp: bool = True,
+        trees_dir: Optional[str] = None,
     ) -> None:
         self.client = client
+        # ---------------- 全局设置（所有对话树共享） ----------------
         self.current_system = default_system
         self.current_temperature = default_temperature
         self.current_model = normalize_model_name(default_model)
-        # 从会话文件加载时，若旧模型名被自动改写，这里记录原始名（供 UI 提示）
+        # 从磁盘加载时，若旧模型名被自动改写，这里记录原始名（供 UI 提示）
         self.model_migrated_from: Optional[str] = None
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
-        self.audit_level: int = 1
-        # 写文件/编辑文件时是否弹窗确认（/set file_confirm 控制；默认开启）
-        self.file_confirm: bool = True
-        # 命令执行默认工作目录（/set workspace 设置；None 时用 mincli 启动目录）
-        self.workspace: Optional[str] = None
         # 用户主动打断标志：streaming 循环在每个 chunk 处检查，工具调用后也会检查。
         # 每次 send_message 开始时复位；interrupt() 置位并顺带终止正在执行的命令。
         self._interrupt_requested: bool = False
@@ -185,7 +215,17 @@ class ChatController:
         # 图片 detail 全局默认（/set detail 可调；low 省 token，auto≈original 最清晰）
         self.image_detail: str = VISION_DEFAULT_DETAIL
 
-        self.tree = ConversationTree(default_system)
+        # ---------------- 多对话树 ----------------
+        self._store = TreeStore(trees_dir)
+        self._states: Dict[int, TreeState] = {}
+        self._active: int = 0
+        # 生成线程的树上下文：send_message 在 worker 线程里设置它，使 self.tree /
+        # 每树设置在整个生成过程中都指向发起生成的那棵树（用户切走也不串台）
+        self._tls = threading.local()
+        # 正在生成的树编号（0 = 空闲）
+        self._gen_tree: int = 0
+        # 后台生成结束标记：编号 → "done" | "error"（UI 取用后清除）
+        self.tree_marks: Dict[int, str] = {}
 
         self._wf_store = WorkflowStore(self.WORKFLOWS_FILE)
 
@@ -203,14 +243,381 @@ class ChatController:
         self._mcp_tool_names: set = set()
         # MCP 工具列表是否已同步（后台连接完成后同步一次；重连后置回 False）
         self._mcp_synced: bool = False
-        # MCP 连接日志出口：默认打印（纯文本模式）；TUI 会换成通知，避免
+        # MCP 连接日志出口：默认打印（无 UI 时）；TUI 会换成通知，避免
         # 后台线程直接写 stdout 冲乱界面
         self.mcp_logger: Callable[[str], None] = print
         self.llm_tools: List[Dict] = list(TOOLS)
 
-        self.session_loaded = self.load_session()
+        self.session_loaded = self._restore_from_store()
         if auto_start_mcp:
             self.start_mcp()
+
+    # ---------------- 对话树：加载 / 保存 ----------------
+
+    def _restore_from_store(self) -> bool:
+        """从磁盘恢复全局设置与上次激活的对话树。
+
+        返回是否恢复了已有对话树（False = 一棵都没有，UI 应先引导新建）。
+        """
+        g = self._store.global_settings()
+        if g:
+            self.current_system = g.get("system_prompt", self.current_system)
+            self.current_temperature = g.get("temperature", self.current_temperature)
+            saved_model = g.get("model", self.current_model)
+            self.current_model = normalize_model_name(saved_model)
+            if self.current_model != saved_model:
+                self.model_migrated_from = saved_model
+            self.thinking_enabled = bool(g.get("thinking_enabled", False))
+            self.reasoning_effort = g.get("reasoning_effort", "high")
+            self.image_detail = g.get("image_detail", VISION_DEFAULT_DETAIL)
+            self.imported_content = g.get("imported_content")
+            self.imported_files = g.get("imported_files") or []
+
+        numbers = self._store.numbers()
+        active = self._store.active()
+        if active is None and numbers:
+            active = numbers[-1]
+        if active is not None and self._store.has_tree(active):
+            self._load_state(active)
+            self._active = int(active)
+            self._store.set_active(self._active)
+            return True
+
+        # 一棵树都没有：放一棵占位空树，让 UI 有东西可渲染（发送前必须先建树）
+        self._reset_placeholder()
+        return False
+
+    def _reset_placeholder(self) -> None:
+        self._states[0] = TreeState(
+            number=0, color=1, tree=ConversationTree(self.current_system)
+        )
+        self._active = 0
+
+    def _load_state(self, number: int) -> TreeState:
+        """按需加载一棵树（已加载则直接返回）。"""
+        number = int(number)
+        st = self._states.get(number)
+        if st is not None:
+            return st
+        data = self._store.load_tree(number) or {}
+        tree_data = data.get("tree")
+        tree = (
+            ConversationTree.from_dict(tree_data)
+            if isinstance(tree_data, dict)
+            else ConversationTree(self.current_system)
+        )
+        # 系统提示词是全局设置：以内存中的值为准，忽略树文件里的旧副本
+        tree.system_prompt = self.current_system
+        st = TreeState(
+            number=number,
+            color=self._store.color_of(number),
+            tree=tree,
+            draft=data.get("draft", "") or "",
+            audit_level=int(data.get("audit_level") or 1),
+            file_confirm=bool(data.get("file_confirm", True)),
+            workspace=data.get("workspace") or None,
+            system_tools=bool(data.get("system_tools", True)),
+            mcp_tools=list(data.get("mcp_tools") or []),
+        )
+        self._states[number] = st
+        return st
+
+    @staticmethod
+    def _snapshot_tree(tree: ConversationTree) -> Optional[Dict[str, Any]]:
+        """把树序列化成 dict；生成线程正在增删节点时退避重试，仍失败则放弃本次写入。
+
+        后台生成与 UI 切树可能同时发生（切树会保存「离开的那棵树」），而
+        `to_dict` 要遍历节点表——遍历中字典被改会抛 RuntimeError。宁可跳过
+        这一次保存（下一次切换/退出还会再写），也不要写出半棵树。
+        """
+        for attempt in range(3):
+            try:
+                return tree.to_dict()
+            except RuntimeError:
+                time.sleep(0.05 * (attempt + 1))
+        return None
+
+    def _tree_payload(self, st: TreeState) -> Optional[Dict[str, Any]]:
+        tree_data = self._snapshot_tree(st.tree)
+        if tree_data is None:
+            return None
+        return {
+            "number": st.number,
+            "color": st.color,
+            "tree": tree_data,
+            "draft": st.draft,
+            "audit_level": st.audit_level,
+            "file_confirm": st.file_confirm,
+            "workspace": st.workspace,
+            "system_tools": st.system_tools,
+            "mcp_tools": list(st.mcp_tools),
+            "saved_at": time.time(),
+        }
+
+    def _global_payload(self) -> Dict[str, Any]:
+        return {
+            "system_prompt": self.current_system,
+            "temperature": self.current_temperature,
+            "model": self.current_model,
+            "thinking_enabled": self.thinking_enabled,
+            "reasoning_effort": self.reasoning_effort,
+            "image_detail": self.image_detail,
+            "imported_content": self.imported_content,
+            "imported_files": self.imported_files,
+        }
+
+    def save_tree(self, number: Optional[int] = None) -> bool:
+        """保存指定（默认当前）对话树到磁盘。占位树（0）不落盘。"""
+        st = self._state(number)
+        if st is None or st.is_placeholder:
+            return False
+        payload = self._tree_payload(st)
+        if payload is None:
+            return False
+        return self._store.save_tree(st.number, payload)
+
+    def save_session(self) -> bool:
+        """保存全部对话树 + 全局设置（退出时调用；返回是否全部成功）。"""
+        ok = True
+        for number, st in list(self._states.items()):
+            if st.is_placeholder:
+                continue
+            payload = self._tree_payload(st)
+            if payload is None or not self._store.save_tree(number, payload):
+                ok = False
+        self._store.set_global_settings(self._global_payload())
+        return ok
+
+    # ---------------- 对话树：访问与切换 ----------------
+
+    def _state(self, number: Optional[int] = None) -> Optional[TreeState]:
+        """取某棵树的状态（默认当前树）。
+
+        生成线程里默认取「发起生成的那棵树」，因此 send_message 及其调用的
+        工具实现全部自动作用于正确的树，用户中途切走也不受影响。
+        """
+        if number is None:
+            ctx = getattr(self._tls, "state", None)
+            if ctx is not None:
+                return ctx
+        return self._states.get(self._active if number is None else int(number))
+
+    @property
+    def tree(self) -> ConversationTree:
+        st = self._state()
+        if st is None:
+            self._load_state(self._active) if self._active > 0 else self._reset_placeholder()
+            st = self._state()
+        return st.tree
+
+    @tree.setter
+    def tree(self, value: ConversationTree) -> None:
+        st = self._state()
+        if st is None:
+            self._states[self._active] = TreeState(
+                number=self._active, color=color_of(self._active), tree=value
+            )
+        else:
+            st.tree = value
+
+    @property
+    def active_number(self) -> int:
+        """当前激活的对话树编号（0 = 尚未创建）。"""
+        return self._active
+
+    @property
+    def generating_number(self) -> int:
+        """正在生成回答的树编号（0 = 空闲）。"""
+        return self._gen_tree
+
+    @property
+    def has_trees(self) -> bool:
+        return self._store.has_trees()
+
+    def tree_numbers(self) -> List[int]:
+        return self._store.numbers()
+
+    def tree_color(self, number: Optional[int] = None) -> int:
+        n = self._active if number is None else int(number)
+        if n <= 0:
+            return 1
+        return self._store.color_of(n)
+
+    def tree_summary(self, number: int) -> dict:
+        """列表展示用摘要（不把整棵树留在内存里）。"""
+        number = int(number)
+        st = self._states.get(number)
+        tree = st.tree if st is not None else None
+        if tree is None:
+            data = self._store.load_tree(number) or {}
+            tree_data = data.get("tree")
+            tree = (
+                ConversationTree.from_dict(tree_data)
+                if isinstance(tree_data, dict)
+                else None
+            )
+        title = ""
+        count = 0
+        if tree is not None:
+            count = len(tree.nodes)
+            if tree.root is not None:
+                title = tree.root.title or ""
+        return {"number": number, "nodes": count, "title": title}
+
+    def switch_tree(self, number: int) -> bool:
+        """切换当前对话树（编号不存在返回 False）。"""
+        number = int(number)
+        if not self._store.has_tree(number):
+            return False
+        if number == self._active:
+            self.tree_marks.pop(number, None)
+            return True
+        self.save_tree()  # 离开前先保存当前树，避免崩溃丢改动
+        self._load_state(number)
+        self._active = number
+        self._store.set_active(number)
+        self._interrupt_requested = False  # 打断标志只属于具体那棵树
+        self.tree_marks.pop(number, None)
+        self._rebuild_llm_tools()
+        return True
+
+    def create_tree(
+        self,
+        system_tools: bool = True,
+        mcp_tools: Optional[List[str]] = None,
+        activate: bool = True,
+    ) -> int:
+        """新建一棵空对话树并（默认）切过去，返回编号。"""
+        if activate:
+            self.save_tree()
+        number = self._store.allocate()
+        st = TreeState(
+            number=number,
+            color=self._store.color_of(number),
+            tree=ConversationTree(self.current_system),
+            system_tools=bool(system_tools),
+            mcp_tools=list(mcp_tools or []),
+        )
+        self._states[number] = st
+        # 刚建的空树没有并发改动，快照一定成功
+        self._store.save_tree(number, self._tree_payload(st) or {})
+        if activate:
+            self._states.pop(0, None)
+            self._active = number
+            self._store.set_active(number)
+            self._rebuild_llm_tools()
+        return number
+
+    def delete_tree(self, number: int) -> dict:
+        """删除整棵对话树（含数据文件）。编号不复用。"""
+        number = int(number)
+        if not self._store.has_tree(number):
+            return {"ok": False, "reason": "missing"}
+        was_active = number == self._active
+        self._store.delete_tree(number)
+        self._states.pop(number, None)
+        self.tree_marks.pop(number, None)
+        if was_active:
+            remaining = self._store.numbers()
+            if remaining:
+                nxt = remaining[-1]
+                self._load_state(nxt)
+                self._active = nxt
+                self._store.set_active(nxt)
+            else:
+                self._states.pop(0, None)
+                self._reset_placeholder()
+                self._store.set_active(None)
+            self._rebuild_llm_tools()
+        return {"ok": True, "was_active": was_active, "remaining": self._store.numbers()}
+
+    def tree_caps(self, number: Optional[int] = None) -> dict:
+        """某棵树的能力挂载配置（未加载的树按需读盘）。"""
+        st = self._state(number)
+        if st is None and number is not None and self._store.has_tree(int(number)):
+            st = self._load_state(int(number))
+        if st is None:
+            return {"system_tools": True, "mcp_tools": []}
+        return {"system_tools": st.system_tools, "mcp_tools": list(st.mcp_tools)}
+
+    def set_tree_caps(
+        self,
+        number: Optional[int] = None,
+        system_tools: Optional[bool] = None,
+        mcp_tools: Optional[List[str]] = None,
+    ) -> bool:
+        """修改某棵树的能力挂载（对下一次请求生效）。"""
+        st = self._state(number)
+        if st is None and number is not None and self._store.has_tree(int(number)):
+            st = self._load_state(int(number))
+        if st is None or st.is_placeholder:
+            return False
+        if system_tools is not None:
+            st.system_tools = bool(system_tools)
+        if mcp_tools is not None:
+            st.mcp_tools = list(mcp_tools)
+        self.save_tree(st.number)
+        if st.number == self._active:
+            self._rebuild_llm_tools()
+        return True
+
+    def available_tool_groups(self) -> Dict[str, List[str]]:
+        """当前可勾选的工具：server 名 → 工具名（内置 server 的键为 "mincli"）。"""
+        if self._mcp is None:
+            return {}
+        return self._mcp.tools_by_server()
+
+    def external_servers(self) -> List[str]:
+        """已配置的第三方 MCP server 名（可能尚未连接完成）。"""
+        if self._mcp is None:
+            return []
+        return self._mcp.configured_servers()
+
+    # ---------------- 每棵树独立的设置 ----------------
+
+    @property
+    def audit_level(self) -> int:
+        st = self._state()
+        return st.audit_level if st is not None else 1
+
+    @audit_level.setter
+    def audit_level(self, value: int) -> None:
+        st = self._state()
+        if st is not None:
+            st.audit_level = int(value)
+
+    @property
+    def file_confirm(self) -> bool:
+        st = self._state()
+        return st.file_confirm if st is not None else True
+
+    @file_confirm.setter
+    def file_confirm(self, value: bool) -> None:
+        st = self._state()
+        if st is not None:
+            st.file_confirm = bool(value)
+
+    @property
+    def workspace(self) -> Optional[str]:
+        st = self._state()
+        return st.workspace if st is not None else None
+
+    @workspace.setter
+    def workspace(self, value: Optional[str]) -> None:
+        st = self._state()
+        if st is not None:
+            st.workspace = value
+
+    @property
+    def draft(self) -> str:
+        st = self._state()
+        return st.draft if st is not None else ""
+
+    @draft.setter
+    def draft(self, value: str) -> None:
+        st = self._state()
+        if st is not None:
+            st.draft = value or ""
 
     # ---------------- MCP ----------------
 
@@ -275,7 +682,29 @@ class ChatController:
         return self._mcp.ok
 
     def _rebuild_llm_tools(self) -> None:
-        self.llm_tools = list(TOOLS) + (self._mcp.tools() if self._mcp else [])
+        """按当前对话树的能力挂载重组发给模型的工具列表。
+
+        - 进程内工具（查询对话树）与内置 server 的工具同属「系统工具」整组开关；
+        - 外置 server 的工具按该树保存的白名单逐个放行（白名单为空 = 一个都不挂）；
+        - MCP 未就绪时只有进程内工具，其余等 wait_mcp_ready 同步后补上。
+        """
+        st = self._state()
+        system_tools = True if st is None else st.system_tools
+        allowed = set(st.mcp_tools) if st is not None else set()
+        tools: List[Dict] = []
+        if system_tools:
+            tools.extend(TOOLS)
+        if self._mcp is not None:
+            for d in self._mcp.tools():
+                name = d.get("function", {}).get("name")
+                if not name:
+                    continue
+                if self._mcp.tool_owner(name) == BUNDLED_NAME:
+                    if system_tools:
+                        tools.append(d)
+                elif name in allowed:
+                    tools.append(d)
+        self.llm_tools = tools
 
     def mcp_status(self) -> dict:
         return self._mcp.server_status() if self._mcp else {}
@@ -317,80 +746,13 @@ class ChatController:
         """本轮是否已请求过打断（UI 用于「再按一次强制退出」）。"""
         return self._interrupt_requested
 
-    # ---------------- 持久化 ----------------
-
-    def save_session(self) -> None:
-        filepath = self.SAVE_FILE
-        try:
-            data = {
-                "system_prompt": self.current_system,
-                "temperature": self.current_temperature,
-                "model": self.current_model,
-                "thinking_enabled": self.thinking_enabled,
-                "reasoning_effort": self.reasoning_effort,
-                "audit_level": self.audit_level,
-                "file_confirm": self.file_confirm,
-                "workspace": self.workspace,
-                "tree": self.tree.to_dict(),
-                "imported_content": self.imported_content,
-                "imported_files": self.imported_files,
-            }
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception:
-            return False
-
-    def load_session(self) -> bool:
-        self.session_loaded = False
-        if not os.path.exists(self.SAVE_FILE):
-            return False
-        try:
-            with open(self.SAVE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            try:
-                os.remove(self.SAVE_FILE)
-            except Exception:
-                pass
-            return False
-
-        self.current_system = data.get("system_prompt", self.current_system)
-        self.current_temperature = data.get("temperature", self.current_temperature)
-        # 旧模型名（deepseek-v4-flash / -vision-exp / chat / reasoner）自动改写为现役名
-        saved_model = data.get("model", self.current_model)
-        self.current_model = normalize_model_name(saved_model)
-        if self.current_model != saved_model:
-            self.model_migrated_from = saved_model
-        self.thinking_enabled = data.get("thinking_enabled", False)
-        self.reasoning_effort = data.get("reasoning_effort", "high")
-        self.audit_level = data.get("audit_level", 1)
-        self.file_confirm = data.get("file_confirm", True)
-        self.workspace = data.get("workspace") or None
-
-        tree_data = data.get("tree")
-        if tree_data:
-            self.tree = ConversationTree.from_dict(tree_data)
-        else:
-            self.tree = ConversationTree(self.current_system)
-
-        self.imported_content = data.get("imported_content")
-        self.imported_files = data.get("imported_files") or []
-        self.session_loaded = True
-        return True
-
-    def delete_session_file(self) -> None:
-        try:
-            if os.path.exists(self.SAVE_FILE):
-                os.remove(self.SAVE_FILE)
-        except Exception:
-            pass
-
     # ---------------- 设置 ----------------
 
     def set_system(self, system: str) -> None:
+        """设置系统提示词（全局设置：立即作用于所有已加载的对话树）。"""
         self.current_system = system
-        self.tree.system_prompt = system
+        for st in self._states.values():
+            st.tree.system_prompt = system
 
     def set_temperature(self, temp: float) -> None:
         self.current_temperature = temp
@@ -602,10 +964,10 @@ class ChatController:
         return filepath
 
     def reset(self) -> None:
-        """清空对话历史（/clear）。"""
+        """清空当前对话树的对话历史（/clear）。"""
         self._cleanup_temp_files()
         self.tree = ConversationTree(self.current_system)
-        self.delete_session_file()
+        self.save_tree()
 
     # ---------------- 上下文压缩 ----------------
 
@@ -1092,7 +1454,45 @@ class ChatController:
     def send_message(
         self, user_input: str, emit: EventSink
     ) -> Optional[ConversationNode]:
-        """发送一条消息（可能触发多轮工具调用），完成后返回新节点。
+        """在当前对话树里发送一条消息（可能触发多轮工具调用），返回新节点。
+
+        多对话树：本方法在 worker 线程里执行，进入时把「当前树」绑定到发起
+        生成的那棵树（线程局部），因此用户中途切到别的树也不会让生成写错树；
+        事件统一盖上树编号，UI 据此丢弃不属于当前树的事件。切走后生成继续，
+        结束后在 tree_marks 里留下「完成/出错」标记供 UI 提示。
+        """
+        state = self._state()
+        if state is None:
+            self._reset_placeholder()
+            state = self._state()
+        if state is None or state.is_placeholder:
+            raise RuntimeError("尚未创建对话树，请先新建对话树（/tree new）")
+
+        self._tls.state = state
+        self._gen_tree = state.number
+        failed = False
+
+        def _emit(ev: ControllerEvent) -> None:
+            ev.tree = state.number
+            emit(ev)
+
+        try:
+            return self._send_message_impl(user_input, _emit)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            self._tls.state = None
+            self._gen_tree = 0
+            if state.number != self._active:
+                # 后台生成：给侧栏留一个「完成/出错」标记，并把结果落盘
+                self.tree_marks[state.number] = "error" if failed else "done"
+            self.save_tree(state.number)
+
+    def _send_message_impl(
+        self, user_input: str, emit: EventSink
+    ) -> Optional[ConversationNode]:
+        """发送消息的实际实现（已绑定好树上下文，见 send_message）。
 
         节点在流式输出前即创建并设为当前节点（UI 可立即“进入”新节点进行
         流式输出）；**出错时节点也会保留**（写入已生成的部分内容与 node.error），
@@ -1340,7 +1740,7 @@ class ChatController:
                     tool_messages=tool_messages,
                 )
         except KeyboardInterrupt:
-            # 纯文本模式下 Ctrl+C 会直接中断阻塞调用：同样保留已生成的部分，
+            # 外部直接中断（如测试或未来前端）：同样保留已生成的部分，
             # 再抛出交给前端（TUI 走 interrupt() 标志，不会走到这里）。
             self._interrupt_requested = True
             _finalize("用户已打断")
@@ -1722,9 +2122,13 @@ class ChatController:
     def _run_tool(self, name: str, args: dict, emit: EventSink) -> str:
         """执行一个工具，返回文本结果。"""
         if name == "query_conversation_tree":
-            return self._query_conversation_tree(args.get("root", ""), args.get("search", ""))
+            return self._query_conversation_tree(
+                args.get("root", ""), args.get("search", ""), args.get("tree", "")
+            )
         if name == "read_conversation_nodes":
-            return self._read_conversation_nodes(args.get("node_ids", ""))
+            return self._read_conversation_nodes(
+                args.get("node_ids", ""), args.get("tree", "")
+            )
         if name == "write_file":
             return self._write_file(args.get("filepath", ""), args.get("content", ""))
         if name == "edit_file":
@@ -1741,59 +2145,110 @@ class ChatController:
 
     # ---------------- 工具实现 ----------------
 
-    def _query_conversation_tree(self, root: str = "", search: str = "") -> str:
-        if not self.tree or not self.tree.root:
-            return "（暂无对话记录）"
+    def _tree_for_arg(self, tree_arg: Any) -> Optional[ConversationTree]:
+        """解析跨树查询工具的 tree 参数（编号）：空 = 当前树，非法/不存在 = None。"""
+        text = str(tree_arg if tree_arg is not None else "").strip()
+        if not text:
+            return self.tree
+        try:
+            number = int(text)
+        except ValueError:
+            return None
+        if not self._store.has_tree(number):
+            return None
+        return self._load_state(number).tree
+
+    def tree_overview_lines(self) -> List[str]:
+        """所有对话树的编号 + 首条提问标题（跨树查询工具返回给模型的索引）。"""
+        lines = []
+        for number in self._store.numbers():
+            st = self._states.get(number)
+            tree = st.tree if st is not None else None
+            if tree is None:
+                data = self._store.load_tree(number) or {}
+                tree_data = data.get("tree")
+                tree = (
+                    ConversationTree.from_dict(tree_data)
+                    if isinstance(tree_data, dict)
+                    else None
+                )
+            title = ""
+            if tree is not None and tree.root is not None:
+                title = tree.root.title or ""
+            mark = "（当前对话树）" if number == self._active else ""
+            lines.append(f"树 {number}{mark}: {title or '（空）'}")
+        return lines
+
+    def _query_conversation_tree(
+        self, root: str = "", search: str = "", tree_arg: Any = ""
+    ) -> str:
+        tree = self._tree_for_arg(tree_arg)
+        if tree is None:
+            return f"（对话树 {tree_arg} 不存在；可用编号: {'、'.join(str(n) for n in self._store.numbers()) or '无'}）"
+        scope = f"树 {tree_arg}" if str(tree_arg).strip() else f"树 {self._active}"
+        if not tree.root:
+            return f"（{scope} 暂无对话记录）"
 
         if search:
             results = []
             kw = search.lower()
-            for nid, node in self.tree.nodes.items():
+            for nid, node in tree.nodes.items():
                 if kw in (node.title or "").lower() or kw in (node.user_msg or "").lower():
                     results.append(f"{nid}: {node.title}")
-            return "\n".join(results) if results else f"（未找到包含「{search}」的节点）"
+            return "\n".join(results) if results else f"（{scope} 中未找到包含「{search}」的节点）"
 
         if root:
             nodes_in_tree = []
             root_id = next(
                 (
                     nid
-                    for nid in self.tree.nodes
-                    if self.tree._node_letter_prefix(nid) == root
-                    and self.tree.nodes[nid].parent_id == "main"
+                    for nid in tree.nodes
+                    if tree._node_letter_prefix(nid) == root
+                    and tree.nodes[nid].parent_id == "main"
                 ),
                 None,
             )
             if not root_id:
-                return f"（子对话树 {root} 不存在）"
+                return f"（{scope} 的子对话树 {root} 不存在）"
             descendants = set()
-            self.tree._collect_descendants(self.tree.nodes[root_id], descendants)
+            tree._collect_descendants(tree.nodes[root_id], descendants)
             for nid in sorted(descendants):
-                node = self.tree.nodes[nid]
+                node = tree.nodes[nid]
                 depth = 0
                 cur = node
                 while cur.parent_id and cur.parent_id != "main":
                     depth += 1
-                    cur = self.tree.nodes.get(cur.parent_id)
+                    cur = tree.nodes.get(cur.parent_id)
                 nodes_in_tree.append(f"{'  ' * depth}{nid}: {node.title}")
             return "\n".join(nodes_in_tree)
 
-        lines = [f"main: {self.tree.root.title}"]
-        for child in self.tree.root.children:
-            prefix = self.tree._get_subtree_root_prefix(child.id)
+        lines = []
+        # 不指定 tree 时顺带列出所有对话树，让模型知道有哪几棵树可以查
+        if not str(tree_arg).strip():
+            overview = self.tree_overview_lines()
+            if len(overview) > 1:
+                lines.append("全部对话树（可用 tree 参数指定编号查询）：")
+                lines.extend(f"  {ln}" for ln in overview)
+                lines.append("")
+        lines.append(f"main: {tree.root.title}")
+        for child in tree.root.children:
+            prefix = tree._get_subtree_root_prefix(child.id)
             if prefix:
-                count = self.tree.count_subtree_nodes(prefix)
-                suffix = self.tree.subtree_titles.get(prefix, child.title)
+                count = tree.count_subtree_nodes(prefix)
+                suffix = tree.subtree_titles.get(prefix, child.title)
                 lines.append(f"  {prefix}: {suffix}（{count}个节点）")
         return "\n".join(lines)
 
-    def _read_conversation_nodes(self, node_ids: str) -> str:
+    def _read_conversation_nodes(self, node_ids: str, tree_arg: Any = "") -> str:
+        tree = self._tree_for_arg(tree_arg)
+        if tree is None:
+            return f"（对话树 {tree_arg} 不存在）"
         parts = []
         for nid in node_ids.split(","):
             nid = nid.strip()
             if not nid:
                 continue
-            node = self.tree.nodes.get(nid)
+            node = tree.nodes.get(nid)
             if not node:
                 parts.append(f"--- {nid} ---\n（节点不存在）")
             else:

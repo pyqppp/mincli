@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -124,8 +125,26 @@ class FakeClient:
 # ---------------- 测试用控制器 ----------------
 
 class TestController(ChatController):
-    SAVE_FILE = os.path.join(_TMP, "session.json")
+    """测试控制器：对话树落在临时目录，默认先建一棵树。
+
+    历史用例都面向「只有一棵树」的行为，因此构造后若磁盘上没有树就先建
+    编号 1；需要验证「一棵树都没有」的用例请用 reset_store() 清空后自行构造。
+    """
+
+    TREES_DIR = os.path.join(_TMP, "trees")
     WORKFLOWS_FILE = os.path.join(_TMP, "workflows.json")
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("trees_dir", self.TREES_DIR)
+        super().__init__(*args, **kwargs)
+        if not self.has_trees:
+            self.create_tree()
+
+    @classmethod
+    def reset_store(cls) -> None:
+        """清空测试用树目录（用例之间相互隔离）。"""
+        shutil.rmtree(cls.TREES_DIR, ignore_errors=True)
+        os.makedirs(cls.TREES_DIR, exist_ok=True)
 
 
 def collect(ctrl, text):
@@ -286,8 +305,7 @@ def test_partial_save_on_error():
           reloaded is not None and reloaded.assistant_msg == "前半句，还没写完")
     check("重载后中断标记仍在",
           reloaded is not None and "Content Exists Risk" in reloaded.error)
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
 
 
 def test_tool_round_partial_save():
@@ -334,14 +352,13 @@ def test_tool_round_partial_save():
 
 def test_session_roundtrip():
     print("== 会话持久化 ==")
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
     script = [[FakeChunk(content="第一轮")], FakeChatResponse(content="标题A")]
     ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     check("首次无已存会话", not ctrl.session_loaded)
     collect(ctrl, "第一问")
     check("save_session 成功", ctrl.save_session())
-    check("文件已写入", os.path.exists(TestController.SAVE_FILE))
+    check("文件已写入", os.path.exists(os.path.join(TestController.TREES_DIR, "1.json")))
 
     script2 = [[FakeChunk(content="第二轮")], FakeChatResponse(content="标题B")]
     ctrl2 = TestController(FakeClient(script2), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
@@ -349,7 +366,7 @@ def test_session_roundtrip():
     check("树已恢复", ctrl2.tree.root is not None and ctrl2.tree.root.title == "标题A")
     node, _ = collect(ctrl2, "第二问")
     check("在已有树上追加节点", node is not None and node.parent_id is not None and node.id != "main")
-    os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
 
 
 def test_import_target():
@@ -552,8 +569,7 @@ def test_compact():
     ctrl.save_session()
     ctrl3 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     check("重载后压缩仍在", ctrl3.session_loaded and ctrl3.tree.compaction is not None)
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
 
     # 空会话无可压缩内容
     ctrl2 = TestController(
@@ -626,6 +642,8 @@ def test_multimodal():
         [FakeChunk(content="x", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
         FakeChatResponse(content="t"),
     ]
+    # 独立场景：清空树目录，保证 ctrl3 从空树开始（前两个控制器已把树落盘）
+    TestController.reset_store()
     ctrl3 = TestController(FakeClient(script3), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     ctrl3.current_model = "gpt-4o"
     events3 = []
@@ -717,8 +735,7 @@ def test_multimodal():
     check("压缩源含图片占位", "[图片: m.png (800x600)]" in src)
 
     # 8) 会话持久化保留附件（路径与 file_id，不含 base64）
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
     c8 = TestController(FakeClient(script6, files_script=["file-api-persist"]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     c8.add_pending_images([png])
     n8 = c8.send_message("图", lambda e: None)
@@ -729,8 +746,7 @@ def test_multimodal():
           and c8b.tree.current_node is not None
           and c8b.tree.current_node.user_images
           and c8b.tree.current_node.user_images[0].file_id == "file-api-persist")
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
 
     # 9) set_detail 校验
     c9 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
@@ -809,8 +825,7 @@ def test_usage_stats():
 
     # 会话持久化保留缓存统计
     ctrl.tree.current_node = node
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
     ctrl.save_session()
     ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     check("重载后缓存统计保留", ctrl2.tree.current_node is not None
@@ -819,8 +834,7 @@ def test_usage_stats():
     check("重载后 last_* usage 保留", ctrl2.tree.current_node.last_prompt_tokens == 200
           and ctrl2.tree.current_node.last_output_tokens == 30
           and ctrl2.usage_stats()["next_input_tokens"] == 230)
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
 
     # 无节点时返回默认值
     ctrl3 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
@@ -1021,8 +1035,7 @@ def test_model_migration():
     check("归一：pro 保持", normalize_model_name("deepseek-v4-pro") == MODEL_PRO)
     check("归一：未知名原样", normalize_model_name("gpt-4o") == "gpt-4o")
 
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
     ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     ctrl.tree.create_root("问题", "回答", "", "标题", 1, 1)
     ctrl.current_model = "deepseek-v4-flash-vision-exp"  # 模拟旧会话
@@ -1030,8 +1043,7 @@ def test_model_migration():
     ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
     check("旧会话模型自动改写", ctrl2.current_model == MODEL_FLASH)
     check("记录改写来源", ctrl2.model_migrated_from == "deepseek-v4-flash-vision-exp")
-    if os.path.exists(TestController.SAVE_FILE):
-        os.remove(TestController.SAVE_FILE)
+    TestController.reset_store()
 
 
 def test_image_limits():
@@ -1331,6 +1343,20 @@ def test_mcp_nonblocking_controller():
         def tool_names(self):
             return set() if self.connecting else {"read_file"}
 
+        def tool_owner(self, name):
+            return "mincli" if name == "read_file" else None
+
+        def tools_by_server(self):
+            if self.connecting:
+                return {}
+            return {"mincli": ["read_file"], "tavily": ["tavily_search"]}
+
+        def configured_servers(self):
+            return ["tavily"]
+
+        def call(self, name, arguments, timeout=None):
+            return "（stub）"
+
         def cancel_running(self):
             return True
 
@@ -1402,33 +1428,252 @@ def test_mcp_internal_tools():
           "cancel_command" in INTERNAL_TOOLS)
 
 
+def test_multi_tree():
+    print("== 多对话树：新建 / 切换 / 每树设置 / 删除 ==")
+    script = [
+        [FakeChunk(content="树二回答", usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4))],
+        FakeChatResponse(content="标题二"),
+    ]
+    ctrl = TestController(
+        FakeClient(script), default_system="sys", default_temperature=1.0,
+        auto_start_mcp=False,
+    )
+    check("默认只有树 1", ctrl.tree_numbers() == [1] and ctrl.active_number == 1)
+    check("树 1 颜色为 1（青）", ctrl.tree_color(1) == 1)
+
+    n2 = ctrl.create_tree(system_tools=False, mcp_tools=["tavily_search"])
+    check("新建得到编号 2 并切过去", n2 == 2 and ctrl.active_number == 2)
+    check("树 2 颜色为 2", ctrl.tree_color(2) == 2)
+    check("树 2 能力已记录",
+          ctrl.tree_caps(2) == {"system_tools": False, "mcp_tools": ["tavily_search"]})
+    check("树 1 能力仍是默认",
+          ctrl.tree_caps(1) == {"system_tools": True, "mcp_tools": []})
+
+    ctrl.audit_level = 3
+    ctrl.workspace = "/tmp/tree2"
+    ctrl.draft = "树 2 的草稿"
+    check("切回树 1 后每树设置回到默认",
+          ctrl.switch_tree(1) and ctrl.audit_level == 1
+          and ctrl.workspace is None and ctrl.draft == "")
+    check("切回树 2 后每树设置还在",
+          ctrl.switch_tree(2) and ctrl.audit_level == 3
+          and ctrl.workspace == "/tmp/tree2" and ctrl.draft == "树 2 的草稿")
+
+    node2, _ = collect(ctrl, "树二的问题")
+    check("树 2 的节点落在树 2", ctrl.tree.root is node2)
+    ctrl.switch_tree(1)
+    check("树 1 仍是空树", ctrl.tree.root is None and ctrl.tree.current_node is None)
+
+    ctrl.save_session()
+    reloaded = TestController(
+        FakeClient([]), default_system="sys", default_temperature=1.0,
+        auto_start_mcp=False,
+    )
+    check("重载后两棵树都在", reloaded.tree_numbers() == [1, 2])
+    check("重载后停在树 1", reloaded.active_number == 1)
+    check("重载后树 2 的问答还在", reloaded.tree_summary(2)["title"] == "标题二")
+    check("重载后树 2 的能力还在", reloaded.tree_caps(2)["system_tools"] is False)
+    check("重载后树 2 的草稿还在", reloaded._load_state(2).draft == "树 2 的草稿")
+    check("每棵树一个文件",
+          os.path.exists(os.path.join(TestController.TREES_DIR, "1.json"))
+          and os.path.exists(os.path.join(TestController.TREES_DIR, "2.json")))
+
+    result = ctrl.delete_tree(2)
+    check("删除树 2", result["ok"] and ctrl.tree_numbers() == [1])
+    check("删除后文件也没了",
+          not os.path.exists(os.path.join(TestController.TREES_DIR, "2.json")))
+    check("编号不复用：新建得到 3", ctrl.create_tree() == 3)
+
+
+def test_multi_tree_no_tree_guard():
+    print("== 没有对话树时拒绝发送 ==")
+    base = tempfile.mkdtemp(prefix="mincli_notree_")
+    try:
+        ctrl = ChatController(
+            FakeClient([]), default_system="sys", default_temperature=1.0,
+            auto_start_mcp=False, trees_dir=base,
+        )
+        check("没有树时 has_trees 为假", not ctrl.has_trees and not ctrl.session_loaded)
+        raised = False
+        try:
+            ctrl.send_message("你好", lambda ev: None)
+        except RuntimeError:
+            raised = True
+        check("没有树时发送被拒绝", raised)
+        check("建树后恢复正常", ctrl.create_tree() == 1 and ctrl.has_trees)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_background_tree_mark():
+    print("== 后台生成：切走后留完成标记 ==")
+    script = [
+        [FakeChunk(content="回答", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="标题"),
+    ]
+    ctrl = TestController(
+        FakeClient(script), default_system="sys", default_temperature=1.0,
+        auto_start_mcp=False,
+    )
+    ctrl.create_tree()          # 建树 2
+    ctrl.switch_tree(1)         # 回到树 1 发起生成
+
+    seen_trees = []
+
+    def fake_impl(text, emit):
+        # 模拟生成期间用户切到树 2
+        ctrl.switch_tree(2)
+        emit(ControllerEvent.done(None))
+        return None
+
+    ctrl._send_message_impl = fake_impl
+    ctrl.send_message("目标树里的问题", lambda ev: seen_trees.append(ev.tree))
+    check("事件带上发起生成的树编号", seen_trees == [1])
+    check("后台生成结束留下完成标记", ctrl.tree_marks.get(1) == "done")
+    check("当前仍在用户切过去的树", ctrl.active_number == 2)
+    check("切回该树时标记被清除", ctrl.switch_tree(1) and 1 not in ctrl.tree_marks)
+
+
+def test_tree_capability_filter():
+    print("== 能力白名单：系统工具开关 + 外置工具逐个放行 ==")
+
+    class FakeMcp:
+        """只提供工具定义与归属，不连接任何 server。"""
+
+        def tools(self):
+            return [
+                {"type": "function",
+                 "function": {"name": n, "description": "", "parameters": {}}}
+                for n in ("read_file", "execute_command", "tavily_search", "obsidian_note")
+            ]
+
+        def tool_owner(self, name):
+            return {
+                "read_file": "mincli",
+                "execute_command": "mincli",
+                "tavily_search": "tavily",
+                "obsidian_note": "obsidian",
+            }.get(name)
+
+        def tool_names(self):
+            return {"read_file", "execute_command", "tavily_search", "obsidian_note"}
+
+        def tools_by_server(self):
+            return {
+                "mincli": ["read_file", "execute_command"],
+                "tavily": ["tavily_search"],
+                "obsidian": ["obsidian_note"],
+            }
+
+        def configured_servers(self):
+            return ["tavily", "obsidian"]
+
+    ctrl = TestController(
+        FakeClient([]), default_system="sys", default_temperature=1.0,
+        auto_start_mcp=False,
+    )
+    ctrl._mcp = FakeMcp()
+    ctrl._rebuild_llm_tools()
+    names = {t["function"]["name"] for t in ctrl.llm_tools}
+    check("默认：进程内 + 内置 server 工具都在",
+          "query_conversation_tree" in names and "read_file" in names)
+    check("默认：外置工具一个都不挂",
+          "tavily_search" not in names and "obsidian_note" not in names)
+
+    ctrl.set_tree_caps(ctrl.active_number, mcp_tools=["tavily_search"])
+    names = {t["function"]["name"] for t in ctrl.llm_tools}
+    check("勾选后只放行勾到的那个工具",
+          "tavily_search" in names and "obsidian_note" not in names)
+
+    ctrl.set_tree_caps(ctrl.active_number, system_tools=False)
+    names = {t["function"]["name"] for t in ctrl.llm_tools}
+    check("关掉系统工具后内置工具消失",
+          "read_file" not in names and "query_conversation_tree" not in names)
+    check("外置白名单不受影响", "tavily_search" in names)
+
+    ctrl.create_tree(system_tools=False, mcp_tools=[])
+    check("新树不继承上一棵树的外置白名单",
+          {t["function"]["name"] for t in ctrl.llm_tools} == set())
+    check("可查询可选工具分组", ctrl.available_tool_groups()["tavily"] == ["tavily_search"])
+
+
+def test_cross_tree_tools():
+    print("== 跨树查询工具（tree 参数） ==")
+    script = [
+        [FakeChunk(content="回答一", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="标题一"),
+        [FakeChunk(content="回答二", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="标题二"),
+    ]
+    ctrl = TestController(
+        FakeClient(script), default_system="sys", default_temperature=1.0,
+        auto_start_mcp=False,
+    )
+    collect(ctrl, "树一的问题")
+    ctrl.create_tree()
+    collect(ctrl, "树二的问题")
+
+    out = ctrl._run_tool("query_conversation_tree", {}, lambda ev: None)
+    check("不传 tree：列出全部对话树编号与首条提问",
+          "树 1" in out and "树 2" in out and "标题一" in out and "标题二" in out)
+    check("不传 tree：同时给出当前树的子树索引", "main:" in out)
+
+    out1 = ctrl._run_tool("query_conversation_tree", {"tree": "1"}, lambda ev: None)
+    check("指定 tree=1 查到另一棵树", "标题一" in out1 and "标题二" not in out1)
+    check("指定编号时不附带全树索引", "全部对话树" not in out1)
+
+    search = ctrl._run_tool(
+        "query_conversation_tree", {"tree": "1", "search": "树一"}, lambda ev: None
+    )
+    check("跨树搜索命中", "main" in search)
+
+    read = ctrl._run_tool(
+        "read_conversation_nodes", {"node_ids": "main", "tree": "1"}, lambda ev: None
+    )
+    check("跨树读节点内容", "树一的问题" in read and "回答一" in read)
+
+    bad = ctrl._run_tool("query_conversation_tree", {"tree": "9"}, lambda ev: None)
+    check("不存在的编号给出可用编号提示", "不存在" in bad and "1" in bad)
+
+
+def run_test(fn) -> None:
+    """每个用例前清空对话树目录：树是持久化的，不隔离会互相污染。"""
+    TestController.reset_store()
+    fn()
+
+
 if __name__ == "__main__":
-    test_simple_qa()
-    test_tool_round()
-    test_api_error()
-    test_partial_save_on_error()
-    test_tool_round_partial_save()
-    test_session_roundtrip()
-    test_import_target()
-    test_path_args()
-    test_import_multi()
-    test_delete_nodes()
-    test_settings()
-    test_compact()
-    test_multimodal()
-    test_usage_stats()
-    test_workflows()
-    test_pricing_config()
-    test_model_migration()
-    test_image_limits()
-    test_open_path_with_os()
-    test_exec_timeout_config()
-    test_interrupt()
-    test_exec_cancel()
-    test_mcp_internal_tools()
-    test_mcp_parallel_connect()
-    test_mcp_background_start()
-    test_mcp_close_while_connecting()
-    test_mcp_nonblocking_controller()
+    run_test(test_simple_qa)
+    run_test(test_tool_round)
+    run_test(test_api_error)
+    run_test(test_partial_save_on_error)
+    run_test(test_tool_round_partial_save)
+    run_test(test_session_roundtrip)
+    run_test(test_import_target)
+    run_test(test_path_args)
+    run_test(test_import_multi)
+    run_test(test_delete_nodes)
+    run_test(test_settings)
+    run_test(test_compact)
+    run_test(test_multimodal)
+    run_test(test_usage_stats)
+    run_test(test_workflows)
+    run_test(test_pricing_config)
+    run_test(test_model_migration)
+    run_test(test_image_limits)
+    run_test(test_open_path_with_os)
+    run_test(test_exec_timeout_config)
+    run_test(test_interrupt)
+    run_test(test_exec_cancel)
+    run_test(test_mcp_internal_tools)
+    run_test(test_mcp_parallel_connect)
+    run_test(test_mcp_background_start)
+    run_test(test_mcp_close_while_connecting)
+    run_test(test_mcp_nonblocking_controller)
+    run_test(test_multi_tree)
+    run_test(test_multi_tree_no_tree_guard)
+    run_test(test_background_tree_mark)
+    run_test(test_tree_capability_filter)
+    run_test(test_cross_tree_tools)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

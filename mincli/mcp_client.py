@@ -139,6 +139,29 @@ class McpToolClient:
     def tool_names(self) -> set:
         return set(self._tool_owner.keys())
 
+    def tool_owner(self, name: str) -> Optional[str]:
+        """工具名 → 提供它的 server 名（未知工具返回 None）。"""
+        return self._tool_owner.get(name)
+
+    def tools_by_server(self) -> Dict[str, List[str]]:
+        """server 名 → 该 server 暴露给模型的工具名（不含内部工具）。
+
+        多对话树的能力勾选界面按这个分组列出可选工具；内置 server 用
+        BUNDLED_NAME（"mincli"）作为键，对应「系统工具」那一组。
+        """
+        grouped: Dict[str, List[str]] = {}
+        for d in self._tool_defs:
+            name = d.get("function", {}).get("name")
+            if not name:
+                continue
+            owner = self._tool_owner.get(name) or BUNDLED_NAME
+            grouped.setdefault(owner, []).append(name)
+        return grouped
+
+    def configured_servers(self) -> List[str]:
+        """已配置的第三方 server 名（不含内置），按配置顺序。"""
+        return list(load_mcp_servers().keys())
+
     def call(self, name: str, arguments: dict, timeout: int = CALL_TIMEOUT) -> str:
         owner = self._tool_owner.get(name)
         if owner is None:
