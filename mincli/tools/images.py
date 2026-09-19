@@ -4,23 +4,30 @@
 与 DeepSeek API 的行为一致（API 也按内容而非扩展名/声明 MIME 判断，
 实测 JPEG 内容声明为 png 仍可正常识别，BMP 会被 400 拒绝）。
 
-token 估算采用「每图固定值」（默认 1024 = 官方单图上限，可在 pricing.json
-通过 image_tokens 调整）：官方文档说明每张图片缩放后 token 数存在上限，
-且官方未公开精确换算公式；这里只用于状态条与压缩前后统计的近似估算，
-实际计费以接口返回的 usage 为准。
+token 估算按官方预处理流程精确换算（见 estimate_image_tokens）：小图先放大到
+约 544×544，大图缩到上限 1024 token（约 1300×1300），结果与官方文档给的
+「2000×2000 与 5000×5000 同值」「单图上限 1024」完全吻合。尺寸未知（外链 URL）
+时退回 pricing.json 的可配置值 image_tokens（默认 1024，即上限）。估算只用于
+状态条与压缩前后统计，实际计费以接口返回的 usage 为准。
 """
 
 from __future__ import annotations
 
 import base64
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from mincli.config import (
     VISION_DEFAULT_DETAIL,
+    VISION_DOWNSAMPLE_RATIO,
     VISION_FILE_ID_IMAGE_MAX_BYTES,
     VISION_INLINE_IMAGE_MAX_BYTES,
+    VISION_LOW_SCALE_SIDE,
+    VISION_MAX_IMAGE_TOKENS,
+    VISION_MIN_PIXELS,
+    VISION_PATCH_SIZE,
     VISION_URL_MAX_CHARS,
 )
 from mincli.pricing import image_tokens_per_image
@@ -175,16 +182,76 @@ def encode_data_url(data: bytes, fmt: str) -> str:
     return f"data:image/{fmt};base64,{b64}"
 
 
+def _llm_grid(best_h: int, best_w: int) -> Tuple[int, int]:
+    """对齐后的像素尺寸 → 视觉 token 网格（官方实现同名函数）。"""
+    return (
+        math.ceil((best_h // VISION_PATCH_SIZE) / VISION_DOWNSAMPLE_RATIO),
+        math.ceil((best_w // VISION_PATCH_SIZE) / VISION_DOWNSAMPLE_RATIO),
+    )
+
+
+def _num_image_tokens(n_h: int, n_w: int) -> int:
+    """官方实现：n_h 行，每行 n_w 个图像 token 加 1 个换行，外加首尾 2 个标记。"""
+    return n_h * (n_w + 1) + 2
+
+
+def _solve_resize_ratio(height: int, width: int, max_tokens: int) -> Tuple[int, int]:
+    """token 超上限时，求长宽比不变的最大像素尺寸（官方实现同名函数）。
+
+    返回 (best_height, best_width)，两者都是 patch 的整数倍。
+    """
+    cell = VISION_PATCH_SIZE * VISION_DOWNSAMPLE_RATIO
+    r = height / width
+    max_w = math.sqrt((max_tokens - 2) / r + 0.25) - 0.5
+    max_h = max_w * r
+    if max_w < 1.0:      # 极窄：压成单列
+        return (max_tokens - 2) // 2 * cell, cell
+    if max_h < 1.0:      # 极宽：压成单行
+        return cell, (max_tokens - 3) * cell
+    beta = min(
+        math.floor(max_w) * cell / width,
+        math.floor(max_h) * cell / height,
+    )
+    return (
+        math.floor(height * beta / VISION_PATCH_SIZE) * VISION_PATCH_SIZE,
+        math.floor(width * beta / VISION_PATCH_SIZE) * VISION_PATCH_SIZE,
+    )
+
+
 def estimate_image_tokens(
     width: Optional[int], height: Optional[int], detail: str = VISION_DEFAULT_DETAIL
 ) -> int:
-    """估算一张图片消耗的 token（固定值/图；实际以接口 usage 为准）。
+    """按官方预处理流程估算一张图片消耗的 token。
 
-    官方文档：每张图片缩放后 token 数存在上限（1024）。为便于随官方调整，
-    这里不再按尺寸插值，统一用 pricing.json 的 ``image_tokens``（默认 1024）。
-    width/height/detail 仅保留参数兼容（不再影响估算）。
+    流程（与 deepseek-ai/DeepSeek-V4.1-Flash 的 vision_config + vLLM 参考实现
+    ``mm_preprocess.load_image`` 一致）：
+
+    1. ``detail=low``：先把图片缩到单边不超过 512px；
+    2. 总像素小于 544×544 的图片按长宽比放大到约 544×544；
+    3. 宽高各自对齐到 patch(14) 的整数倍，再按下采样比 3 得到 token 网格；
+    4. 单图 token = n_h*(n_w+1)+2，超过上限 1024 时缩小到刚好不超。
+
+    尺寸未知（外链 URL 无法本地嗅探）时退回 ``image_tokens`` 配置值（默认 1024，
+    即官方上限），属于保守估计。
     """
-    return image_tokens_per_image()
+    if not width or not height:
+        return image_tokens_per_image()
+    w, h = int(width), int(height)
+    if w <= 0 or h <= 0:
+        return image_tokens_per_image()
+    if detail == "low" and max(w, h) > VISION_LOW_SCALE_SIDE:
+        ratio = VISION_LOW_SCALE_SIDE / max(w, h)
+        w, h = max(1, int(w * ratio)), max(1, int(h * ratio))
+    if w * h < VISION_MIN_PIXELS:
+        ratio = (VISION_MIN_PIXELS / (w * h)) ** 0.5
+        w, h = max(1, int(w * ratio)), max(1, int(h * ratio))
+    best_w = math.ceil(w / VISION_PATCH_SIZE) * VISION_PATCH_SIZE
+    best_h = math.ceil(h / VISION_PATCH_SIZE) * VISION_PATCH_SIZE
+    n_h, n_w = _llm_grid(best_h, best_w)
+    if _num_image_tokens(n_h, n_w) > VISION_MAX_IMAGE_TOKENS:
+        best_h, best_w = _solve_resize_ratio(h, w, VISION_MAX_IMAGE_TOKENS)
+        n_h, n_w = _llm_grid(best_h, best_w)
+    return _num_image_tokens(n_h, n_w)
 
 
 # ---------------- 附件构造 ----------------
@@ -315,6 +382,48 @@ def oversize_side_attachments(attachments: List[ImageAttachment], limit: int) ->
         if att.width and att.height and max(att.width, att.height) > limit:
             out.append(f"{att.name}（{att.width}x{att.height}）")
     return out
+
+
+def total_tokens_est(attachments: List[ImageAttachment]) -> int:
+    """一组附件的估算 token 合计（尺寸未知的按配置上限计）。"""
+    return sum(
+        att.tokens_est or estimate_image_tokens(att.width, att.height, att.detail)
+        for att in attachments
+    )
+
+
+def split_low_inline(
+    attachments: List[ImageAttachment], budget_bytes: int
+) -> Tuple[List[ImageAttachment], List[ImageAttachment]]:
+    """把「还没有 file_id 的本地图片」分成 (走内联, 走上传) 两组。
+
+    ``file`` 内容块不支持 detail 字段（官方明确：通过 file_id 传图时 detail 被
+    忽略），所以要让 ``detail=low`` 真正省 token，只能走内联的 ``image_url``。
+    这里把 detail=low 的本地图片按体积升序放进内联预算，预算用完的（以及
+    超过内联单图上限、本地文件缺失的）仍走上传，由调用方提示 detail 不生效。
+    """
+    inline: List[ImageAttachment] = []
+    upload: List[ImageAttachment] = []
+    candidates: List[ImageAttachment] = []
+    budget = max(0, int(budget_bytes))
+    for att in attachments:
+        if att.file_id or att.is_url:
+            continue
+        if (
+            att.detail != "low"
+            or not att.size_bytes
+            or att.size_bytes > VISION_INLINE_IMAGE_MAX_BYTES
+        ):
+            upload.append(att)
+            continue
+        candidates.append(att)
+    for att in sorted(candidates, key=lambda a: a.size_bytes):
+        if att.size_bytes <= budget:
+            budget -= att.size_bytes
+            inline.append(att)
+        else:
+            upload.append(att)
+    return inline, upload
 
 
 def collect_inline_bytes(messages: List[Dict]) -> int:

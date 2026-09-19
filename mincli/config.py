@@ -114,10 +114,11 @@ DEFAULT_PEAK_CONFIG: dict = {
     "timezone_offset_hours": 8,       # 高峰判定所用时区（北京时间为 8）
 }
 
-# 图片 token 估算：官方单图上限 1024，按“固定值/图”估算（可在 pricing.json 调整）
+# 图片 token 估算兜底：只用于「尺寸未知」（如外链 URL）的图片，默认取官方单图上限；
+# 尺寸已知时按官方预处理公式精确换算（见 tools/images.estimate_image_tokens）
 VISION_IMAGE_TOKENS_DEFAULT = 1024
 
-# 定价配置文件（价格、峰谷时段、图片 token 固定值均可在此覆盖）
+# 定价配置文件（价格、峰谷时段、图片 token 估算兜底值均可在此覆盖）
 PRICING_PATH = os.path.expanduser(
     os.getenv("MINCLI_PRICING_PATH", "~/.mincli/pricing.json")
 )
@@ -174,6 +175,31 @@ VISION_MAX_SIDE_MANY = 4096        # 单请求 ≥ VISION_MANY_IMAGES_THRESHOLD 
 VISION_MANY_IMAGES_THRESHOLD = 15
 VISION_URL_MAX_CHARS = 8192
 VISION_DEFAULT_DETAIL = "auto"   # low(512²缩放,省token) / high=original / auto≈original
+VISION_LOW_SCALE_SIDE = 512        # detail=low 时先把图片缩到单边不超过该值
+
+# 图片 token 换算（官方实现参数，取自 deepseek-ai/DeepSeek-V4.1-Flash 的
+# vision_config，与 vLLM 参考实现 vllm/models/deepseek_v41/common/mm_preprocess.py
+# 的 num_image_tokens 一致）：
+#   best_w = ceil(w / patch) * patch（宽高各自对齐到 patch 的整数倍）
+#   n_h = ceil(best_h / patch / downsample)，n_w 同理
+#   单图 token = n_h * (n_w + 1) + 2，上限 VISION_MAX_IMAGE_TOKENS
+# 小于 min_pixels 的图片先按长宽比放大到 min_pixels（约 544×544），因此小图不会
+# 低于约 184 token；上限 1024 对应约 1300×1300 的缩放结果。
+VISION_PATCH_SIZE = 14
+VISION_DOWNSAMPLE_RATIO = 3
+VISION_MAX_IMAGE_TOKENS = 1024
+VISION_MIN_PIXELS = 295936         # 544 * 544，小图放大阈值
+
+# detail=low 时改用 base64 内联（file 块不支持 detail，只有内联/外链才真正生效）。
+# 内联走 base64（体积约 4/3），这里按原始字节给一个请求级预算；取 24MiB 是为了给
+# 「48MiB 请求体」留出文本历史的余量（24MiB → base64 约 32MiB）。
+VISION_LOW_INLINE_BUDGET_BYTES = 24 * 1024 * 1024
+
+# Files API 存储配额与 /files 列表分页（官方文档 2026-09）
+FILES_MAX_COUNT = 10_000                   # 单用户最大存储文件数
+FILES_MAX_BYTES = 25 * 1024 * 1024 * 1024  # 单用户最大存储空间 25 GiB
+FILES_LIST_PAGE = 20                       # /files list 默认展示条数
+FILES_LIST_PAGE_MAX = 1000                 # 官方单页上限
 
 MCP_CONFIG_PATH = os.path.expanduser(
     os.getenv("MINCLI_MCP_CONFIG", "~/.mincli/mcp_servers.json")

@@ -88,14 +88,53 @@ class _FakeCompletions:
         return self.script.pop(0)
 
 
+class _FakeFiles:
+    """Files API 模拟：内存列表，支持 order/limit/after 与 retrieve。"""
+
+    def __init__(self):
+        # 按创建时间升序保存（官方列表默认 asc，desc 时反转）
+        self.items = [
+            {"id": "file-api-old", "filename": "old.jpg", "bytes": 1024,
+             "created_at": 1690000000, "expires_at": None},
+            {"id": "file-api-tui", "filename": "tui.png", "bytes": 2048,
+             "created_at": 1700000000, "expires_at": None},
+        ]
+        self.created = []
+
+    def create(self, file, purpose="user_data"):
+        item = {"id": f"file-api-{len(self.items)}", "filename": "up.png",
+                "bytes": 1, "created_at": 1700000000, "expires_at": None}
+        self.items.append(item)
+        self.created.append(item["id"])
+        return SimpleNamespace(id=item["id"])
+
+    def list(self, limit=1000, order="asc", after=None):
+        items = list(self.items)
+        if order == "desc":
+            items = list(reversed(items))
+        if after:
+            ids = [i["id"] for i in items]
+            items = items[ids.index(after) + 1:] if after in ids else items
+        return SimpleNamespace(
+            data=[SimpleNamespace(**i) for i in items[:limit]],
+            has_more=len(items) > limit,
+        )
+
+    def retrieve(self, file_id):
+        for item in self.items:
+            if item["id"] == file_id:
+                return SimpleNamespace(**item)
+        raise RuntimeError(f"file not found: {file_id}")
+
+    def delete(self, file_id):
+        self.items = [i for i in self.items if i["id"] != file_id]
+        return SimpleNamespace(deleted=True)
+
+
 class _FakeClient:
     def __init__(self, script):
         self.chat = SimpleNamespace(completions=_FakeCompletions(script))
-        self.files = SimpleNamespace(
-            create=lambda file, purpose: SimpleNamespace(id="file-api-tui"),
-            list=lambda: SimpleNamespace(data=[]),
-            delete=lambda file_id: SimpleNamespace(deleted=True),
-        )
+        self.files = _FakeFiles()
 
 
 class FakeController(ChatController):
@@ -1261,7 +1300,51 @@ async def main() -> int:
         await type_command("/files list")
         for _ in range(10):
             await pilot.pause()
-        check("命令：/files list 显示空列表", "已上传图片文件" in app._chat_source())
+        src_files = app._chat_source()
+        check("命令：/files list 表格带序号与最新在前",
+              "已上传图片文件" in src_files and "| 1 |" in src_files
+              and src_files.index("tui.png") < src_files.index("old.jpg"))
+        check("命令：/files list 显示容量与配额",
+              "合计" in src_files and "配额 10000 个 / 25 GiB" in src_files)
+        check("命令：/files list 提示按序号操作",
+              "/files delete <ID|序号>" in src_files and "/files clean" in src_files)
+
+        await type_command("/files list 1")
+        for _ in range(10):
+            await pilot.pause()
+        src_one = app._chat_source()
+        check("命令：/files list N 限制条数",
+              "共 1 个（最新在前）" in src_one and "还有更早的文件未列出" in src_one)
+        await type_command("/clear")
+        await type_command("/files list")
+        for _ in range(10):
+            await pilot.pause()
+
+        await type_command("/files info 1")
+        for _ in range(10):
+            await pilot.pause()
+        src_info = app._chat_source()
+        check("命令：/files info 按序号查询",
+              "文件信息（Files API）" in src_info and "tui.png" in src_info
+              and "2 KiB" in src_info)
+        check("命令：/files info 显示永久有效", "永久有效" in src_info)
+
+        await type_command("/files delete 2")
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/files delete 按序号删除",
+              [f["id"] for f in fake.client.files.items] == ["file-api-tui"])
+
+        await type_command("/files clean")
+        for _ in range(20):
+            await pilot.pause()
+            if app.screen.query("#confirm-yes"):
+                break
+        check("命令：/files clean 需确认", bool(app.screen.query("#confirm-yes")))
+        app.screen.query_one("#confirm-yes", Button).press()
+        for _ in range(10):
+            await pilot.pause()
+        check("命令：/files clean 删除未引用文件", fake.client.files.items == [])
 
         # 节点视图：带图片的节点渲染占位（直接驱动 node_created 事件）
         node = fake.tree.create_root("看图", "", "", "图题", 0, 0)

@@ -100,6 +100,10 @@ from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
     MODEL_FLASH,
     BALANCE_REFRESH_SECONDS,
+    FILES_LIST_PAGE,
+    FILES_LIST_PAGE_MAX,
+    FILES_MAX_BYTES,
+    FILES_MAX_COUNT,
     PREVIEW_ASSISTANT_MSG_LEN,
     PREVIEW_USER_MSG_LEN,
     TEMPERATURE_MAX,
@@ -353,6 +357,8 @@ class ChatApp(App):
         self._balance_txt: Optional[str] = None  # 最近一次拉取的账户余额（字符串）
         # 工作流（/wf）：已挂载到“下一次输入”的工作流名（发送后自动解除）
         self._pending_wf: Optional[str] = None
+        # /files：最近一次列表结果（供 /files info|delete 用序号引用，免手抄 file_id）
+        self._files_listing: list = []
         # /wf edit：系统编辑器打开的临时文档轮询（检测改动后自动回写）
         self._wf_edit_timer = None  # textual Interval
         self._wf_edit_path: Optional[str] = None
@@ -934,7 +940,11 @@ class ChatApp(App):
             if len(name) > 100:
                 name = name[:97] + "…"
             label = self._IMPORT_KIND_LABELS.get(item.get("kind", ""))
-            lines.append(f"[{label}] {name}" if label else f"· {name}")
+            toks = item.get("tokens") or 0
+            suffix = f" · 约 {toks} tokens" if toks else ""
+            lines.append(
+                f"[{label}] {name}{suffix}" if label else f"· {name}{suffix}"
+            )
         popup = self._import_popup_w
         popup.update("\n".join(lines))
         bar = self.query_one("#usage-bar", Horizontal).region
@@ -967,14 +977,16 @@ class ChatApp(App):
     # ---------------- 拖入文件直接导入（终端路径粘贴） ----------------
 
     def _notify_import_result(self, res: dict) -> None:
-        """统一展示 import_targets 的导入结果通知。"""
+        """统一展示 import_targets 的导入结果通知（图片附带 token 估算）。"""
         bits = []
         if res["images_added"]:
             bits.append(f"{res['images_added']} 张图片")
         if res["text_added"]:
             bits.append(f"{res['text_added']} 个文本/网页")
         if bits:
-            self.notify(f"✅ 已导入 {'、'.join(bits)}，发送时自动附带")
+            self.notify(
+                f"已导入 {'、'.join(bits)}{self.ctrl.images_tokens_hint()}，发送时自动附带"
+            )
         for err in res["errors"][:2]:
             self.notify(err, severity="warning")
         if len(res["errors"]) > 2:
@@ -1467,42 +1479,7 @@ class ChatApp(App):
             return True
 
         if low.startswith("/files"):
-            parts = cmd.split(maxsplit=2)
-            sub = parts[1].lower() if len(parts) > 1 else "list"
-            try:
-                if sub in ("list", "ls", ""):
-                    files = ctrl.files_list()
-                    if not files:
-                        await self._chat_append("**已上传图片文件（Files API）**\n\n（空）")
-                    else:
-                        lines = [
-                            "**已上传图片文件（Files API）**",
-                            "",
-                            "| ID | 文件名 | 大小 | 创建时间 | 过期 |",
-                            "|---|---|---|---|---|",
-                        ]
-                        for f in files:
-                            created = (
-                                datetime.datetime.fromtimestamp(f.get("created_at", 0)).strftime("%m-%d %H:%M")
-                                if f.get("created_at") else "—"
-                            )
-                            expires = (
-                                datetime.datetime.fromtimestamp(f["expires_at"]).strftime("%m-%d %H:%M")
-                                if f.get("expires_at") else "永久"
-                            )
-                            size = f"{f.get('bytes', 0) / 1024 / 1024:.2f} MiB"
-                            lines.append(
-                                f"| `{f.get('id', '')}` | {f.get('name', '')} | {size} | {created} | {expires} |"
-                            )
-                        lines.append("\n删除: `/files delete <ID>`")
-                        await self._chat_append("\n".join(lines))
-                elif sub in ("delete", "rm", "del") and len(parts) == 3:
-                    ctrl.files_delete(parts[2])
-                    self.notify(f"✅ 已删除文件 {parts[2]}")
-                else:
-                    self.notify(usage_line("/files"), severity="warning")
-            except FilesAPIError as e:
-                self.notify(str(e), severity="error")
+            await self._cmd_files(cmd)
             return True
 
         m = re.match(r"^/([A-Za-z]+\d+|main)$", cmd)
@@ -1614,7 +1591,16 @@ class ChatApp(App):
             )
         elif sub == "detail" and len(parts) == 3:
             if ctrl.set_detail(parts[2].lower()):
-                self.notify(f"图片 detail 已设置为: {ctrl.image_detail}")
+                if ctrl.image_detail == "low":
+                    self.notify(
+                        "图片 detail 已设置为: low（本地图片将以内联 base64 发送，"
+                        "detail 才真正生效；file_id 方式会忽略 detail）"
+                    )
+                else:
+                    self.notify(
+                        f"图片 detail 已设置为: {ctrl.image_detail}"
+                        "（本地图片优先上传 Files API 复用；该档与上传后的处理一致）"
+                    )
             else:
                 self.notify(usage_line("/set detail"), severity="warning")
         elif sub == "file_confirm" and len(parts) == 3:
@@ -1640,13 +1626,225 @@ class ChatApp(App):
                 f"- **审核层级**: {ctrl.audit_level} - {AUDIT_LABELS[ctrl.audit_level]}",
                 f"- **文件写入确认**: {'开' if ctrl.file_confirm else '关（AI 可直接写入/修改文件）'}",
                 f"- **命令工作目录**: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}",
-                f"- **图片 detail**: {ctrl.image_detail}",
+                f"- **图片 detail**: {ctrl.image_detail}"
+                + ("（本地图片内联发送，真正生效）" if ctrl.image_detail == "low"
+                   else "（本地图片上传复用 file_id；该档与上传后处理一致）"),
             ]
             if ctrl.tree.current_node:
                 lines.append(f"- **当前节点**: {ctrl.tree.current_node.id} ({ctrl.tree.current_node.title})")
             await self._chat_append("\n".join(lines))
         else:
             self.notify(usage, severity="warning")
+
+    # ---------------- /files：Files API 已上传文件管理 ----------------
+
+    @staticmethod
+    def _fmt_mib(num_bytes: int) -> str:
+        """字节 → MiB 文本（小于 100KiB 时用 KiB，避免全显示成 0.00 MiB）。"""
+        num_bytes = int(num_bytes or 0)
+        if num_bytes < 100 * 1024:
+            return f"{num_bytes / 1024:.0f} KiB"
+        return f"{num_bytes / 1024 / 1024:.2f} MiB"
+
+    @staticmethod
+    def _fmt_ts(ts) -> str:
+        if not ts:
+            return "—"
+        try:
+            return datetime.datetime.fromtimestamp(int(ts)).strftime("%m-%d %H:%M")
+        except (OSError, OverflowError, ValueError):
+            return "—"
+
+    def _resolve_file_ref(self, ref: str) -> Optional[str]:
+        """把 /files 参数解析为 file_id：纯数字按最近列表序号，否则原样当 ID。
+
+        序号优先用最近一次 /files list 的结果（省一次网络请求）；没列过或序号
+        超出范围时按默认页拉一次列表再解析，让 /files delete 2 可以独立使用。
+        """
+        ref = (ref or "").strip()
+        if not ref.isdigit() or self.ctrl is None:
+            return ref or None
+        index = int(ref)
+        listing = list(self._files_listing)
+        if not listing:
+            try:
+                page = self.ctrl.files_list(FILES_LIST_PAGE)
+            except FilesAPIError:
+                return None
+            listing = page["items"]
+        if 1 <= index <= len(listing):
+            return listing[index - 1]["id"]
+        return None
+
+    def _file_ref_error(self, ref: str) -> str:
+        """序号解析失败时的提示（带上当前列表范围，便于改用正确的序号或先列表）。"""
+        total = len(self._files_listing)
+        if total:
+            return f"找不到序号 {ref}（当前列表只有 {total} 个）；/files list <N> 可看更多"
+        return f"找不到序号 {ref}；请先 /files list 查看列表"
+
+    def _render_files_table(self, page: dict) -> str:
+        """把一页文件列表渲染成 Markdown 表格（带序号，便于按序号删除）。"""
+        items = page["items"]
+        if not items:
+            return "**已上传图片文件（Files API）**\n\n（空）"
+        total_bytes = sum(int(f.get("bytes", 0) or 0) for f in items)
+        head = (
+            f"**已上传图片文件（Files API）**\n\n"
+            f"共 {len(items)} 个（最新在前）· 合计 {self._fmt_mib(total_bytes)}"
+            f" · 配额 {FILES_MAX_COUNT} 个 / {FILES_MAX_BYTES // 1024 // 1024 // 1024} GiB"
+        )
+        if page.get("has_more"):
+            head += f" · 还有更早的文件未列出（`/files list <N>`，单页上限 {FILES_LIST_PAGE_MAX}）"
+        lines = [
+            head,
+            "",
+            "| # | ID | 文件名 | 大小 | 创建时间 | 过期 |",
+            "|---|---|---|---|---|---|",
+        ]
+        for i, f in enumerate(items, start=1):
+            expires = self._fmt_ts(f.get("expires_at")) if f.get("expires_at") else "永久"
+            # 文件名来自 API：转义 `|` 并截断，避免超长名字（有些工具用 ID 当文件名）
+            # 把 Markdown 表格撑到换行；完整名字用 `/files info <序号>` 查看
+            name = str(f.get("name", "")).replace("|", "\\|")
+            if len(name) > 36:
+                name = name[:35] + "…"
+            lines.append(
+                f"| {i} | `{f.get('id', '')}` | {name} "
+                f"| {self._fmt_mib(f.get('bytes', 0))} | {self._fmt_ts(f.get('created_at'))} "
+                f"| {expires} |"
+            )
+        lines.append(
+            "\n查询: `/files info <ID|序号>` · 删除: `/files delete <ID|序号>`"
+            " · 清理未引用: `/files clean`"
+        )
+        return "\n".join(lines)
+
+    async def _cmd_files_list(self, args: list) -> None:
+        """`/files list [N]`：列出最近上传的文件（默认 20 条）。"""
+        limit = FILES_LIST_PAGE
+        if args:
+            if not args[0].isdigit():
+                self.notify(usage_line("/files list"), severity="warning")
+                return
+            limit = max(1, min(int(args[0]), FILES_LIST_PAGE_MAX))
+        try:
+            page = self.ctrl.files_list(limit)
+        except FilesAPIError as e:
+            self.notify(str(e), severity="error")
+            return
+        self._files_listing = page["items"]
+        await self._chat_append(self._render_files_table(page))
+
+    async def _cmd_files_info(self, args: list) -> None:
+        """`/files info <ID|序号>`：查询单个文件（GET /files/{id}）。"""
+        if not args:
+            self.notify(usage_line("/files info"), severity="warning")
+            return
+        ref = args[0]
+        file_id = self._resolve_file_ref(ref)
+        if file_id is None:
+            self.notify(self._file_ref_error(ref), severity="warning")
+            return
+        try:
+            info = self.ctrl.files_retrieve(file_id)
+        except FilesAPIError as e:
+            self.notify(str(e), severity="error")
+            return
+        expires = self._fmt_ts(info["expires_at"]) if info.get("expires_at") else "永久有效"
+        await self._chat_append(
+            "**文件信息（Files API）**\n\n"
+            f"- **ID**: `{info['id']}`\n"
+            f"- **文件名**: {info['name'] or '（无）'}\n"
+            f"- **大小**: {self._fmt_mib(info['bytes'])}\n"
+            f"- **创建时间**: {self._fmt_ts(info['created_at'])}\n"
+            f"- **过期**: {expires}"
+        )
+
+    async def _cmd_files_delete(self, args: list) -> None:
+        """`/files delete <ID|序号>`：删除文件，并同步清掉对话树里的失效引用。"""
+        if not args:
+            self.notify(usage_line("/files delete"), severity="warning")
+            return
+        ref = args[0]
+        file_id = self._resolve_file_ref(ref)
+        if file_id is None:
+            self.notify(self._file_ref_error(ref), severity="warning")
+            return
+        name = next(
+            (f.get("name", "") for f in self._files_listing if f.get("id") == file_id),
+            "",
+        )
+        try:
+            self.ctrl.files_delete(file_id)
+        except FilesAPIError as e:
+            self.notify(str(e), severity="error")
+            return
+        self._files_listing = [f for f in self._files_listing if f.get("id") != file_id]
+        self.notify(f"已删除文件 {file_id}" + (f"（{name}）" if name else ""))
+
+    def _on_files_clean_confirmed(self, ids: list, ok: bool) -> None:
+        """确认后逐个删除未被引用的远端文件（失败只提示，不中断其余删除）。"""
+        if not ok or not ids:
+            if not ok:
+                self.notify("已取消清理")
+            return
+        done, failed = 0, []
+        for fid in ids:
+            try:
+                self.ctrl.files_delete(fid)
+                done += 1
+            except FilesAPIError as e:
+                failed.append(f"{fid}: {e}")
+        self._files_listing = [f for f in self._files_listing if f.get("id") not in set(ids)]
+        self.notify(f"已清理 {done} 个未被引用的远端文件" + (f"，{len(failed)} 个失败" if failed else ""))
+        for msg in failed[:2]:
+            self.notify(msg, severity="warning")
+
+    async def _cmd_files_clean(self) -> None:
+        """`/files clean`：列出所有对话树都没引用的远端文件，确认后删除。"""
+        try:
+            res = self.ctrl.files_clean()
+        except FilesAPIError as e:
+            self.notify(str(e), severity="error")
+            return
+        if not res["total"]:
+            self.notify("Files API 上没有任何文件")
+            return
+        if not res["unused"]:
+            self.notify(f"没有可清理的文件（共 {res['total']} 个，全部仍被对话树引用）")
+            return
+        unused = res["unused"]
+        preview = "\n".join(
+            f"{f.get('name', '') or f.get('id', '')}（{self._fmt_mib(f.get('bytes', 0))}）"
+            for f in unused[:10]
+        )
+        if len(unused) > 10:
+            preview += f"\n…共 {len(unused)} 个"
+        self._ask_confirm(
+            f"清理 {len(unused)} 个未被引用的远端文件？",
+            f"{preview}\n\n"
+            f"这些文件不再被任何对话树引用（共 {res['total']} 个，"
+            f"仍被引用 {res['used']} 个）。删除后无法恢复；"
+            "若同一个 API Key 也被其它工具用来上传文件，那些文件同样会被删掉。",
+            lambda ok, ids=[f["id"] for f in unused]: self._on_files_clean_confirmed(ids, ok),
+        )
+
+    async def _cmd_files(self, cmd: str) -> None:
+        """`/files` 命令族：list / info / delete / clean。"""
+        parts = cmd.split()
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        args = parts[2:]
+        if sub in ("list", "ls"):
+            await self._cmd_files_list(args)
+        elif sub == "info":
+            await self._cmd_files_info(args)
+        elif sub in ("delete", "rm", "del"):
+            await self._cmd_files_delete(args)
+        elif sub == "clean":
+            await self._cmd_files_clean()
+        else:
+            self.notify(usage_line("/files"), severity="warning")
 
     async def _cmd_tree(self, cmd: str) -> bool:
         parts = cmd.split()

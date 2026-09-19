@@ -145,9 +145,12 @@ def info() -> None:
     pricing = load_pricing()
     print(
         f"  定价配置: {pricing['path'] or '内置默认'}"
-        f"（可编辑 {PRICING_PATH} 覆盖价格/峰谷/图片 token）"
+        f"（可编辑 {PRICING_PATH} 覆盖价格/峰谷）"
     )
-    print(f"  图片 token 估算: {image_tokens_per_image(pricing)} / 张")
+    print(
+        "  图片 token 估算: 按官方预处理公式换算（patch 14/下采样 3/"
+        f"上限 {image_tokens_per_image(pricing)}），尺寸未知时用上限"
+    )
     print(f"  系统提示词: {SYSTEM_PROMPT_SOURCE or '内置兜底'}（{len(DEFAULT_SYSTEM_PROMPT)} 字符）")
     print("  模式: 树状对话 (Textual TUI)")
     print("  多模型: `mincli register <模型名> <URL>` 注册 / `mincli models` 查看")

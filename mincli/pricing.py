@@ -12,7 +12,7 @@ DeepSeek 价格会频繁调整，因此内置价格只是默认值，全部可�
         "deepseek-flash": {"hit": [0.02, 0.04], "miss": [1.0, 2.0], "output": [4.0, 8.0]},
         "deepseek-v4-pro": {"miss": 4.5, "output": 13.5}   # 单数字 = 不分峰谷
       },
-      "image_tokens": 1024               # 每张图片固定估算 token（可调整）
+      "image_tokens": 1024               # 尺寸未知图片的估算兜底（默认=官方单图上限）
     }
 
 单位为「元 / 百万 tokens」；价格字段支持 ``[空闲价, 高峰价]`` 或单个数字。
@@ -204,5 +204,5 @@ def estimate_input_price(
 
 
 def image_tokens_per_image(pricing: Optional[dict] = None) -> int:
-    """每张图片用于估算的固定 token 数（默认 1024，可在 pricing.json 调整）。"""
+    """尺寸未知时的图片估算兜底值（默认 1024=官方单图上限，可在 pricing.json 调整）。"""
     return int((pricing or load_pricing())["image_tokens"])

@@ -24,6 +24,7 @@ from mincli.tools.images import (
     make_url_attachment,
     read_dimensions,
     sniff_format,
+    total_tokens_est,
 )
 
 PASS = 0
@@ -120,11 +121,43 @@ def test_encode():
 
 
 def test_estimate():
-    print("== token 估算（固定值/图，可在 pricing.json 调整） ==")
-    check("默认固定值 1024", estimate_image_tokens(100, 100) == 1024)
-    check("与尺寸无关（超大图同值）", estimate_image_tokens(5000, 4000) == 1024)
-    check("low 档同为固定值", estimate_image_tokens(1600, 1200, "low") == 1024)
-    check("无尺寸同为固定值", estimate_image_tokens(None, None) == 1024)
+    print("== token 估算（官方预处理公式：patch 14 / 下采样 3 / 小图放大到 544²） ==")
+    # 官方文档锚点：总像素小于约 544×544 会被放大 → 小图不低于 184 token
+    check("极小图放大到 544² → 184", estimate_image_tokens(100, 100) == 184)
+    check("544×544 → 184", estimate_image_tokens(544, 544) == 184)
+    # 官方文档锚点：2000×2000 与 5000×5000 缩放后 token 数相同（上限 1024 以内）
+    check("超大图触顶且与尺寸无关",
+          estimate_image_tokens(2000, 2000) == estimate_image_tokens(5000, 5000) == 994)
+    check("单图不超过官方上限 1024", estimate_image_tokens(5000, 4000) <= 1024)
+    check("中等尺寸按网格换算", estimate_image_tokens(800, 600) == 317)
+    check("宽图按行换算", estimate_image_tokens(1920, 1080) == 968)
+    # detail=low：先缩到单边 512，再走同一套预处理
+    check("low 档更省 token", estimate_image_tokens(2000, 2000, "low") == 184)
+    check("low 档小图不变", estimate_image_tokens(1600, 1200, "low") == 194)
+    check("尺寸未知退回可配置上限 1024", estimate_image_tokens(None, None) == 1024)
+    check("尺寸非法同样退回上限", estimate_image_tokens(0, 100) == 1024)
+
+    # split_low_inline：detail=low 的本地图片优先内联（file 块不支持 detail）
+    from mincli.tools.images import split_low_inline
+    low_small = ImageAttachment(source="/tmp/a.png", detail="low", size_bytes=1024, name="a.png")
+    low_big = ImageAttachment(source="/tmp/b.png", detail="low", size_bytes=2048, name="b.png")
+    auto = ImageAttachment(source="/tmp/c.png", detail="auto", size_bytes=512, name="c.png")
+    uploaded = ImageAttachment(source="/tmp/d.png", detail="low", size_bytes=512,
+                               file_id="file-api-x", name="d.png")
+    url = ImageAttachment(source="https://e.com/i.png", detail="low", is_url=True, name="e.png")
+    huge = ImageAttachment(source="/tmp/f.png", detail="low",
+                           size_bytes=40 * 1024 * 1024, name="f.png")
+    inline, upload = split_low_inline([low_small, low_big, auto, uploaded, url, huge], 4096)
+    check("预算内 low 图内联（体积升序）", inline == [low_small, low_big])
+    check("非 low / 超内联上限走上传", upload == [auto, huge])
+    check("已有 file_id / 外链 URL 两边都不进",
+          uploaded not in inline and uploaded not in upload
+          and url not in inline and url not in upload)
+    inline2, upload2 = split_low_inline([low_small, low_big], 1024)
+    check("预算不足只收最小的", inline2 == [low_small] and upload2 == [low_big])
+    check("合计估算（未预算时按上限 1024）", total_tokens_est([low_small]) == 1024)
+    low_small.tokens_est = 184
+    check("合计估算用已算好的值", total_tokens_est([low_small, low_big]) == 184 + 1024)
 
 
 def test_attachments():
@@ -135,7 +168,8 @@ def test_attachments():
     check("路径附件保存绝对路径", os.path.isabs(att.source) and att.source == os.path.abspath(png))
     check("尺寸已解析", (att.width, att.height) == (800, 600))
     check("detail 生效", att.detail == "low")
-    check("token 估算写入（固定值）", att.tokens_est == 1024)
+    check("token 估算写入（800x600 low）", att.tokens_est == estimate_image_tokens(800, 600, "low"))
+    check("auto 档估算更大", make_path_attachment(png).tokens_est > att.tokens_est)
 
     check("不存在的文件报错", "文件不存在" in str(_exc(make_path_attachment, "/nonexistent/x.png")))
     check("不支持的格式报错", "不支持" in str(_exc(make_path_attachment, write("b.txt", b"hello"))))

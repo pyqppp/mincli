@@ -35,6 +35,7 @@ from mincli.config import (
     COMPACT_TOOL_RESULT_MAX_CHARS,
     EXEC_DEFAULT_TIMEOUT,
     VISION_DEFAULT_DETAIL,
+    VISION_LOW_INLINE_BUDGET_BYTES,
     VISION_MAX_SIDE,
     VISION_MAX_SIDE_MANY,
     VISION_MANY_IMAGES_THRESHOLD,
@@ -42,6 +43,7 @@ from mincli.config import (
     VISION_REQUEST_INLINE_TOTAL_MAX_BYTES,
     VISION_REQUEST_MAX_BYTES,
     VISION_REQUEST_TOTAL_MAX_BYTES,
+    FILES_LIST_PAGE,
     WORKFLOWS_PATH,
     WF_EXTRACT_MAX_TOKENS,
     WF_SOURCE_MAX_CHARS,
@@ -66,10 +68,18 @@ from mincli.models import ConversationNode, ConversationTree
 from mincli.streaming import stream_response
 from mincli.tools.execute import audit_command, is_safe_readonly, matches_dangerous
 from mincli.tools.file_ops import parse_file
-from mincli.tools.files import FilesAPIError, delete_file, list_files, upload_image
+from mincli.tools.files import (
+    FilesAPIError,
+    delete_file,
+    list_all_files,
+    list_files,
+    retrieve_file,
+    upload_image,
+)
 from mincli.tools.images import (
     ImageAttachment,
     collect_inline_bytes,
+    estimate_image_tokens,
     image_placeholder_text,
     is_image_path,
     looks_like_image_target,
@@ -77,6 +87,8 @@ from mincli.tools.images import (
     make_url_attachment,
     oversize_inline_attachments,
     oversize_side_attachments,
+    split_low_inline,
+    total_tokens_est,
 )
 from mincli.tools.registry import TOOLS
 from mincli.tools.web_fetch import fetch_webpage
@@ -776,11 +788,18 @@ class ChatController:
         return False
 
     def set_detail(self, detail: str) -> bool:
-        """设置图片 detail 全局默认（low/auto/high/original）。"""
-        if detail in ("low", "auto", "high", "original"):
-            self.image_detail = detail
-            return True
-        return False
+        """设置图片 detail 全局默认（low/auto/high/original）。
+
+        同时改写「待发送图片」的 detail 并重算 token 估算：用户多半是先导入图片
+        再 `/set detail low`，若只改全局默认，已入队的图片仍会按旧档发送。
+        """
+        if detail not in ("low", "auto", "high", "original"):
+            return False
+        self.image_detail = detail
+        for att in self.pending_images:
+            att.detail = detail
+            att.tokens_est = estimate_image_tokens(att.width, att.height, detail)
+        return True
 
     def set_thinking(self, on: bool) -> None:
         self.thinking_enabled = on
@@ -894,7 +913,7 @@ class ChatController:
         return n
 
     def import_summary(self) -> str:
-        """状态条中段文本：已导入文件数量 + 前 2 个文件名；无导入返回空串。"""
+        """状态条中段文本：已导入文件数量 + 前 2 个文件名 + 图片 token 估算。"""
         names = [a.name for a in self.pending_images] + [
             f["name"] for f in self.imported_files
         ]
@@ -902,12 +921,34 @@ class ChatController:
             return ""
         shown = "、".join(names[:2])
         extra = "…" if len(names) > 2 else ""
-        return f"已导入 {len(names)} 个文件：{shown}{extra} · /import clear 清除"
+        return (
+            f"已导入 {len(names)} 个文件：{shown}{extra}{self.images_tokens_hint()}"
+            " · /import clear 清除"
+        )
+
+    def images_tokens_hint(self) -> str:
+        """待发送图片的 token 估算提示（无图片返回空串）。
+
+        按官方图片预处理公式逐张估算，让用户在发送前就知道这轮图片大概多少
+        token（只算图片本身，文本与工具定义不计）。
+        """
+        if not self.pending_images:
+            return ""
+        tokens = total_tokens_est(self.pending_images)
+        if not tokens:
+            return ""
+        return f" · 图片约 {tokens} tokens"
 
     def import_file_list(self) -> List[Dict[str, str]]:
         """完整导入文件列表（图片在前、文本/网页在后），供悬停弹窗展示。"""
-        items = [{"kind": "image", "name": a.name} for a in self.pending_images]
-        items += [{"kind": f["kind"], "name": f["name"]} for f in self.imported_files]
+        items = [
+            {"kind": "image", "name": a.name, "tokens": a.tokens_est or 0}
+            for a in self.pending_images
+        ]
+        items += [
+            {"kind": f["kind"], "name": f["name"], "tokens": 0}
+            for f in self.imported_files
+        ]
         return items
 
     # ---------------- 多模态：待发送图片 ----------------
@@ -1511,12 +1552,7 @@ class ChatController:
             self.imported_content = None
             self.imported_files = []
 
-        # 待发送图片：先上传为 file_id（成功后历史重放/后续请求体保持极小）
-        if self.pending_images:
-            emit(ControllerEvent.status(
-                f"正在上传图片（{len(self.pending_images)} 张）…"
-            ))
-            self._upload_attachments(self.pending_images, emit)
+        # 本轮待发送图片（已在上传前从待发送区摘出，避免重复发送）
         this_turn_images = list(self.pending_images)
         self.pending_images = []
 
@@ -1525,8 +1561,9 @@ class ChatController:
         node.user_images = this_turn_images
         emit(ControllerEvent.node_created(node))
 
-        # 历史节点的本地图片若未上传过（file_id 缺失），补传一次（尽力而为）
-        self._ensure_chain_uploads(node, emit)
+        # 图片落地方式统一规划：detail=low 走内联（file 块不支持 detail），其余
+        # 上传为 Files API file_id（含历史节点缺 file_id 的补传）
+        self._prepare_attachments(node, emit)
 
         # MCP 后台连接的收口：首次发送时若还没连完，这里等它（状态提示已发出），
         # 保证本轮请求带上完整工具列表——工具中途就绪会导致前后两轮工具集不一致。
@@ -1546,13 +1583,20 @@ class ChatController:
                 emit(ControllerEvent.error(limit_err))
                 return self._finalize_interrupted(node, limit_err, emit)
 
-        # 请求体大小预检（仅内联 base64 回退路径会产生大请求体）
+        # 请求体大小预检（内联 base64 才是大请求体来源：detail=low 内联或上传回退）
         inline_bytes = collect_inline_bytes(messages)
         if inline_bytes > VISION_REQUEST_MAX_BYTES:
+            low_inlined = any(
+                att.detail == "low" and not att.file_id and not att.is_url
+                for att in self._attachments_for_node(node)
+            )
+            hint = (
+                "输入 /set detail auto 改用 Files API 上传（file_id）可绕开请求体限制，"
+                if low_inlined else "请减少图片数量或压缩后重试"
+            )
             size_err = (
                 f"图片 base64 总量超限（约 {inline_bytes // 1024 // 1024} MiB "
-                f"> {VISION_REQUEST_MAX_BYTES // 1024 // 1024} MiB），"
-                "请减少图片数量或压缩后重试"
+                f"> {VISION_REQUEST_MAX_BYTES // 1024 // 1024} MiB），{hint}"
             )
             emit(ControllerEvent.error(size_err))
             return self._finalize_interrupted(node, size_err, emit)
@@ -1784,44 +1828,55 @@ class ChatController:
 
     # ---------------- 多模态：图片上传与模型守卫 ----------------
 
-    def _upload_attachments(
-        self, attachments: List[ImageAttachment], emit: EventSink
-    ) -> None:
-        """尽力上传 path 附件为 Files API file_id；失败保留 file_id=None。
+    def _prepare_attachments(self, node: ConversationNode, emit: EventSink) -> None:
+        """决定本轮链上每张本地图片的落地方式，并完成上传。
 
-        发送时对无 file_id 的 path 附件回退 base64 内联（见 images.build_image_block）。
+        - ``detail=low``：只有内联 ``image_url`` 才支持 detail（``file`` 块没有该
+          字段，官方明确通过 file_id 传图时 detail 被忽略），因此在请求级预算内
+          优先 base64 内联，让「省 token」真正生效；
+        - 其余情况（detail 非 low、超过内联单图上限、预算不够）：上传 Files API，
+          换 file_id 以便跨轮复用、请求体极小；
+        - 历史节点里还没上传过的图片一并补传（尽力而为，静默失败）。
+
+        上传会改变消息序列化结果（base64 → file 块），因此只要有任何变化就失效
+        链上节点缓存——子节点缓存包含父节点消息。
         """
-        for i, att in enumerate(attachments, start=1):
-            if att.file_id or att.is_url:
-                continue
+        chain = self._path_to_root(node)
+        images = [att for n in chain for att in n.user_images]
+        inline, to_upload = split_low_inline(images, VISION_LOW_INLINE_BUDGET_BYTES)
+        uploadable = [
+            att for att in to_upload
+            if os.path.exists(os.path.expanduser(att.source))
+        ]
+        missing = len(to_upload) - len(uploadable)
+        if inline:
             emit(ControllerEvent.status(
-                f"正在上传图片 {i}/{len(attachments)}：{att.name}…"
+                f"detail=low：{len(inline)} 张图片以内联 base64 发送（省 token）"
+            ))
+        if uploadable:
+            emit(ControllerEvent.status(f"正在上传图片（{len(uploadable)} 张）…"))
+        changed = False
+        for i, att in enumerate(uploadable, start=1):
+            emit(ControllerEvent.status(
+                f"正在上传图片 {i}/{len(uploadable)}：{att.name}…"
             ))
             try:
                 att.file_id = upload_image(self.client, att.source)
+                changed = True
             except FilesAPIError as e:
-                emit(ControllerEvent.status(f"⚠️ {e}（将以内联 base64 发送）"))
-
-    def _ensure_chain_uploads(self, node: ConversationNode, emit: EventSink) -> None:
-        """历史节点的本地图片若缺 file_id 则补传（尽力而为，静默失败）。
-
-        上传成功会使该节点消息序列化改变（base64 → file 块），因此失效其
-        cached_messages 以便下次构建时使用 file_id。
-        """
-        for n in self._path_to_root(node):
-            changed = False
-            for att in n.user_images:
-                if (
-                    att.file_id is None
-                    and not att.is_url
-                    and os.path.exists(os.path.expanduser(att.source))
-                ):
-                    try:
-                        att.file_id = upload_image(self.client, att.source)
-                        changed = True
-                    except FilesAPIError:
-                        pass
-            if changed:
+                emit(ControllerEvent.status(f"[WARN] {e}（将以内联 base64 发送）"))
+        if missing:
+            emit(ControllerEvent.status(
+                f"[WARN] {missing} 张历史图片的本地文件已不存在，未上传"
+            ))
+        low_uploaded = [att for att in uploadable if att.detail == "low"]
+        if low_uploaded:
+            emit(ControllerEvent.status(
+                f"detail=low 的 {len(low_uploaded)} 张图片超出内联预算"
+                "（或单图超 32MiB），已改用 file_id 上传，其 detail 将被忽略"
+            ))
+        if changed:
+            for n in chain:
                 n.cached_messages = None
 
     def _invalidate_file_ids_in_chain(self, node: ConversationNode) -> None:
@@ -1996,9 +2051,54 @@ class ChatController:
 
     # ---------------- 多模态：Files API 文件管理 ----------------
 
-    def files_list(self) -> List[Dict]:
-        """列出已上传的图片文件（/files list）。"""
-        return list_files(self.client)
+    def files_list(self, limit: int = FILES_LIST_PAGE) -> Dict:
+        """列出最近上传的图片文件（/files list）。默认最新在前。"""
+        return list_files(self.client, limit=limit, order="desc")
+
+    def files_all(self) -> List[Dict]:
+        """翻页取回全部已上传文件（/files clean 需要全量清单）。"""
+        return list_all_files(self.client)
+
+    def files_retrieve(self, file_id: str) -> Dict:
+        """查询单个已上传文件的信息（/files info）。"""
+        return retrieve_file(self.client, file_id)
+
+    def files_referenced_ids(self) -> set:
+        """所有对话树（含未保存的内存改动）里引用到的 file_id 集合。"""
+        self.save_tree()  # 当前树的未保存改动也要算进去
+        ids: set = set()
+        for number in self._store.numbers():
+            st = self._states.get(number)
+            tree = st.tree if st is not None else None
+            if tree is None:
+                data = self._store.load_tree(number) or {}
+                tree_data = data.get("tree")
+                tree = (
+                    ConversationTree.from_dict(tree_data)
+                    if isinstance(tree_data, dict) else None
+                )
+            if tree is None:
+                continue
+            for n in tree.nodes.values():
+                for att in n.user_images:
+                    if att.file_id:
+                        ids.add(att.file_id)
+        return ids
+
+    def files_clean(self) -> Dict:
+        """找出「没有任何对话树引用」的远端文件（不删除）。
+
+        返回 ``{"unused": [...], "used": int, "total": int}``；远端文件数超过官方
+        配额时上传会失败，因此需要这个入口定期回收（官方配额：10000 个 / 25GiB）。
+        """
+        remote = self.files_all()
+        referenced = self.files_referenced_ids()
+        unused = [f for f in remote if f.get("id") not in referenced]
+        return {
+            "unused": unused,
+            "used": len(remote) - len(unused),
+            "total": len(remote),
+        }
 
     def files_delete(self, file_id: str) -> bool:
         """删除一个已上传的图片文件（/files delete），并同步清除对话树中的失效引用。"""

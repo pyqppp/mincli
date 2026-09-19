@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mincli.controller import ChatController, ControllerEvent
+from mincli.tools.images import estimate_image_tokens
 
 PASS = 0
 FAIL = 0
@@ -87,13 +88,14 @@ class FakeCompletions:
 
 
 class FakeFiles:
-    """Files API 模拟：可脚本化上传成功/失败。"""
+    """Files API 模拟：可脚本化上传成功/失败（list 支持 order/limit/after）。"""
 
     def __init__(self, script=None, fail=False):
         self.script = list(script or [])
         self.calls = []
         self.fail = fail
         self.created = []
+        self.list_calls = []
 
     def create(self, file, purpose="user_data"):
         self.calls.append(("create", file.name, purpose))
@@ -103,16 +105,31 @@ class FakeFiles:
         self.created.append({"id": fid, "name": os.path.basename(file.name)})
         return SimpleNamespace(id=fid)
 
-    def list(self):
-        return SimpleNamespace(data=[
+    def list(self, limit=1000, order="asc", after=None):
+        self.list_calls.append({"limit": limit, "order": order, "after": after})
+        items = [
             SimpleNamespace(
                 id=c["id"], filename=c["name"], bytes=100, created_at=1, expires_at=None
             )
             for c in self.created
-        ])
+        ]
+        if order == "desc":
+            items = list(reversed(items))
+        return SimpleNamespace(data=items[:limit], has_more=len(items) > limit)
+
+    def retrieve(self, file_id):
+        self.calls.append(("retrieve", file_id))
+        for c in self.created:
+            if c["id"] == file_id:
+                return SimpleNamespace(
+                    id=c["id"], filename=c["name"], bytes=100,
+                    created_at=1, expires_at=None,
+                )
+        raise RuntimeError("not found")
 
     def delete(self, file_id):
         self.calls.append(("delete", file_id))
+        self.created = [c for c in self.created if c["id"] != file_id]
         return SimpleNamespace(deleted=True)
 
 
@@ -714,7 +731,12 @@ def test_multimodal():
     n6b = c6.send_message("看图", lambda e: None)
     check("上传取脚本 id", n6b.user_images[0].file_id == "file-api-abc")
     files = c6.files_list()
-    check("files_list 返回文件", len(files) == 1 and files[0]["id"] == "file-api-abc")
+    check("files_list 返回文件", len(files["items"]) == 1
+          and files["items"][0]["id"] == "file-api-abc")
+    check("files_list 默认倒序（最新在前）",
+          c6.client.files.list_calls[-1]["order"] == "desc")
+    check("files_retrieve 取回信息",
+          c6.files_retrieve("file-api-abc")["name"] == "m.png")
     check("files_delete 调用删除", c6.files_delete("file-api-abc"))
     check("删除 API 已调用", c6.client.files.calls[-1] == ("delete", "file-api-abc"))
     check("删除子节点清理关联文件", c6.delete_node(n6b.id))
@@ -756,6 +778,80 @@ def test_multimodal():
     check("旧名 deepseek-v4-flash 改写为 flash",
           c9.set_model("deepseek-v4-flash") and c9.current_model == "deepseek-flash")
     check("set_model pro", c9.set_model("pro") and c9.current_model == "deepseek-v4-pro")
+
+    # 10) detail=low → 内联发送（file 块没有 detail 字段，只有内联才真正生效）
+    TestController.reset_store()
+    script10 = [
+        [FakeChunk(content="ok", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
+        FakeChatResponse(content="标题10"),
+    ]
+    c10 = TestController(FakeClient(script10), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c10.add_pending_images([png])
+    hint = c10.images_tokens_hint()
+    check("导入后有 token 估算提示", "图片约" in hint and "tokens" in hint)
+    check("状态栏含 token 估算", "图片约" in c10.import_summary())
+    check("set_detail 改写待发送图片的 detail", c10.set_detail("low"))
+    check("待发送图片 detail 已改写", c10.pending_images[0].detail == "low")
+    check("待发送图片重算 token", c10.pending_images[0].tokens_est
+          == estimate_image_tokens(800, 600, "low"))
+    events10 = []
+    n10 = c10.send_message("看图", events10.append)
+    check("low 档不上传 Files API", n10.user_images[0].file_id is None
+          and not c10.client.files.calls)
+    blocks10 = c10.client.chat.completions.calls[0]["messages"][-1]["content"]
+    check("low 档走内联并带 detail=low", any(
+        b.get("type") == "image_url" and b.get("image_url", {}).get("detail") == "low"
+        for b in blocks10))
+    check("low 档发出内联提示", any(
+        e.kind == "status" and "内联" in e.message for e in events10))
+    check("low 档估算低于 auto 档",
+          estimate_image_tokens(800, 600, "low") < estimate_image_tokens(800, 600))
+
+    # 11) detail=low 但超过内联单图上限（32MiB）→ 退回上传，detail 被忽略
+    TestController.reset_store()
+    big = _make_png(os.path.join(_TMP, "big_low.png"))
+    with open(big, "ab") as f:
+        f.truncate(33 * 1024 * 1024)
+    script11 = [
+        [FakeChunk(content="ok", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
+        FakeChatResponse(content="标题11"),
+    ]
+    c11 = TestController(FakeClient(script11, files_script=["file-api-big"]),
+                         default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c11.add_pending_images([big])
+    c11.set_detail("low")
+    events11 = []
+    n11 = c11.send_message("大图", events11.append)
+    check("超内联上限的 low 图仍上传", n11.user_images[0].file_id == "file-api-big")
+    check("提示 detail 将被忽略", any(
+        e.kind == "status" and "detail 将被忽略" in e.message for e in events11))
+
+    # 12) files_clean：跨对话树统计引用，只清理没人引用的远端文件
+    TestController.reset_store()
+    script12 = [
+        [FakeChunk(content="a", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="题A"),
+        [FakeChunk(content="b", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
+        FakeChatResponse(content="题B"),
+    ]
+    c12 = TestController(FakeClient(script12), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c12.add_pending_images([png])
+    n12 = c12.send_message("树1看图", lambda e: None)
+    ref1 = n12.user_images[0].file_id
+    second = c12.create_tree(activate=True)  # 另一棵树里也传一张
+    c12.add_pending_images([png])
+    n12b = c12.send_message("树2看图", lambda e: None)
+    ref2 = n12b.user_images[0].file_id
+    c12.client.files.created.append({"id": "file-api-orphan", "name": "orphan.png"})
+    res12 = c12.files_clean()
+    check("clean 只报未引用文件", [f["id"] for f in res12["unused"]] == ["file-api-orphan"])
+    check("clean 统计（含非当前树）",
+          res12["total"] == 3 and res12["used"] == 2
+          and ref1 in c12.files_referenced_ids() and ref2 in c12.files_referenced_ids())
+    check("切树后引用仍算数", c12.switch_tree(1))
+    check("切回树 1 后引用集合不变",
+          {"file-api-orphan"} == {f["id"] for f in c12.files_clean()["unused"]})
+    TestController.reset_store()
 
 
 def test_usage_stats():
@@ -972,7 +1068,7 @@ def test_pricing_config():
         check("定价：无配置用内置默认",
               pricing.model_pricing("deepseek-flash")["miss"] == (1.0, 2.0)
               and pricing.model_pricing("deepseek-flash")["output"] == (4.0, 8.0))
-        check("定价：默认图片固定值 1024", pricing.image_tokens_per_image() == 1024)
+        check("定价：尺寸未知时默认兜底 1024", pricing.image_tokens_per_image() == 1024)
         check("峰谷：默认周一 10 点高峰",
               pricing.is_peak_hour(datetime.datetime(2026, 9, 14, 10, 0)))
         check("峰谷：默认周一 13 点空闲",
