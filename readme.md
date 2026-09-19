@@ -286,6 +286,18 @@ Configure `~/.mincli/mcp_servers.json` (Claude Desktop-compatible; override path
 
 Tools from third-party servers are merged into the AI tool list on startup; on name collision, mincli's own tools win.
 
+### Startup speed and background MCP connection
+
+Connecting to MCP (handshake with the bundled server subprocess, plus remote connects and tool listings for every third-party server) takes 1-3 seconds, so mincli keeps it **off the first-paint path**:
+
+- The TUI renders its first frame immediately (then loads the current session node's content) while MCP connects concurrently on a background thread. The interface usually appears in about one second.
+- While connecting, the status bar under the input shows "MCP 连接中…" and `/mcp list` reports "连接中…" for the pending servers.
+- If you send a message before connecting finishes, that turn first shows "正在连接 MCP 服务…" and waits for readiness, so every request carries one complete, consistent tool list.
+- Connection results (servers ready, tool count, failures) arrive as TUI notifications instead of being printed to stdout.
+- Plain-text mode (`--no-tui`) still waits for MCP at startup so logs do not interleave with the `input()` prompt.
+
+Other startup costs were trimmed too: `trafilatura` (web fetch, ~0.2s) and the MCP SDK are now imported only on first use.
+
 **Two kinds of third-party servers are supported:**
 - **Local command (stdio)**: `command` + `args` + optional `env`, like the filesystem example above
 - **Remote HTTP (streamable-http)**: just set `url`, e.g.:

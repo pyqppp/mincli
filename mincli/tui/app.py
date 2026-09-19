@@ -472,8 +472,11 @@ class ChatApp(App):
                 default_system=DEFAULT_SYSTEM_PROMPT,
                 default_temperature=1.0,
                 default_model=MODEL_FLASH,
+                # MCP 由 _start_mcp 在首屏之后后台启动（日志出口也得先接好）
+                auto_start_mcp=False,
             )
         self.ctrl.confirm = self._confirm
+        self._start_mcp()
         self.query_one("#tree", Tree).auto_expand = False  # 点击节点名只切换节点，不收起/展开
         # 状态条中段导入提示 + 其上方的悬停弹窗（缓存引用，on_mouse_move 高频使用）
         self._import_center_w = self.query_one("#usage-center", Static)
@@ -485,8 +488,19 @@ class ChatApp(App):
         self._start_balance_refresh()
         self._refresh_usage_bar()
         self._refresh_import_status()
-        # 启动即进入上次会话的当前节点：直接显示该节点内容（无节点时才显示欢迎页）
-        node = self.ctrl.tree.current_node if (self.ctrl and self.ctrl.tree) else None
+        # 启动即进入上次会话的当前节点：渲染放在首帧之后（恢复长对话的
+        # Markdown 要 0.5s 左右，没必要挡在界面出现之前），界面先出来，
+        # 内容紧接着补上——见 _restore_current_view。
+        self.call_after_refresh(self._restore_current_view)
+
+    async def _restore_current_view(self) -> None:
+        """首帧渲染完成后显示当前节点内容（无节点时显示欢迎页）。"""
+        if self.ctrl is None or self.ctrl.tree is None:
+            return
+        # 首帧到这里的间隙里用户已经发了消息：别用旧节点内容盖掉当前视图
+        if self._turn_active or self._stream_active:
+            return
+        node = self.ctrl.tree.current_node
         if node is not None:
             await self._switch_to(node.id)
         else:
@@ -498,6 +512,55 @@ class ChatApp(App):
         if self.ctrl is not None:
             self.ctrl.save_session()
             self.ctrl.close()
+
+    # ---------------- MCP 后台连接 ----------------
+
+    def _start_mcp(self) -> None:
+        """接上 MCP 日志出口并确保后台连接已启动。
+
+        MCP 连接不再挡在首屏前面（原本要等 4 秒左右），改为后台进行：界面先
+        出来，连接完成后再补上 MCP 工具；期间发送消息会短暂等待（见
+        ChatController.wait_mcp_ready）。
+        """
+        if self.ctrl is None:
+            return
+        self.ctrl.mcp_logger = self._on_mcp_log
+        if not self.ctrl.mcp_started:
+            self.ctrl.start_mcp()
+        if self.ctrl.mcp_started and self.ctrl.mcp_connecting:
+            self._watch_mcp_ready()
+
+    def _watch_mcp_ready(self) -> None:
+        """后台等待 MCP 连接结束，完成后刷新状态条（不阻塞 UI）。"""
+        self.run_worker(
+            self._wait_mcp_worker, name="mcp-ready", thread=True, exit_on_error=False
+        )
+
+    def _wait_mcp_worker(self) -> None:
+        if self.ctrl is None:
+            return
+        try:
+            self.ctrl.wait_mcp_ready()
+        finally:
+            try:
+                self.call_from_thread(self._refresh_usage_bar)
+            except Exception:
+                pass
+
+    def _on_mcp_log(self, message: str) -> None:
+        """MCP 客户端日志（后台线程）→ 主线程通知。
+
+        这些消息以前是 print 在 TUI 启动之前输出的；现在连接在后台进行，
+        直接写 stdout 会把界面冲乱，所以统一转成通知。
+        """
+        try:
+            self.call_from_thread(self._show_mcp_log, message)
+        except Exception:
+            pass
+
+    def _show_mcp_log(self, message: str) -> None:
+        self.notify(message, timeout=5)
+        self._refresh_usage_bar()
 
     # ---------------- 输入栏状态条（缓存命中率 / 余额 / 下次输入） ----------------
 
@@ -541,9 +604,10 @@ class ChatApp(App):
             bal_txt = "…"
         else:
             bal_txt = f"¥{self._balance_txt}"
-        self.query_one("#usage-left", Static).update(
-            f"缓存命中 {rate_txt}   余额 {bal_txt}"
-        )
+        left = f"缓存命中 {rate_txt}   余额 {bal_txt}"
+        if self.ctrl.mcp_connecting:
+            left += "   MCP 连接中…"
+        self.query_one("#usage-left", Static).update(left)
         tokens = stats["next_input_tokens"]
         price = stats["estimated_price"]
         price_txt = f"≈ ¥{price:.4f}" if price is not None else "--"
@@ -1511,12 +1575,15 @@ class ChatApp(App):
                 lambda ok: self._on_mcp_remove_confirmed(name, ok),
             )
         elif sub == "reload":
-            self.notify("正在重新加载 MCP servers…")
             try:
                 self.ctrl.mcp_reload()
-                self.notify("✅ MCP 已重新加载")
             except Exception as e:
                 self.notify(f"MCP 重载失败: {e}", severity="error")
+                return
+            # 重连在后台进行：完成后 MCP 客户端会通过日志出口报「MCP 就绪」
+            self.notify("正在重新连接 MCP servers…")
+            self._refresh_usage_bar()
+            self._watch_mcp_ready()
         else:
             self.notify(
                 "用法: /mcp list | add <名称> <命令|URL> [参数...] [--header 'K: V'] | remove <名称> | reload",
@@ -1543,6 +1610,7 @@ class ChatApp(App):
             lines.append("\nMCP 客户端未就绪")
         else:
             lines += ["", "| 名称 | 命令 | 工具数 | 状态 |", "|---|---|---|---|"]
+            connecting = self.ctrl.mcp_connecting
             for name in sorted(status):
                 st = status[name]
                 if name == "mincli":
@@ -1552,7 +1620,12 @@ class ChatApp(App):
                     cmd = cfg.get("url") or cfg.get("command", "")
                     if cfg.get("headers"):
                         cmd += f"（带 {len(cfg['headers'])} 个请求头）"
-                state = "✅ 已连接" if st["connected"] else "⚠ 未连接"
+                if st["connected"]:
+                    state = "已连接"
+                elif connecting:
+                    state = "连接中…"
+                else:
+                    state = "未连接"
                 lines.append(f"| {name} | {cmd} | {st['tools']} | {state} |")
         if not servers:
             lines.append("\n（未配置第三方 server，可用 /mcp add 添加）")

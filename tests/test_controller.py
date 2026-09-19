@@ -1195,6 +1195,180 @@ def test_exec_cancel():
         check("命令打断：注册表已清理", not exec_mod._RUNNING_PROCS)
 
 
+def test_mcp_parallel_connect():
+    """MCP 连接并发：总耗时接近最慢的一个，而不是各 server 相加。"""
+    print("== MCP 并发连接 ==")
+    import asyncio
+    import time
+
+    import mincli.mcp_client as mc
+    from mincli.mcp_client import McpToolClient
+
+    class _Result:
+        tools = []
+
+    class _FakeSdkClient:
+        async def list_tools(self):
+            return _Result()
+
+    client = McpToolClient()
+    delay = 0.4
+
+    async def fake_connect(name, kind, target, headers=None):
+        await asyncio.sleep(delay)
+        client._clients[name] = _FakeSdkClient()
+
+    client._connect_one = fake_connect
+    orig_servers = mc.load_mcp_servers
+    mc.load_mcp_servers = lambda: {
+        "s1": {"url": "http://127.0.0.1:1/mcp"},
+        "s2": {"url": "http://127.0.0.1:2/mcp"},
+        "s3": {"url": "http://127.0.0.1:3/mcp"},
+    }
+    try:
+        t0 = time.perf_counter()
+        client._loop = asyncio.new_event_loop()
+        client._loop.run_until_complete(client._connect_all())
+        elapsed = time.perf_counter() - t0
+        client._loop.close()
+    finally:
+        mc.load_mcp_servers = orig_servers
+
+    # 串行需要 4 × 0.4s = 1.6s；并发应接近 0.4s（阈值放宽以抗负载抖动）
+    check("并发连接：4 个 server 不再串行累加", elapsed < delay * 2)
+    check("并发连接：客户端全部登记", len(client._clients) == 4)
+    check("并发连接：整体就绪标志为 True", client.ok is True)
+
+
+def test_mcp_background_start():
+    """MCP 后台连接：start 立即返回，wait_ready 才阻塞等结果。"""
+    print("== MCP 后台连接（不阻塞首屏） ==")
+    import time
+
+    from mincli.mcp_client import McpToolClient
+
+    client = McpToolClient()
+
+    async def slow_connect():
+        import asyncio
+
+        await asyncio.sleep(1.0)
+        client.ok = True
+
+    client._connect_all = slow_connect
+    t0 = time.perf_counter()
+    client.start()
+    elapsed = time.perf_counter() - t0
+    check("后台连接：start 立即返回（不等连接完成）", elapsed < 0.5)
+    check("后台连接：连接中状态可查询", client.connecting and not client.ready)
+
+    t1 = time.perf_counter()
+    ok = client.wait_ready()
+    waited = time.perf_counter() - t1
+    check("后台连接：wait_ready 等到了结果", ok is True)
+    check("后台连接：wait_ready 确实等待了", waited >= 0.5)
+    check("后台连接：完成后状态翻转", client.ready and not client.connecting)
+
+    t2 = time.perf_counter()
+    client.close()
+    check("后台连接：关闭不卡住", time.perf_counter() - t2 < 5)
+
+
+def test_mcp_close_while_connecting():
+    """连接仍在后台进行时退出：close 必须及时返回，不能等连接超时。"""
+    print("== MCP 连接中退出 ==")
+    import time
+
+    from mincli.mcp_client import McpToolClient
+
+    client = McpToolClient()
+
+    async def very_slow():
+        import asyncio
+
+        await asyncio.sleep(30)
+
+    client._connect_all = very_slow
+    client.start()
+    check("连接中退出：仍处于连接状态", client.connecting)
+    t0 = time.perf_counter()
+    client.close()
+    elapsed = time.perf_counter() - t0
+    check("连接中退出：close 及时返回", elapsed < 8)
+    check("连接中退出：事件循环已释放", client._loop is None)
+
+
+def test_mcp_nonblocking_controller():
+    """控制器：启动不等待 MCP，首次等待时才同步工具列表。"""
+    print("== 控制器 MCP 懒就绪 ==")
+
+    import mincli.controller as controller_mod
+
+    class FakeMcp:
+        def __init__(self, log=None, external_config_path=None):
+            self.ok = False
+            self.connecting = True
+            self.waited = False
+
+        def start(self):
+            pass
+
+        def wait_ready(self, timeout=None):
+            self.waited = True
+            self.connecting = False
+            self.ok = True
+            return True
+
+        def tools(self):
+            # 真实客户端要等 list_tools 回来才有工具定义
+            if self.connecting:
+                return []
+            return [{
+                "type": "function",
+                "function": {"name": "read_file", "description": "", "parameters": {}},
+            }]
+
+        def tool_names(self):
+            return set() if self.connecting else {"read_file"}
+
+        def cancel_running(self):
+            return True
+
+        def server_status(self):
+            return {"mincli": {"connected": True, "tools": 1}}
+
+        def reload(self):
+            pass
+
+        def close(self):
+            pass
+
+    orig = controller_mod.McpToolClient
+    controller_mod.McpToolClient = FakeMcp
+    try:
+        ctrl = TestController(
+            FakeClient([]), default_system="sys", default_temperature=1.0
+        )
+        check("懒就绪：构造期不等待 MCP", ctrl.mcp_connecting is True)
+        names = [t["function"]["name"] for t in ctrl.llm_tools]
+        check("懒就绪：工具同步前不带 MCP 工具", "read_file" not in names)
+
+        events = []
+        ok = ctrl.wait_mcp_ready(emit=events.append)
+        check("懒就绪：等待返回连接结果", ok is True)
+        names = [t["function"]["name"] for t in ctrl.llm_tools]
+        check("懒就绪：等待后工具列表补齐", "read_file" in names)
+        check("懒就绪：等待期间发出状态提示",
+              any(e.kind == "status" for e in events))
+        check("懒就绪：连上后状态可查询", ctrl.mcp_connected is True)
+
+        events.clear()
+        ctrl.wait_mcp_ready(emit=events.append)
+        check("懒就绪：已同步后不重复提示", not events)
+    finally:
+        controller_mod.McpToolClient = orig
+
+
 def test_mcp_internal_tools():
     """MCP 内部工具：cancel_command 注册但不对模型暴露。"""
     print("== MCP 内部工具（cancel_command 不暴露给模型） ==")
@@ -1252,5 +1426,9 @@ if __name__ == "__main__":
     test_interrupt()
     test_exec_cancel()
     test_mcp_internal_tools()
+    test_mcp_parallel_connect()
+    test_mcp_background_start()
+    test_mcp_close_while_connecting()
+    test_mcp_nonblocking_controller()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

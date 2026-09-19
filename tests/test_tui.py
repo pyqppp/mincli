@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -123,6 +124,15 @@ class FakeController(ChatController):
         )
         self.saved = False
         self.closed = False
+        self.mcp_start_count = 0
+
+    def start_mcp(self):
+        """测试桩：不真的连接 MCP（会被 ChatApp 在挂载时调用）。
+
+        真实实现会起子进程 + 连远程 server，测试里既慢又要联网；这里只记录
+        调用次数，_mcp 保持未设置，App 侧也就不会派生就绪监听 worker。
+        """
+        self.mcp_start_count += 1
 
     def _wf_call_model(self, messages, max_tokens):
         user = str((messages[-1] or {}).get("content", ""))
@@ -628,6 +638,80 @@ async def test_adaptive_flush_interval():
             app._adapt_flush_interval(0.001)
         check("自适应刷新：刷新变快后回落",
               app._flush_interval == FLUSH_INTERVAL_MIN)
+
+
+async def test_mcp_background_ui():
+    """MCP 后台连接：状态条显示「连接中」，日志转通知（不往 stdout 写）。"""
+
+    class FakeMcp:
+        """最小 MCP 客户端替身：连接状态由测试显式放行（模拟慢连接）。"""
+
+        def __init__(self):
+            self.connecting = True
+            self.ok = False
+            self.release = threading.Event()
+
+        def wait_ready(self, timeout=None):
+            # 卡住「连接中」状态，等测试检查完状态条再放行
+            self.release.wait(timeout=5)
+            self.connecting = False
+            self.ok = True
+            return True
+
+        def tools(self):
+            return []
+
+        def tool_names(self):
+            return set()
+
+        def close(self):
+            pass
+
+    class McpController(FakeController):
+        def __init__(self):
+            super().__init__()
+            self._mcp = FakeMcp()
+
+        @property
+        def mcp_started(self):
+            return True  # 已启动：App 不会再调 start_mcp，避免起真实连接
+
+    ctrl = McpController()
+    app = ChatApp(controller=ctrl)
+    notified = []
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(30):
+            await pilot.pause()
+            if app.ctrl is ctrl:
+                break
+        left = str(app.query_one("#usage-left", Static).content)
+        check("MCP：连接中时状态条有提示", "MCP 连接中" in left)
+
+        app.notify = lambda message, **kwargs: notified.append(message)
+        app._show_mcp_log("连接 MCP server「demo」失败: boom，已跳过")
+        check("MCP：连接日志转成通知", bool(notified) and "boom" in notified[0])
+
+        ctrl._mcp.release.set()  # 放行后台等待，模拟连接完成
+        for _ in range(60):
+            await pilot.pause()
+            if not ctrl.mcp_connecting:
+                break
+        left = str(app.query_one("#usage-left", Static).content)
+        check("MCP：就绪后状态条提示消失", "MCP 连接中" not in left)
+
+
+async def test_first_view_deferred():
+    """首帧不等节点渲染：挂载立即返回，节点内容随后补上。"""
+    ctrl = FakeController()
+    ctrl.tree.create_root("问题", "答案", "思考", "标题", 1, 1)
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 30)) as pilot:
+        check("启动：挂载阶段首帧已出（不阻塞）", app.is_running)
+        for _ in range(40):
+            await pilot.pause()
+            if "答案" in app._chat_source():
+                break
+        check("启动：首帧之后恢复当前节点内容", "答案" in app._chat_source())
 
 
 async def main() -> int:
@@ -1206,6 +1290,8 @@ async def main() -> int:
     test_stream_segment_sealable()
     await test_stream_segment_sealing()
     await test_adaptive_flush_interval()
+    await test_mcp_background_ui()
+    await test_first_view_deferred()
 
     check("退出时保存会话", fake.saved)
     check("退出时关闭控制器", fake.closed)

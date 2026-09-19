@@ -2,10 +2,33 @@
 
 from http import HTTPStatus
 
-import trafilatura
-from trafilatura.downloads import fetch_response
-
 from mincli.config import webpage_max_length
+
+# trafilatura 的导入要 0.2s 左右（自身 + htmldate/dateparser 等），而抓网页是
+# 低频工具：改成首次真正抓取时才导入，mincli 主进程与内置 MCP server 的启动
+# 都不再为它付钱。这里保留 trafilatura / fetch_response 两个模块级名字，测试
+# 仍可像以前一样打桩（web_fetch.trafilatura.extract = ...）。
+
+
+def __getattr__(name: str):
+    """惰性暴露 trafilatura / fetch_response（PEP 562）。"""
+    if name == "trafilatura":
+        global trafilatura
+        import trafilatura  # noqa: PLC0415 - 故意延后到首次使用
+        return trafilatura
+    if name == "fetch_response":
+        global fetch_response
+        from trafilatura.downloads import fetch_response  # noqa: PLC0415
+        return fetch_response
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _ensure_deps() -> None:
+    """把两个依赖绑成模块全局，供 fetch_webpage 直接引用（也尊重测试的打桩）。"""
+    if "trafilatura" not in globals():
+        __getattr__("trafilatura")
+    if "fetch_response" not in globals():
+        __getattr__("fetch_response")
 
 
 def _status_label(status) -> str:
@@ -19,6 +42,7 @@ def _status_label(status) -> str:
 
 
 def fetch_webpage(url: str) -> str:
+    _ensure_deps()
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url

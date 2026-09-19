@@ -9,7 +9,6 @@ import sys
 from typing import Optional
 
 import typer
-from openai import OpenAI
 
 from mincli.tools.files import FilesAPIError
 
@@ -60,9 +59,15 @@ def build_controller(
     temperature: float,
     thinking: bool,
     effort: str,
+    auto_start_mcp: bool = True,
 ) -> "ChatController":
-    """按 CLI 参数构造 ChatController（支持多 Provider/多模型，惰性导入）。"""
+    """按 CLI 参数构造 ChatController（支持多 Provider/多模型，惰性导入）。
+
+    auto_start_mcp=False 时不在构造期连接 MCP：TUI 用它把「首屏」和「MCP
+    连接」解耦，界面先出来、连接在后台进行（见 ChatApp._start_mcp）。
+    """
     from mincli.controller import ChatController
+    from openai import OpenAI
 
     effective_model = resolve_model_name(model)
     base_url = get_model_base_url(provider, effective_model)
@@ -75,6 +80,7 @@ def build_controller(
         default_model=effective_model,
         thinking_enabled=thinking,
         reasoning_effort=effort,
+        auto_start_mcp=auto_start_mcp,
     )
 
 
@@ -98,7 +104,9 @@ def chat(
 
     from mincli.tui.app import ChatApp
 
-    ChatApp(controller=build_controller(provider, model, temperature, thinking, effort)).run()
+    # MCP 交给 ChatApp 在首屏之后后台连接，避免主界面等 4 秒左右才出现
+    ctrl = build_controller(provider, model, temperature, thinking, effort, auto_start_mcp=False)
+    ChatApp(controller=ctrl).run()
 
 
 @app.command("register")
@@ -274,6 +282,9 @@ def _chat_plain(provider: str, model: str, temperature: float, thinking: bool, e
     from mincli.controller import ControllerEvent
 
     ctrl = build_controller(provider, model, temperature, thinking, effort)
+    # 纯文本模式没有“首屏”概念，直接等 MCP 连完：否则连接日志会和 input()
+    # 提示符交错；TUI 模式的解耦见 ChatApp._start_mcp
+    ctrl.wait_mcp_ready()
 
     def emit(ev: ControllerEvent) -> None:
         if ev.kind == "stream":

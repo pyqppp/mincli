@@ -82,9 +82,10 @@ from mincli.workflows import (
 )
 
 try:
-    from mincli.mcp_client import McpToolClient
+    from mincli.mcp_client import READY_TIMEOUT, McpToolClient
 except ImportError:  # pragma: no cover
     McpToolClient = None
+    READY_TIMEOUT = 30
 
 
 @dataclass
@@ -200,6 +201,11 @@ class ChatController:
 
         self._mcp: Optional[McpToolClient] = None
         self._mcp_tool_names: set = set()
+        # MCP 工具列表是否已同步（后台连接完成后同步一次；重连后置回 False）
+        self._mcp_synced: bool = False
+        # MCP 连接日志出口：默认打印（纯文本模式）；TUI 会换成通知，避免
+        # 后台线程直接写 stdout 冲乱界面
+        self.mcp_logger: Callable[[str], None] = print
         self.llm_tools: List[Dict] = list(TOOLS)
 
         self.session_loaded = self.load_session()
@@ -208,17 +214,65 @@ class ChatController:
 
     # ---------------- MCP ----------------
 
+    def _mcp_log(self, message: str) -> None:
+        """MCP 客户端日志回调（可能来自后台连接线程）。"""
+        try:
+            self.mcp_logger(message)
+        except Exception:
+            pass
+
+    @property
+    def mcp_started(self) -> bool:
+        """MCP 客户端是否已创建（不代表已连接完成）。"""
+        return self._mcp is not None
+
+    @property
+    def mcp_ready(self) -> bool:
+        """后台连接是否已结束。"""
+        return self._mcp is not None and self._mcp.ready
+
+    @property
+    def mcp_connecting(self) -> bool:
+        """是否仍在后台连接（UI 据此显示「连接中」）。"""
+        return self._mcp is not None and self._mcp.connecting
+
+    @property
+    def mcp_connected(self) -> bool:
+        """是否至少连上一个 server（工具可用）。"""
+        return self._mcp is not None and self._mcp.ok
+
     def start_mcp(self) -> None:
+        """创建 MCP 客户端并**在后台**开始连接（立即返回，不阻塞首屏）。"""
         if McpToolClient is None or self._mcp is not None:
             return
-        self._mcp = McpToolClient()
+        self._mcp = McpToolClient(log=self._mcp_log)
+        self._mcp_synced = False
         try:
             self._mcp.start()
-            self._mcp_tool_names = self._mcp.tool_names()
         except Exception:
             self._mcp = None
             self._mcp_tool_names = set()
         self._rebuild_llm_tools()
+
+    def wait_mcp_ready(
+        self, emit: Optional[EventSink] = None, timeout: Optional[float] = READY_TIMEOUT
+    ) -> bool:
+        """等待后台 MCP 连接结束并同步工具列表（发送消息前调用）。
+
+        首次调用会阻塞到连接完成（通常启动后 1~2 秒内就已结束，此处瞬间返回）；
+        之后只做一次同步。超时或连不上时返回 False，调用方退回“无 MCP 工具”
+        继续，不因为 MCP 故障把发送卡死。
+        """
+        if self._mcp is None:
+            return False
+        if not self._mcp_synced:
+            if self._mcp.connecting and emit is not None:
+                emit(ControllerEvent.status("正在连接 MCP 服务…"))
+            self._mcp.wait_ready(timeout=timeout)
+            self._mcp_tool_names = self._mcp.tool_names()
+            self._mcp_synced = True
+            self._rebuild_llm_tools()
+        return self._mcp.ok
 
     def _rebuild_llm_tools(self) -> None:
         self.llm_tools = list(TOOLS) + (self._mcp.tools() if self._mcp else [])
@@ -227,11 +281,11 @@ class ChatController:
         return self._mcp.server_status() if self._mcp else {}
 
     def mcp_reload(self) -> None:
+        """后台重连全部 MCP server（读取最新配置），立即返回。"""
         if not self._mcp:
             raise RuntimeError("MCP 客户端未就绪")
         self._mcp.reload()
-        self._mcp_tool_names = self._mcp.tool_names()
-        self._rebuild_llm_tools()
+        self._mcp_synced = False
 
     def close(self) -> None:
         if self._mcp:
@@ -1073,6 +1127,10 @@ class ChatController:
 
         # 历史节点的本地图片若未上传过（file_id 缺失），补传一次（尽力而为）
         self._ensure_chain_uploads(node, emit)
+
+        # MCP 后台连接的收口：首次发送时若还没连完，这里等它（状态提示已发出），
+        # 保证本轮请求带上完整工具列表——工具中途就绪会导致前后两轮工具集不一致。
+        self.wait_mcp_ready(emit=emit)
 
         # 构建发送消息（历史链 + 本轮；图片构造为 OpenAI 兼容内容块）
         messages = self.tree.get_messages_for_node(node)
