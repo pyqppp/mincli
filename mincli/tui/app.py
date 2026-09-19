@@ -21,6 +21,7 @@ from mincli.markdown_safe import _patch_markdown_it
 _patch_markdown_it()
 
 from rich.markup import escape as _markup_escape
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -115,6 +116,14 @@ from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
 from mincli.helpers import open_path_with_os, split_path_args
 from mincli.tools.files import FilesAPIError
 from mincli.tools.images import image_placeholder_text
+from mincli.tui.commands import (
+    Completion,
+    command_block,
+    complete as complete_command,
+    help_markdown,
+    runtime_providers,
+    usage_line,
+)
 from mincli.tui.confirm import ConfirmScreen
 from mincli.tui.theme import TREE_THEMES, color_label, theme_name
 from mincli.tui.tree_wizard import TreeWizardScreen
@@ -133,27 +142,25 @@ DeepSeek 树状对话 TUI
 直接输入问题开始对话，输入 `/help` 查看命令。
 """
 
-# 命令补全/提示用元数据：命令 → 帮助文本（首行为简要说明）
-COMMAND_HELP: dict[str, str] = {
-    "/exit": "退出程序（自动保存会话）",
-    "/clear": "清空当前会话",
-    "/compact": "用法: /compact\n把当前分支全部对话压缩成详细摘要并新建摘要节点；在摘要节点（及其子节点）输入使用摘要，其他节点仍用完整历史",
-    "/help": "显示此帮助",
-    "/import": "用法: /import <文件路径或URL> [...] | /import clear\n导入文件/网页（图片自动转为待发送图片；可一次导入多个；clear 清除待导入内容）。也可以直接把文件拖进终端窗口（粘贴的路径会自动识别并导入）",
-    "/view": "用编辑器打开当前回答",
-    "/mcp": "用法: /mcp list | /mcp add <名称> <命令|URL> [参数...] [--header 'K: V'] | /mcp remove <名称> | /mcp reload\n管理第三方 MCP server（--header 仅对远程 server 生效，可重复使用）",
-    "/model": "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]\n列出/注册模型配置（注册后可用 /set model <模型名> 切换）",
-    "/set": "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set show\n修改运行配置",
-    "/tree": "用法: /tree | /tree <编号> | /tree new | /tree delete <编号> | /tree <编号> tools\n列出/新建/切换/删除对话树，或修改某棵树挂载的能力；每棵树有独立编号与界面颜色，对话框（/tree 列表）会同时给出编号、颜色与工具数",
-    "/info": "用法: /info [节点ID]\n查看节点详情（默认当前节点）",
-    "/up": "返回父节点",
-    "/home": "跳回根节点",
-    "/full": "切换全览模式：节点树全宽显示（切换节点自动退出）\n隐藏右侧回答区、输入框保留；再按一次 /full 恢复分栏",
-    "/save": "用法: /save [节点ID]\n导出节点为 Markdown 文件",
-    "/delete": "用法: /delete <节点ID> [...]\n删除一个或多个节点及其所有子节点（需确认；子节点随父节点级联删除）",
-    "/files": "用法: /files list | /files delete <ID>\n管理已上传的 Files API 图片文件（/import 导入的图片可在此查看/删除）",
-    "/wf": "用法: /wf list | /wf show <名> | /wf save <名> [起点节点ID] | /wf use <名> | /wf stop | /wf run <名> [键=值...] | /wf edit <名> [修改要求] | /wf rename <旧> <新> | /wf delete <名>\n把当前某次/一连串操作保存为可复用工作流并长期保存；/wf use 挂载到下一次输入自动执行，/wf run 立即执行；重复任务无需再描述",
-}
+# 命令补全/提示、/help、各处的用法提示都来自 mincli/tui/commands.py 的同一份
+# 命令规格（三级：/set → /set thinking → /set thinking on），这里不再维护文案表。
+COMPLETION_HINT = "Tab 切换 · Shift+Tab 反向 · Enter 补全"
+
+# /help 尾部：命令清单由命令规格生成，这里只补规格里没有的说明
+HELP_TAIL = """
+**补充说明**
+- 输入 `/` 打开命令补全：继续输入过滤候选，**Tab** 循环（**Shift+Tab** 反向），**Enter** 补全；命令写完按 **Enter** 执行
+- 二级命令（如 `/set thinking on|off`）与运行时候选（对话树编号、工作流名、MCP server 名）都能补全
+- `/<节点ID>`（如 `/a3`）— 直接跳转到指定节点
+- 图片理解仅 deepseek-flash 支持；其他模型会提示切换
+- 配置类命令（`/set ...`）对当前对话树生效，工作目录与审核层级也是每棵树独立
+
+**快捷键**
+- **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行
+- **Tab** 命令补全/循环候选 · **Shift+Tab** 反向循环候选
+- **Esc** / 生成中 **Ctrl+C** 打断当前生成或正在执行的命令（再按一次 **Ctrl+C** 强制退出） · **Ctrl+C** 退出
+- **Ctrl/Alt+1~8** 切换对话树
+"""
 
 # 思考过程：灰色块引用（不再折叠/点击展开；多轮工具调用时每个思考段
 # 各自独立成块，正文穿插其间正常显示）
@@ -329,7 +336,7 @@ class ChatApp(App):
         self._chat_md: Markdown | None = None  # 当前正在流式的正文 Markdown 段
         self._chat_blocks: list = []  # 有序：Markdown 段 或 ToolCard
         self._active_tool_card = None  # 正在执行的工具卡片（开始→结束更新同一张）
-        self._completion_matches: list[str] = []
+        self._completion: Completion | None = None  # 当前补全状态（命令树 + 候选）
         self._completion_index = 0
         # 流式渲染节流：SSE 按 token 级产生事件，逐事件 append 会导致
         # Markdown 组件反复 mount/布局/重绘，主线程跟不上 → 渲染卡顿。
@@ -1274,82 +1281,118 @@ class ChatApp(App):
     def on_chat_input_text_changed(self, message: ChatInput.TextChanged) -> None:
         self._update_command_popup(message.text)
 
+    def _completion_providers(self) -> dict:
+        """运行时候选来源（对话树编号、工作流名、MCP server 名）。"""
+        if self.ctrl is None:
+            return {}
+        return runtime_providers(self.ctrl)
+
     def _update_command_popup(self, text: str) -> None:
-        """根据输入内容更新输入框上方的命令补全/提示弹窗。"""
+        """根据输入内容更新输入框上方的命令补全/提示弹窗。
+
+        候选来自 commands.py 的命令树，支持三级（/set → thinking → on）；
+        命令写全但没有下一级时，弹窗转为「用法 + 说明」提示。
+        """
         popup = self.query_one("#cmd-popup")
-        body = self.query_one("#cmd-popup-body", Static)
-        low = text.strip().lower()
-
-        if not low.startswith("/"):
+        completion = complete_command(text, self._completion_providers())
+        if completion is None or (not completion.candidates and not completion.title):
             popup.remove_class("visible")
-            self._completion_matches = []
+            self._completion = None
             self._completion_index = 0
             return
-
-        if low in COMMAND_HELP:
-            # 命令已输入完整 → 提示框模式
-            popup.add_class("visible")
-            body.update(f"[b]{low}[/b]\n\n{COMMAND_HELP[low]}")
-            self._completion_matches = []
+        prev_title = self._completion.title if self._completion else ""
+        self._completion = completion
+        # 同一层级内换候选不重置高亮；换了层级（如 /set → /set thinking）则回到第一项
+        if not completion.candidates or completion.title != prev_title:
             self._completion_index = 0
-            return
-
-        base = low.split()[0]
-        if base in COMMAND_HELP and low != base:
-            # 已带参数 → 仍显示该命令的提示
-            popup.add_class("visible")
-            body.update(f"[b]{base}[/b]\n\n{COMMAND_HELP[base]}")
-            self._completion_matches = []
+        if self._completion_index >= len(completion.candidates):
             self._completion_index = 0
-            return
-
-        matches = [c for c in COMMAND_HELP if c.startswith(low)]
-        self._completion_matches = matches
-        self._completion_index = 0
-        if not matches:
-            popup.remove_class("visible")
-            return
         popup.add_class("visible")
         self._render_command_list()
 
     def _render_command_list(self) -> None:
+        """渲染弹窗：每个候选一行（用法 + 灰色说明），高亮行滚入可视区。"""
+        completion = self._completion
         body = self.query_one("#cmd-popup-body", Static)
-        lines = ["[b]命令补全[/b]（Tab 切换 · Enter 补全）", ""]
-        for i, name in enumerate(self._completion_matches):
-            brief = COMMAND_HELP[name].splitlines()[0]
-            marker = "→" if i == self._completion_index else " "
-            lines.append(f"{marker} [b]{name}[/b]  [dim]{brief}[/dim]")
-        body.update("\n".join(lines))
+        if completion is None:
+            return
+        # 用 rich.Text 直接拼样式：候选里含 [参数...] / <值> 这类字符，
+        # 走 markup 会被当标签解析（这也是旧实现里命令文案不敢带方括号的原因）
+        text = Text(completion.title, style="bold")
+        if completion.candidates:
+            text.append("   ", style="dim")
+            text.append(COMPLETION_HINT, style="dim")
+            if len(completion.candidates) > 1:
+                # 弹窗不显示滚动条，用序号告诉用户还有多少候选没露出来
+                text.append(
+                    f" · 第 {self._completion_index + 1}/{len(completion.candidates)} 项",
+                    style="dim",
+                )
+        if completion.desc:
+            text.append("  " + completion.desc, style="dim")
+        for i, cand in enumerate(completion.candidates):
+            text.append("\n")
+            active = i == self._completion_index
+            text.append("→ " if active else "  ", style="bold" if active else "")
+            text.append(cand.usage, style="bold" if active else "")
+            if cand.desc:
+                text.append("  " + cand.desc, style="dim")
+        body.update(text)
+        self._scroll_completion_into_view()
 
-    def _advance_or_complete(self) -> bool:
-        """Tab 处理：多候选循环高亮，唯一候选直接补全。返回 True 表示已消费。"""
-        matches = self._completion_matches
-        if not matches:
+    def _scroll_completion_into_view(self) -> None:
+        """把高亮候选滚进弹窗可视区（否则 Tab 循环到后面的候选就看不见了）。"""
+        popup = self.query_one("#cmd-popup")
+        row = 1 + self._completion_index  # 第 0 行是标题
+        height = popup.content_size.height
+        if height <= 0:
+            return
+        top = int(popup.scroll_y)
+        if row < top:
+            popup.scroll_y = float(row)
+        elif row >= top + height:
+            popup.scroll_y = float(row - height + 1)
+
+    def _advance_or_complete(self, reverse: bool = False) -> bool:
+        """Tab/Shift+Tab：多候选循环高亮，唯一候选直接补全。返回 True 表示已消费。"""
+        completion = self._completion
+        candidates = completion.candidates if completion else []
+        if not candidates:
             return False
-        if len(matches) > 1:
-            self._completion_index = (self._completion_index + 1) % len(matches)
+        if len(candidates) > 1:
+            step = -1 if reverse else 1
+            self._completion_index = (self._completion_index + step) % len(candidates)
             self._render_command_list()
             return True
         return self._complete_from_popup()
 
     def _complete_from_popup(self) -> bool:
-        """把输入补全为当前高亮的命令。返回 True 表示已补全（未执行）。"""
-        matches = self._completion_matches
-        if not matches:
+        """把输入补全为当前高亮的候选。返回 True 表示已补全（未执行）。"""
+        completion = self._completion
+        candidates = completion.candidates if completion else []
+        if not candidates:
             return False
-        if not (0 <= self._completion_index < len(matches)):
+        if not (0 <= self._completion_index < len(candidates)):
             self._completion_index = 0
-        target = matches[self._completion_index]
+        target = candidates[self._completion_index].insert
         inp = self.query_one("#chat-input", ChatInput)
-        if inp.text != target:
-            # 光标移到行尾再插入补全后缀（直接替换 .text 会把光标重置到行首，
-            # 导致后续输入插到错误位置）
+        if inp.text == target:
+            # 已经是补全结果（再按一次应执行命令，而不是卡在原地）
+            return False
+        # 光标移到行尾再插入补全后缀（直接替换 .text 会把光标重置到行首，
+        # 导致后续输入插到错误位置）；候选替换的是最后一个词，可能是改写而非追加
+        inp.cursor_location = (
+            inp.document.line_count - 1,
+            len(inp.document.lines[-1]),
+        )
+        if target.startswith(inp.text):
+            inp.insert(target[len(inp.text):])
+        else:
+            inp.text = target
             inp.cursor_location = (
                 inp.document.line_count - 1,
                 len(inp.document.lines[-1]),
             )
-            suffix = target[len(inp.text):]
-            inp.insert(suffix)
         self._update_command_popup(target)
         return True
 
@@ -1410,7 +1453,7 @@ class ChatApp(App):
             cmd_parts = cmd.split(maxsplit=1)
             targets = split_path_args(cmd_parts[1]) if len(cmd_parts) > 1 else []
             if not targets:
-                self.notify("用法: /import <路径或URL> [...] | /import clear", severity="warning")
+                self.notify(usage_line("/import"), severity="warning")
                 return True
             if targets[0].lower() in ("clear", "c"):
                 n = ctrl.clear_imports()
@@ -1457,7 +1500,7 @@ class ChatApp(App):
                     ctrl.files_delete(parts[2])
                     self.notify(f"✅ 已删除文件 {parts[2]}")
                 else:
-                    self.notify("用法: /files list | /files delete <ID>", severity="warning")
+                    self.notify(usage_line("/files"), severity="warning")
             except FilesAPIError as e:
                 self.notify(str(e), severity="error")
             return True
@@ -1507,64 +1550,13 @@ class ChatApp(App):
             self.notify(f"已用系统默认程序打开节点 {node.id} 的回答")
 
     async def _cmd_help(self) -> None:
-        await self._chat_append(
-            """**📖 帮助**
-
-**基本命令**
-- `/exit`, `/quit`, `/q` — 退出程序（自动保存会话）
-- `/clear`, `/c` — 清空当前会话
-- `/compact` — 压缩上下文：把当前分支全部对话压成详细摘要并新建摘要节点（在摘要节点输入用摘要，其他节点仍用完整历史）
-- `/wf <list|show|save|use|run|edit|delete|rename|stop>` — 把当前某次/一连串操作保存为可复用工作流并长期保存；`/wf use 名` 挂载到下次输入，`/wf run 名` 立即执行（输入 `/wf` 查看全部用法）
-- `/help`, `/h` — 显示此帮助
-- `/import <路径或URL> [...]` — 导入文件/网页/图片（可一次多个；`/import clear` 清除待导入内容）
-- `/mcp <list|add|remove|reload>` — 管理第三方 MCP server
-- `/view` — 用编辑器打开当前回答
-
-**配置命令**
-- `/set system <提示词>` — 修改系统提示词
-- `/set temp <值>` — 设置温度（0.0~2.0）
-- `/set model <flash|pro|模型名>` — 切换模型（flash 支持图片理解；vision 为 flash 的旧别名）
-- `/set thinking <on|off>` — 开关思考模式
-- `/set effort <low|high|max>` — 推理强度
-- `/set audit <1-4>` — 审核层级
-- `/set workspace <路径>` — 命令执行默认工作目录（默认 mincli 启动目录）
-- `/set detail <low|auto|high|original>` — 图片清晰度（low 省 token，auto≈original 最清晰）
-- `/set show` — 显示当前配置
-
-**多模态（图片理解）**
-- `/import <路径或URL> [...]` — 图片文件/图片 URL 自动转为待发送图片（发送时自动附带；图片理解仅 deepseek-flash 支持，其他模型会提示切换）
-- `/files list|delete <ID>` — 查看/删除 Files API 已上传的图片文件
-
-**多模型**
-- `/model list` — 查看内置与已注册模型
-- `/model register <模型名> <URL> [-p provider] [-k key_var]` — 注册新模型（OpenAI 兼容 API）
-
-**对话树（多棵树各自独立）**
-- `/tree` — 列出全部对话树（编号、颜色、节点数、挂载能力）
-- `/tree <编号>` — 切换到该树（也可点侧栏那一行，或按 Ctrl/Alt+1~8）
-- `/tree new` — 新建对话树（向导里勾选挂载的能力）
-- `/tree delete <编号>` — 删除整棵树（需确认，编号不再复用）
-- `/tree <编号> tools` — 修改某棵树挂载的能力（对下一次请求生效）
-
-**节点命令（当前树内）**
-- `/<节点ID>`（如 /a3）— 直接跳转到指定节点
-- `/info [节点ID]` — 查看节点详情
-- `/up` — 返回父节点
-- `/home` — 跳回根节点
-- `/full` — 全览模式：隐藏回答区，节点树全宽（再按一次或切换节点自动退出）
-- `/save [节点ID]` — 导出节点为 Markdown
-- `/delete <节点ID> [...]` — 删除一个或多个节点及其子节点（需确认；子节点随父节点级联删除）
-
-**快捷键**
-- **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行
-- **Esc** / 生成中 **Ctrl+C** 打断当前生成或正在执行的命令（再按一次 **Ctrl+C** 强制退出） · **Ctrl+C** 退出
-"""
-        )
+        # 命令清单由 commands.py 的命令规格生成（与补全弹窗、用法提示同源）
+        await self._chat_append(help_markdown() + HELP_TAIL)
 
     async def _cmd_set(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=2)
         ctrl = self.ctrl
-        usage = "用法: /set system <提示词> | /set temp <值> | /set model <flash|pro|模型名> | /set thinking <on|off> | /set effort <low|high|max> | /set audit <1-4> | /set workspace <路径> | /set detail <low|auto|high|original> | /set file_confirm <on|off> | /set show"
+        usage = usage_line("/set")
         if len(parts) < 2:
             self.notify(usage, severity="warning")
             return
@@ -1595,12 +1587,12 @@ class ChatApp(App):
                 ctrl.set_thinking(False)
                 self.notify("思考模式已关闭")
             else:
-                self.notify("用法: /set thinking <on|off>", severity="warning")
+                self.notify(usage_line("/set thinking"), severity="warning")
         elif sub == "effort" and len(parts) == 3:
             if ctrl.set_effort(parts[2]):
                 self.notify(f"推理强度已设置为: {ctrl.reasoning_effort}")
             else:
-                self.notify("用法: /set effort <low|high|max>", severity="warning")
+                self.notify(usage_line("/set effort"), severity="warning")
         elif sub == "audit" and len(parts) == 3:
             try:
                 level = int(parts[2])
@@ -1624,7 +1616,7 @@ class ChatApp(App):
             if ctrl.set_detail(parts[2].lower()):
                 self.notify(f"图片 detail 已设置为: {ctrl.image_detail}")
             else:
-                self.notify("用法: /set detail <low|auto|high|original>", severity="warning")
+                self.notify(usage_line("/set detail"), severity="warning")
         elif sub == "file_confirm" and len(parts) == 3:
             arg = parts[2].lower()
             if arg in ("on", "1", "true"):
@@ -1634,7 +1626,7 @@ class ChatApp(App):
                 ctrl.set_file_confirm(False)
                 self.notify("写文件/编辑文件确认已关闭（AI 可直接写入/修改文件）", severity="warning")
             else:
-                self.notify("用法: /set file_confirm <on|off>", severity="warning")
+                self.notify(usage_line("/set file_confirm"), severity="warning")
         elif sub == "show":
             ctrl = self.ctrl
             lines = [
@@ -1701,7 +1693,7 @@ class ChatApp(App):
         if low.startswith("/delete"):
             nids = parts[1:]
             if not nids:
-                self.notify("用法: /delete <节点ID> [...]", severity="warning")
+                self.notify(usage_line("/delete"), severity="warning")
                 return True
             missing = [n for n in nids if n not in tree.nodes]
             if missing:
@@ -1725,10 +1717,7 @@ class ChatApp(App):
     async def _cmd_tree_list(self, args: list) -> None:
         """对话树命令族：/tree | /tree N | /tree new | /tree delete N | /tree N tools。"""
         ctrl = self.ctrl
-        usage = (
-            "用法: `/tree` 列出全部 · `/tree N` 切换 · `/tree new` 新建 · "
-            "`/tree delete N` 删除 · `/tree N tools` 修改能力"
-        )
+        usage = usage_line("/tree")
         if not args:
             numbers = ctrl.tree_numbers()
             if not numbers:
@@ -1755,7 +1744,7 @@ class ChatApp(App):
                     f"{summary['nodes']} 个节点 · {tools}{state}{here}"
                 )
             lines.append("")
-            lines.append(usage)
+            lines.append(command_block("/tree"))
             await self._chat_append("\n".join(lines))
             return
 
@@ -1765,7 +1754,7 @@ class ChatApp(App):
             return
         if sub in ("delete", "rm", "del"):
             if len(args) < 2 or not args[1].isdigit():
-                self.notify("用法: /tree delete <编号>", severity="warning")
+                self.notify(usage_line("/tree delete"), severity="warning")
                 return
             number = int(args[1])
             if not ctrl.has_trees or number not in ctrl.tree_numbers():
@@ -1844,10 +1833,7 @@ class ChatApp(App):
             self._model_register(parts[2] if len(parts) > 2 else "")
             return
 
-        self.notify(
-            "用法: /model list | /model register <模型名> <URL> [-p provider] [-k key_var]",
-            severity="warning",
-        )
+        self.notify(usage_line("/model"), severity="warning")
 
     async def _model_list(self) -> None:
         """列出内置 + 已注册模型。"""
@@ -1868,7 +1854,7 @@ class ChatApp(App):
         """解析并注册模型：/model register <模型名> <URL> [-p provider] [-k key_var]"""
         tokens = rest.split()
         if len(tokens) < 2:
-            self.notify("用法: /model register <模型名> <URL> [-p provider] [-k key_var]", severity="warning")
+            self.notify(usage_line("/model register"), severity="warning")
             return
         model_name = tokens[0]
         url = tokens[1]
@@ -1907,7 +1893,7 @@ class ChatApp(App):
         elif sub in ("remove", "rm", "del"):
             name = rest.split()[0] if rest.split() else ""
             if not name:
-                self.notify("用法: /mcp remove <名称>", severity="warning")
+                self.notify(usage_line("/mcp remove"), severity="warning")
                 return
             servers = load_mcp_servers()
             if name not in servers:
@@ -1929,10 +1915,7 @@ class ChatApp(App):
             self._refresh_usage_bar()
             self._watch_mcp_ready()
         else:
-            self.notify(
-                "用法: /mcp list | add <名称> <命令|URL> [参数...] [--header 'K: V'] | remove <名称> | reload",
-                severity="warning",
-            )
+            self.notify(usage_line("/mcp"), severity="warning")
 
     def _on_mcp_remove_confirmed(self, name: str, ok: bool) -> None:
         """移除 MCP server 的确认回调（App 消息泵空闲时才被调用）。"""
@@ -1982,7 +1965,7 @@ class ChatApp(App):
         tokens = split_path_args(rest)
         if len(tokens) < 2:
             self.notify(
-                "用法: /mcp add <名称> <命令> [参数...] [--header 'K: V'] 或 /mcp add <名称> <URL> [--header 'K: V']",
+                usage_line("/mcp add") + "（本地命令或远程 URL；--header 'K: V' 可重复）",
                 severity="warning",
             )
             return
@@ -2029,7 +2012,7 @@ class ChatApp(App):
         """/compact —— 压缩当前分支全部对话，新建摘要节点。"""
         parts = cmd.strip().split()
         if len(parts) > 1:
-            self.notify("用法: /compact（不支持参数）", severity="warning")
+            self.notify(usage_line("/compact") + "（不支持参数）", severity="warning")
             return
         ctrl = self.ctrl
         if not ctrl.tree or ctrl.tree.current_node is None:
@@ -2062,12 +2045,6 @@ class ChatApp(App):
 
     # ---------------- 工作流（/wf） ----------------
 
-    _WF_USAGE = (
-        "用法: /wf list | /wf show <名> | /wf save <名> [起点节点ID] | "
-        "/wf use <名> | /wf stop | /wf run <名> [键=值...] | "
-        "/wf edit <名> [修改要求] | /wf rename <旧> <新> | /wf delete <名>"
-    )
-
     async def _cmd_wf(self, cmd: str) -> None:
         """工作流命令入口（/wf 与 /workflow 等价）。"""
         ctrl = self.ctrl
@@ -2084,13 +2061,9 @@ class ChatApp(App):
         if sub in ("", "help", "-h", "--help"):
             await self._chat_append(
                 "**工作流命令**\n\n"
-                f"{self._WF_USAGE}\n\n"
-                "- `/wf save <名> [起点节点ID]` — 把当前节点（或起点→当前的一连串操作）"
-                "提炼为可复用工作流并长期保存（自动把每次会变化的数据抽成 {变量}）\n"
-                "- `/wf use <名>` — 挂载到下一次输入：发送下一条消息即按工作流执行（一次性）\n"
-                "- `/wf run <名> [键=值...]` — 立即按工作流执行；未提供值的变量由模型结合当前情况推断\n"
-                "- `/wf edit <名> <修改要求>` — 让模型修订规范；不带要求时用系统默认编辑器打开，保存后自动回写（跨平台）\n"
-                "- 工作流长期保存于 `~/.mincli/workflows.json`，重启后仍在"
+                f"{command_block('/wf')}\n\n"
+                "- 不带 `<名>` 的用法见上；工作流长期保存于 `~/.mincli/workflows.json`，重启后仍在\n"
+                "- `/wf save` 会把每次变化的数据自动抽成 {变量}，`/wf run` 未提供的变量由模型结合当前情况推断"
             )
             return
         if sub in ("list", "ls"):
@@ -2098,7 +2071,7 @@ class ChatApp(App):
             return
         if sub == "show":
             if not name:
-                self.notify("用法: /wf show <名>", severity="warning")
+                self.notify(usage_line("/wf show"), severity="warning")
                 return
             wf = ctrl.wf_get(name)
             if wf is None:
@@ -2110,7 +2083,7 @@ class ChatApp(App):
             return
         if sub == "save":
             if not name:
-                self.notify("用法: /wf save <名> [起点节点ID]", severity="warning")
+                self.notify(usage_line("/wf save"), severity="warning")
                 return
             start_id = tokens[2] if len(tokens) > 2 else None
             if ctrl.wf_get(name) is not None:
@@ -2124,7 +2097,7 @@ class ChatApp(App):
             return
         if sub == "use":
             if not name:
-                self.notify("用法: /wf use <名>（/wf stop 取消挂载）", severity="warning")
+                self.notify(usage_line("/wf use") + "（/wf stop 取消挂载）", severity="warning")
                 return
             if ctrl.wf_get(name) is None:
                 self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
@@ -2148,7 +2121,7 @@ class ChatApp(App):
             return
         if sub == "delete":
             if not name:
-                self.notify("用法: /wf delete <名>", severity="warning")
+                self.notify(usage_line("/wf delete"), severity="warning")
                 return
             if ctrl.wf_get(name) is None:
                 self.notify(f"工作流「{name}」不存在", severity="warning")
@@ -2162,7 +2135,7 @@ class ChatApp(App):
         if sub == "rename":
             new_name = tokens[2] if len(tokens) > 2 else ""
             if not name or not new_name:
-                self.notify("用法: /wf rename <旧名> <新名>", severity="warning")
+                self.notify(usage_line("/wf rename"), severity="warning")
                 return
             err = ctrl.wf_rename(name, new_name)
             if err:
@@ -2175,7 +2148,7 @@ class ChatApp(App):
             return
         if sub == "edit":
             if not name:
-                self.notify("用法: /wf edit <名> [修改要求]", severity="warning")
+                self.notify(usage_line("/wf edit"), severity="warning")
                 return
             if ctrl.wf_get(name) is None:
                 self.notify(f"工作流「{name}」不存在", severity="warning")
@@ -2191,7 +2164,7 @@ class ChatApp(App):
                 return
             self._wf_start_editor(name)
             return
-        self.notify(self._WF_USAGE, severity="warning")
+        self.notify(usage_line("/wf"), severity="warning")
 
     async def _cmd_wf_list(self) -> None:
         data = self.ctrl.wf_list() if self.ctrl else []
@@ -2260,7 +2233,7 @@ class ChatApp(App):
     async def _cmd_wf_run(self, tokens: list) -> None:
         name = tokens[1] if len(tokens) > 1 else ""
         if not name:
-            self.notify("用法: /wf run <名> [键=值...]（位置参数按变量顺序填充）", severity="warning")
+            self.notify(usage_line("/wf run") + "（位置参数按变量顺序填充）", severity="warning")
             return
         ctrl = self.ctrl
         if ctrl is None:

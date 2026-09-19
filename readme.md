@@ -20,7 +20,7 @@ Switch models / system prompts / temperature / thinking mode on the fly; the AI 
 - 🧠 **Thinking Mode** — full V4 reasoning chain display, toggleable on the fly
 - 🔧 **Tool Calling** — AI autonomously invokes tools: read/write/edit files, fetch web pages, list directories, execute commands (user-confirmed)
 - 🔁 **Workflows (`/wf`)** — save one finished task (or a whole run of turns) as a reusable workflow that lives on disk; `/wf use` attaches it to your next message, `/wf run` executes it right away — no need to re-describe repetitive work
-- ⌨️ **Command Completion** — type `/` to list commands; letters filter candidates; `Tab` cycles / completes; a completed command shows its usage help
+- **Command Completion** — type `/` to list commands (one candidate per line: usage + a dim description); supports second-level subcommands (`/set thinking`), third-level values (`on|off`) and runtime candidates (tree numbers, workflow names, MCP server names); `Tab` cycles (the highlighted row scrolls into view), `Shift+Tab` cycles backwards, `Enter` completes; a fully-typed command with no next level shows its usage help
 - 🛡️ **Confirm Dialogs** — destructive actions (`/delete`, `/mcp remove`) ask for confirmation; `←`/`→` switches buttons and the default is *Cancel*
 - 💾 **Auto-Save Session** — saved on exit, restored on next launch
 - ♻️ **Resumable Interruptions** — press `Esc` (or `Ctrl+C` while busy) to stop generation or kill a running command at any time; a failed/interrupted turn keeps its node (partial answer, reasoning and finished tool results); type `继续` to carry on instead of losing the turn
@@ -155,7 +155,7 @@ mincli chat --help
 |-----|--------|
 | `Enter` | Send message |
 | `Ctrl+J` / `Alt+Enter` | Newline |
-| `Tab` | Complete / cycle command completion candidates |
+| `Tab` / `Shift+Tab` | Command completion: cycle candidates / cycle backwards |
 | `↑` / `↓` | Scroll the answer area (when the input is empty); double-press and hold for 2× speed |
 | `Esc` / `Ctrl+C` (while busy) | Interrupt the current generation or running command (the partial turn is kept); `Ctrl+C` when idle quits, and a second `Ctrl+C` forces quit if a turn is stuck |
 | `Ctrl+1~8` / `Alt+1~8` | Switch directly to that conversation tree (some terminals do not report Ctrl+digit as a distinct key; use Alt+digit there) |
@@ -287,7 +287,7 @@ CLI flags:
 | `/delete <node-id> [...]` | Delete one or more nodes and their children (confirmed; children of a deleted parent are removed together, no not-found error) |
 | `/view` | Open reply in editor |
 
-Type `/` in the input box to see the command list; keep typing to filter, `Tab` to complete, and a fully-typed command shows its usage help above the input.
+Type `/` in the input box to see the command list: one candidate per line (usage + dim description), keep typing to filter, `Tab`/`Shift+Tab` to cycle and `Enter` to complete. Completion is multi-level (`/set` → `/set thinking` → `/set thinking on`) and also offers runtime candidates (`/tree <number>`, `/wf show <name>`, `/mcp remove <name>`). A fully-typed command with no next level shows its usage and description above the input; press `Enter` again to run it.
 
 ---
 
@@ -437,6 +437,7 @@ An API failure (rate limit, dropped connection, `Content Exists Risk` moderation
 │   │   ├── app.py           # ChatApp (layout, commands, events)
 │   │   ├── chat.tcss        # TUI styles
 │   │   ├── confirm.py       # Confirm dialog (←/→ switch, default cancel)
+│   │   ├── commands.py      # slash-command spec (completion / /help / usage share it)
 │   │   └── widgets.py       # ChatInput (multi-line + completion)
 │   └── tools/
 │       ├── registry.py      # Local tool defs (conversation tree tools)

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mincli.models import ConversationTree
 from mincli.controller import ChatController, ControllerEvent
 from mincli.tui.app import ChatApp
+from mincli.tui.commands import CMD_SPEC, complete, help_markdown, usage_line
 from mincli.tui.widgets import ChatInput
 from textual import events
 from textual.containers import Horizontal, VerticalScroll
@@ -964,6 +965,8 @@ async def test_tree_background_events():
 
 async def main() -> int:
     print("== ChatApp headless 验证（2b） ==")
+    test_command_spec()
+    await test_command_completion_levels()
     test_markdown_safety()
     test_selection_safety()
     test_screen_forward_safety()
@@ -1069,9 +1072,10 @@ async def main() -> int:
         await type_command("/help")
         for _ in range(10):
             await pilot.pause()
-            if "📖 帮助" in app._chat_source():
+            if "**帮助**" in app._chat_source():
                 break
-        check("命令：/help 显示帮助", "📖 帮助" in app._chat_source())
+        check("命令：/help 显示帮助", "**帮助**" in app._chat_source()
+              and "/set thinking <on|off>" in app._chat_source())
 
         await type_command("/set model pro")
         await pilot.pause()
@@ -1097,10 +1101,10 @@ async def main() -> int:
         await pilot.press("tab")
         for _ in range(5):
             await pilot.pause()
-        check("补全：Tab 补全为 /delete", inp.text == "/delete")
-        check("补全：补全后转为命令提示", "用法: /delete" in str(body.content))
+        check("补全：Tab 补全为 /delete（带参数命令补空格）", inp.text == "/delete ")
+        check("补全：补全后转为命令提示", "/delete <节点ID> [...]" in str(body.content))
 
-        await pilot.press(" ", "a", "1")
+        await pilot.press("a", "1")
         await pilot.press("enter")
         for _ in range(30):
             await pilot.pause()
@@ -1639,6 +1643,165 @@ def test_tool_args_width():
     check("工具参数单行受限", all(len(line) <= 110 for line in fmt.split("\n")))
     # 非 dict（如普通字符串）不影响，直接透传不崩溃
     check("工具参数非 dict 不崩", isinstance(ChatApp._format_tool_args('"just a string"'), str))
+
+
+def test_command_spec():
+    """命令规格引擎：分级补全、别名、动态候选、用法与 /help 同源（纯逻辑，不起 App）。"""
+    prov = {
+        "trees": lambda: [("1", "对话树 1（3 个节点）（当前）"), ("2", "对话树 2（0 个节点）")],
+        "workflows": lambda: [("demo", "示例工作流（2 步）")],
+        "servers": lambda: [("tavily", "已配置的 MCP server")],
+    }
+
+    c = complete("/", prov)
+    check("规格：/ 列出全部一级命令", c is not None and len(c.candidates) == len(CMD_SPEC))
+
+    c = complete("/set", prov)
+    check("规格：/set 列出二级命令", c is not None and len(c.candidates) == 10)
+    check("规格：二级候选项带用法与说明",
+          any(x.usage == "/set temp <值>" and "温度" in x.desc for x in c.candidates))
+    check("规格：含子命令的候选项补空格", any(x.insert == "/set thinking " for x in c.candidates))
+    check("规格：叶子候选项补空格（还要填参数）", any(x.insert == "/set show" for x in c.candidates))
+
+    c = complete("/set thinking ", prov)
+    check("规格：三级取值枚举", c is not None and {x.usage for x in c.candidates} ==
+          {"/set thinking on", "/set thinking off"})
+    check("规格：三级标题回显参数", c is not None and c.title == "/set thinking <on|off>")
+
+    c = complete("/set thinking of", prov)
+    check("规格：三级前缀过滤", c is not None and [x.insert for x in c.candidates] == ["/set thinking off"])
+
+    c = complete("/set te", prov)
+    check("规格：二级前缀过滤", c is not None and [x.insert for x in c.candidates] == ["/set temp "])
+
+    c = complete("/tree ", prov)
+    check("规格：动态候选（对话树编号）",
+          c is not None and any(x.usage == "/tree 2" and "对话树 2" in x.desc for x in c.candidates))
+    c = complete("/tree 2 ", prov)
+    check("规格：动态候选自身还有下一级", c is not None and [x.usage for x in c.candidates] == ["/tree 2 tools"])
+    c = complete("/tree delete ", prov)
+    check("规格：子命令后的动态候选", c is not None and
+          [x.insert for x in c.candidates] == ["/tree delete 1", "/tree delete 2"])
+    c = complete("/wf show ", prov)
+    check("规格：动态候选（工作流名）", c is not None and [x.insert for x in c.candidates] == ["/wf show demo"])
+    c = complete("/mcp remove ", prov)
+    check("规格：动态候选（MCP server 名）", c is not None and
+          [x.insert for x in c.candidates] == ["/mcp remove tavily"])
+
+    c = complete("/workflow list", prov)
+    check("规格：别名按本体归位", c is not None and c.title == "/wf list")
+
+    c = complete("/set temp", prov)
+    check("规格：叶子命令转提示（无候选）", c is not None and not c.candidates and c.title == "/set temp <值>")
+    check("规格：未知命令不弹窗", complete("/zzz", prov) is None)
+    check("规格：非命令不弹窗", complete("你好", prov) is None)
+    # 动态来源不可用时不崩
+    def boom():
+        raise RuntimeError("控制器未就绪")
+    c = complete("/tree ", {"trees": boom})
+    check("规格：动态来源异常不崩且退回静态候选",
+          c is not None and [x.usage for x in c.candidates] == ["/tree new", "/tree delete <编号>"])
+
+    check("用法：含子命令给名称清单", usage_line("/set").endswith("（system/temp/model/thinking/effort/audit/workspace/detail/file_confirm/show）"))
+    check("用法：取值枚举直接写全", usage_line("/set detail") == "用法: /set detail <low|auto|high|original>")
+    check("用法：叶子给完整参数", usage_line("/wf show") == "用法: /wf show <名>")
+
+    help_text = help_markdown()
+    check("帮助：一级命令全部出现", all(f"/{c0.name}" in help_text for c0 in CMD_SPEC))
+    check("帮助：二级命令分行列出", "/set thinking <on|off>" in help_text and "/tree <编号> tools" in help_text)
+    def _has_emoji(text: str) -> bool:
+        # emoji / dingbat / 箭头符号等图形字符区间（AGENTS.md 禁止在交付物引入）
+        return any(
+            0x1F000 <= ord(ch) <= 0x1FAFF
+            or 0x2600 <= ord(ch) <= 0x27BF
+            or 0x2B00 <= ord(ch) <= 0x2BFF
+            or 0x2190 <= ord(ch) <= 0x21FF
+            or 0xFE00 <= ord(ch) <= 0xFE0F
+            for ch in text
+        )
+    check("帮助：无 emoji", not _has_emoji(help_text))
+
+
+async def test_command_completion_levels():
+    """命令补全交互：Tab 循环时滚动跟随、Shift+Tab 反向、Enter 只补全不执行。"""
+    fake = FakeController()
+    fake.create_tree()  # 树 2，供动态候选使用
+    app = ChatApp(controller=fake)
+    async with app.run_test(size=(100, 30)) as pilot:
+        inp = app.query_one("#chat-input", ChatInput)
+        popup = app.query_one("#cmd-popup")
+        body = app.query_one("#cmd-popup-body", Static)
+
+        async def type_text(text: str) -> None:
+            inp.clear()
+            for _ in range(4):
+                await pilot.pause()
+            await pilot.press(*list(text))
+            for _ in range(6):
+                await pilot.pause()
+
+        def popup_text() -> str:
+            return str(body.content)
+
+        await type_text("/")
+        text = popup_text()
+        check("补全：/ 每行一个候选（用法 + 灰色说明）", "/exit" in text and "/wf" in text)
+        check("补全：灰字统一为说明（不再混入用法行）", "用法:" not in text)
+        check("补全：输入 / 时无高亮项也能滚到第一项", popup.scroll_y == 0)
+        check("补全：标题给出候选序号", "第 1/18 项" in text)
+
+        # 18 个一级命令在 30 行终端里超出弹窗可视高度：Tab 必须把高亮项滚进视野
+        indices = []
+        for _ in range(len(app._completion.candidates)):
+            await pilot.press("tab")
+            for _ in range(2):
+                await pilot.pause()
+            index = app._completion_index
+            row = 1 + index
+            visible = popup.scroll_y <= row < popup.scroll_y + popup.content_size.height
+            indices.append((index, popup.scroll_y, visible))
+        # 首次 Tab 从第 0 项移到第 1 项，转一圈后回到第 0 项
+        expected = list(range(1, len(CMD_SPEC))) + [0]
+        check("补全：Tab 循环覆盖全部候选", [i for i, _, _ in indices] == expected)
+        check("补全：Tab 时高亮项滚入可视区", all(vis for _, _, vis in indices))
+        check("补全：确实发生了滚动（不再固定不动）", max(sy for _, sy, _ in indices) > 0)
+
+        await pilot.press("shift+tab")
+        for _ in range(2):
+            await pilot.pause()
+        # 循环结束时高亮在第 0 项，反向一次应回到最后一项
+        check("补全：Shift+Tab 反向切换", app._completion_index == len(CMD_SPEC) - 1)
+        check("补全：序号随高亮更新", f"第 {len(CMD_SPEC)}/{len(CMD_SPEC)} 项" in popup_text())
+
+        await type_text("/set")
+        text = popup_text()
+        check("补全：/set 分行列出二级命令", text.count("\n") == 10)
+        check("补全：二级候选带用法与说明", "→ /set system <提示词>" in text and "修改系统提示词" in text)
+
+        await pilot.press("tab")
+        for _ in range(3):
+            await pilot.pause()
+        check("补全：Tab 选中第二项", app._completion.candidates[app._completion_index].insert == "/set temp ")
+        await pilot.press("enter")
+        for _ in range(6):
+            await pilot.pause()
+        check("补全：Enter 只补全不执行 /set", inp.text == "/set temp ")
+        check("补全：Enter 后弹窗转为该命令提示", "/set temp <值>" in popup_text())
+
+        await type_text("/set thinking ")
+        check("补全：三级取值枚举候选", "→ /set thinking on" in popup_text()
+              and "/set thinking off" in popup_text())
+
+        await type_text("/tree ")
+        text = popup_text()
+        check("补全：动态列出对话树编号", "/tree 1" in text and "/tree 2" in text
+              and "树 2" in text.replace("对话树 2", "树 2"))
+        await type_text("/tree 2 ")
+        check("补全：编号后还有三级命令", "→ /tree 2 tools" in popup_text())
+
+        await type_text("/zzz")
+        check("补全：未知命令不弹窗", not popup.has_class("visible"))
+        await pilot.press("ctrl+c")
 
 
 def test_markdown_safety():

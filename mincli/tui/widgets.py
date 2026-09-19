@@ -34,6 +34,8 @@ class ChatInput(TextArea):
         Ctrl+C     无选区时退出应用；输入框内有选区时先复制（TextArea 默认）
                    生成/命令执行进行中则先打断当前轮
         Esc        打断正在进行的生成/命令（空闲时无操作）
+        Tab        命令补全：循环高亮候选（唯一候选直接补全）；命令写完则插入制表符
+        Shift+Tab  命令补全：反向循环高亮候选
     """
 
     BINDINGS = [
@@ -41,6 +43,7 @@ class ChatInput(TextArea):
         Binding("ctrl+j", "insert_newline", "换行", show=False),
         Binding("alt+enter", "insert_newline", "换行", show=False),
         Binding("tab", "complete_or_tab", "命令补全/Tab", show=False, priority=True),
+        Binding("shift+tab", "complete_or_tab_back", "命令补全反向", show=False, priority=True),
         Binding("up", "scroll_answer(-1)", "上滚回答区", show=False),
         Binding("down", "scroll_answer(1)", "下滚回答区", show=False),
         # TextArea 默认会吞掉 Esc（切焦点），这里优先接管为「打断生成」
@@ -134,6 +137,10 @@ class ChatInput(TextArea):
         if self.app._advance_or_complete():  # type: ignore[attr-defined]
             return
         self.insert("\t")
+
+    def action_complete_or_tab_back(self) -> None:
+        """Shift+Tab：命令补全候选中反向切换（同一层级）。"""
+        self.app._advance_or_complete(reverse=True)  # type: ignore[attr-defined]
 
     def action_scroll_answer(self, delta: int) -> None:
         """↑/↓：输入框为空时滚动回答区；有内容时保留默认光标移动。"""
