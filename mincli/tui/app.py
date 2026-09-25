@@ -98,6 +98,7 @@ _patch_textual_screen_forward_event()
 
 from mincli.config import (
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_MINIMAL_SYSTEM_PROMPT,
     MODEL_FLASH,
     BALANCE_REFRESH_SECONDS,
     FILES_LIST_PAGE,
@@ -462,6 +463,7 @@ class ChatApp(App):
             self.ctrl = ChatController(
                 client=OpenAI(api_key=api_key, base_url="https://api.deepseek.com"),
                 default_system=DEFAULT_SYSTEM_PROMPT,
+                default_system_minimal=DEFAULT_MINIMAL_SYSTEM_PROMPT,
                 default_temperature=1.0,
                 default_model=MODEL_FLASH,
                 # MCP 由 _start_mcp 在首屏之后后台启动（日志出口也得先接好）
@@ -717,6 +719,7 @@ class ChatApp(App):
             heading = "新建对话树"
             note = (
                 "对话能力必选；系统工具与外置 MCP 工具按需勾选。"
+                "两者都不勾选 = 纯对话（使用最小系统提示词）。"
                 "建好后可用 /tree N tools 修改。"
             )
             caps = {"system_tools": True, "mcp_tools": []}
@@ -1619,7 +1622,12 @@ class ChatApp(App):
                 "**当前配置**",
                 "",
                 f"- **对话树**: 树 {ctrl.active_number}（{color_label(ctrl.tree_color())}，共 {len(ctrl.tree_numbers())} 棵）",
-                f"- **系统提示词**: {ctrl.current_system}",
+                f"- **系统提示词**: "
+                + (
+                    f"最小版（{len(ctrl.active_system_prompt)} 字符，本树只挂对话能力）"
+                    if ctrl.active_system_minimal
+                    else f"完整版（{len(ctrl.active_system_prompt)} 字符）"
+                ),
                 f"- **温度**: {ctrl.current_temperature}",
                 f"- **模型**: {ctrl.current_model}",
                 f"- **思考模式**: {'开' if ctrl.thinking_enabled else '关'} | 推理强度: {ctrl.reasoning_effort}",
@@ -1934,7 +1942,12 @@ class ChatApp(App):
                     state = "（后台出错）"
                 here = "（当前）" if number == ctrl.active_number else ""
                 caps = ctrl.tree_caps(number)
-                tools = "系统工具" if caps["system_tools"] else "无系统工具"
+                if caps["system_tools"]:
+                    tools = "系统工具"
+                elif caps["mcp_tools"]:
+                    tools = "无系统工具"
+                else:
+                    tools = "仅对话（最小提示词）"
                 if caps["mcp_tools"]:
                     tools += f" + {len(caps['mcp_tools'])} 个外置工具"
                 lines.append(

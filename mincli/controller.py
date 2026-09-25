@@ -6,7 +6,9 @@ Textual TUI 通过本控制器驱动；UI 通过 ControllerEvent 回调接收增
 
 多对话树：
 - 每棵树一个文件（见 mincli/trees.py），容量固定为「节点树 + 该树自己的设置」；
-- 模型/温度/思考模式/系统提示词等是全局设置，所有树共享；
+- 模型/温度/思考模式等是全局设置，所有树共享；
+- 系统提示词是全局设置与每树能力挂载共同决定的：只挂「对话」能力的树用最小
+  提示词，挂了系统工具或外置 MCP 工具的树用完整版（见 _system_prompt_for）；
 - 审核层级、file_confirm、工作目录、能力白名单、输入草稿是每棵树独立的；
 - 同一时刻只允许一棵树在生成：后台生成期间切走，生成继续，但另一棵树
   必须等它结束才能发送（见 ChatApp._send_user_text）。
@@ -45,6 +47,7 @@ from mincli.config import (
     VISION_REQUEST_TOTAL_MAX_BYTES,
     FILES_LIST_PAGE,
     WORKFLOWS_PATH,
+    DEFAULT_MINIMAL_SYSTEM_PROMPT,
     WF_EXTRACT_MAX_TOKENS,
     WF_SOURCE_MAX_CHARS,
     WF_REASONING_MAX_CHARS,
@@ -208,10 +211,15 @@ class ChatController:
         reasoning_effort: str = "high",
         auto_start_mcp: bool = True,
         trees_dir: Optional[str] = None,
+        default_system_minimal: Optional[str] = None,
     ) -> None:
         self.client = client
         # ---------------- 全局设置（所有对话树共享） ----------------
         self.current_system = default_system
+        # 最小提示词：只挂「对话」能力的树用它（不提及工具/历史/命令等任何信息）
+        self.current_system_minimal = (
+            default_system_minimal or DEFAULT_MINIMAL_SYSTEM_PROMPT
+        )
         self.current_temperature = default_temperature
         self.current_model = normalize_model_name(default_model)
         # 从磁盘加载时，若旧模型名被自动改写，这里记录原始名（供 UI 提示）
@@ -300,9 +308,9 @@ class ChatController:
         return False
 
     def _reset_placeholder(self) -> None:
-        self._states[0] = TreeState(
-            number=0, color=1, tree=ConversationTree(self.current_system)
-        )
+        st = TreeState(number=0, color=1, tree=ConversationTree(self.current_system))
+        self._apply_system_prompt(st)
+        self._states[0] = st
         self._active = 0
 
     def _load_state(self, number: int) -> TreeState:
@@ -318,8 +326,7 @@ class ChatController:
             if isinstance(tree_data, dict)
             else ConversationTree(self.current_system)
         )
-        # 系统提示词是全局设置：以内存中的值为准，忽略树文件里的旧副本
-        tree.system_prompt = self.current_system
+        # 系统提示词由「全局设置 + 本树能力挂载」共同决定，树文件里的旧副本忽略
         st = TreeState(
             number=number,
             color=self._store.color_of(number),
@@ -331,6 +338,7 @@ class ChatController:
             system_tools=bool(data.get("system_tools", True)),
             mcp_tools=list(data.get("mcp_tools") or []),
         )
+        self._apply_system_prompt(st)
         self._states[number] = st
         return st
 
@@ -426,11 +434,40 @@ class ChatController:
     def tree(self, value: ConversationTree) -> None:
         st = self._state()
         if st is None:
-            self._states[self._active] = TreeState(
+            st = TreeState(
                 number=self._active, color=color_of(self._active), tree=value
             )
+            self._states[self._active] = st
         else:
             st.tree = value
+        self._apply_system_prompt(st)
+
+    # ---------------- 系统提示词：完整版 / 最小版 ----------------
+
+    @staticmethod
+    def _is_chat_only(st: Optional[TreeState]) -> bool:
+        """该树是否只挂了「对话」能力（无系统工具、无外置 MCP 工具）。"""
+        return st is not None and not st.system_tools and not st.mcp_tools
+
+    def _system_prompt_for(self, st: Optional[TreeState]) -> str:
+        """按树的能力挂载选提示词：只挂对话用最小版，挂了任何工具用完整版。"""
+        if self._is_chat_only(st):
+            return self.current_system_minimal
+        return self.current_system
+
+    def _apply_system_prompt(self, st: TreeState) -> None:
+        """把当前该生效的提示词写回树对象（能力挂载或全局设置变化后调用）。"""
+        st.tree.system_prompt = self._system_prompt_for(st)
+
+    @property
+    def active_system_prompt(self) -> str:
+        """当前树实际生效的系统提示词。"""
+        return self._system_prompt_for(self._state())
+
+    @property
+    def active_system_minimal(self) -> bool:
+        """当前树是否使用最小提示词（只挂「对话」能力）。"""
+        return self._is_chat_only(self._state())
 
     @property
     def active_number(self) -> int:
@@ -510,6 +547,7 @@ class ChatController:
             system_tools=bool(system_tools),
             mcp_tools=list(mcp_tools or []),
         )
+        self._apply_system_prompt(st)
         self._states[number] = st
         # 刚建的空树没有并发改动，快照一定成功
         self._store.save_tree(number, self._tree_payload(st) or {})
@@ -568,6 +606,8 @@ class ChatController:
             st.system_tools = bool(system_tools)
         if mcp_tools is not None:
             st.mcp_tools = list(mcp_tools)
+        # 能力变化可能让这棵树在「完整版 / 最小版」提示词之间切换
+        self._apply_system_prompt(st)
         self.save_tree(st.number)
         if st.number == self._active:
             self._rebuild_llm_tools()
@@ -761,10 +801,14 @@ class ChatController:
     # ---------------- 设置 ----------------
 
     def set_system(self, system: str) -> None:
-        """设置系统提示词（全局设置：立即作用于所有已加载的对话树）。"""
+        """设置系统提示词（全局设置：立即作用于所有已加载的对话树）。
+
+        这里设置的是「完整版」；只挂「对话」能力的树仍使用最小提示词，
+        见 _system_prompt_for。
+        """
         self.current_system = system
         for st in self._states.values():
-            st.tree.system_prompt = system
+            self._apply_system_prompt(st)
 
     def set_temperature(self, temp: float) -> None:
         self.current_temperature = temp
@@ -1007,7 +1051,7 @@ class ChatController:
     def reset(self) -> None:
         """清空当前对话树的对话历史（/clear）。"""
         self._cleanup_temp_files()
-        self.tree = ConversationTree(self.current_system)
+        self.tree = ConversationTree(self.active_system_prompt)
         self.save_tree()
 
     # ---------------- 上下文压缩 ----------------

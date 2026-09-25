@@ -15,6 +15,8 @@ from mincli.config import (
     SAVE_BASE_DIR,
     DEFAULT_SYSTEM_PROMPT,
     SYSTEM_PROMPT_SOURCE,
+    DEFAULT_MINIMAL_SYSTEM_PROMPT,
+    MINIMAL_SYSTEM_PROMPT_SOURCE,
     MODELS_AVAILABLE,
     API_PROVIDERS,
     load_models,
@@ -70,6 +72,7 @@ def build_controller(
     return ChatController(
         client=OpenAI(api_key=api_key, base_url=base_url),
         default_system=DEFAULT_SYSTEM_PROMPT,
+        default_system_minimal=DEFAULT_MINIMAL_SYSTEM_PROMPT,
         default_temperature=temperature,
         default_model=effective_model,
         thinking_enabled=thinking,
@@ -151,7 +154,14 @@ def info() -> None:
         "  图片 token 估算: 按官方预处理公式换算（patch 14/下采样 3/"
         f"上限 {image_tokens_per_image(pricing)}），尺寸未知时用上限"
     )
-    print(f"  系统提示词: {SYSTEM_PROMPT_SOURCE or '内置兜底'}（{len(DEFAULT_SYSTEM_PROMPT)} 字符）")
+    print(
+        f"  系统提示词（完整版）: {SYSTEM_PROMPT_SOURCE or '内置兜底'}"
+        f"（{len(DEFAULT_SYSTEM_PROMPT)} 字符）"
+    )
+    print(
+        f"  系统提示词（最小版）: {MINIMAL_SYSTEM_PROMPT_SOURCE or '内置兜底'}"
+        f"（{len(DEFAULT_MINIMAL_SYSTEM_PROMPT)} 字符，只挂对话能力的树使用）"
+    )
     print("  模式: 树状对话 (Textual TUI)")
     print("  多模型: `mincli register <模型名> <URL>` 注册 / `mincli models` 查看")
 

@@ -218,25 +218,42 @@ WF_TOOL_ARGS_MAX_CHARS = 800      # 每个工具调用参数计入提炼源的�
 WF_TOOL_RESULT_MAX_CHARS = 400    # 每个工具结果计入提炼源的长度上限
 WF_ANSWER_MAX_CHARS = 1200        # 每节点最终回答计入提炼源的长度上限
 
-# 系统提示词独立存放在文件中，每次启动自动导入：
-# 1. MINCLI_SYSTEM_PROMPT_PATH 环境变量指定的文件（优先级最高）
-# 2. ~/.mincli/system_prompt.md（用户自定义，覆盖默认提示词）
-# 3. 包内 system_prompt.md（随项目分发，默认提示词）
+# 系统提示词独立存放在文件中，每次启动自动导入。分两个版本，按对话树的能力
+# 挂载选用（见 controller._system_prompt_for）：
+#
+#   完整版 system_prompt.md          挂了系统工具或外置 MCP 工具的树
+#   最小版 system_prompt_minimal.md  只挂「对话」能力的树
+#
+# 两个版本各自独立，加载优先级相同：
+# 1. MINCLI_SYSTEM_PROMPT_PATH / MINCLI_MINIMAL_SYSTEM_PROMPT_PATH 环境变量指定的文件
+# 2. ~/.mincli/system_prompt.md / ~/.mincli/system_prompt_minimal.md（用户自定义）
+# 3. 包内同名文件（随项目分发，默认提示词）
 SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "system_prompt.md")
 USER_SYSTEM_PROMPT_PATH = os.path.expanduser("~/.mincli/system_prompt.md")
+MINIMAL_SYSTEM_PROMPT_PATH = os.path.join(
+    os.path.dirname(__file__), "system_prompt_minimal.md"
+)
+USER_MINIMAL_SYSTEM_PROMPT_PATH = os.path.expanduser(
+    "~/.mincli/system_prompt_minimal.md"
+)
 
 # 所有提示词文件均不可用时的内置兜底（正常情况下不会用到）
 _FALLBACK_SYSTEM_PROMPT = "你是一个有用的人工智能助手。"
 
 
-def _load_default_system_prompt() -> tuple[str, Optional[str]]:
-    """读取系统提示词，返回 (提示词内容, 实际使用的文件路径或 None)。"""
+def _load_prompt_file(
+    env_var: str, user_path: str, package_path: str, fallback: str
+) -> tuple[str, Optional[str]]:
+    """读取一个提示词文件，返回 (提示词内容, 实际使用的文件路径或 None)。
+
+    环境变量指定的文件不存在或为空时继续往下找，因此三个候选都是「可用才生效」。
+    """
     candidates = []
-    env_path = os.getenv("MINCLI_SYSTEM_PROMPT_PATH")
+    env_path = os.getenv(env_var)
     if env_path:
         candidates.append(os.path.expanduser(env_path))
-    candidates.append(USER_SYSTEM_PROMPT_PATH)
-    candidates.append(SYSTEM_PROMPT_PATH)
+    candidates.append(user_path)
+    candidates.append(package_path)
     for path in candidates:
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -245,10 +262,21 @@ def _load_default_system_prompt() -> tuple[str, Optional[str]]:
             continue
         if content:
             return content, path
-    return _FALLBACK_SYSTEM_PROMPT, None
+    return fallback, None
 
 
-DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPT_SOURCE = _load_default_system_prompt()
+DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPT_SOURCE = _load_prompt_file(
+    "MINCLI_SYSTEM_PROMPT_PATH",
+    USER_SYSTEM_PROMPT_PATH,
+    SYSTEM_PROMPT_PATH,
+    _FALLBACK_SYSTEM_PROMPT,
+)
+DEFAULT_MINIMAL_SYSTEM_PROMPT, MINIMAL_SYSTEM_PROMPT_SOURCE = _load_prompt_file(
+    "MINCLI_MINIMAL_SYSTEM_PROMPT_PATH",
+    USER_MINIMAL_SYSTEM_PROMPT_PATH,
+    MINIMAL_SYSTEM_PROMPT_PATH,
+    _FALLBACK_SYSTEM_PROMPT,
+)
 
 
 def load_mcp_servers() -> dict:
