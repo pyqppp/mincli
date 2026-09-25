@@ -157,13 +157,25 @@ class ChatInput(TextArea):
         self.app.action_interrupt()  # type: ignore[attr-defined]
 
     def on_text_area_changed(self, event) -> None:
-        """内容变化时按行数自适应高度（3~8 行）并广播文本变化。"""
+        """内容变化时按视觉行数自适应高度（3~8 行）并广播文本变化。"""
         self._update_height()
         self.post_message(self.TextChanged(self.text))
 
+    def _chrome_rows(self) -> int:
+        """输入框上下「非内容行」数（边框 + 内边距）。
+
+        chat.tcss 里 ChatInput 是 `border: tall` + `padding: 0 1`，上下各占 1 行。
+        高度必须把这 2 行算进去，否则内容会把最后一行挤掉（第一个 Ctrl+J 时
+        lines+1 恰好等于 MIN_INPUT_HEIGHT，看起来就是「没长高、少一行」）。
+        这里从实际样式取，改 CSS 后不需要同步改常量。
+        """
+        gutter = self.styles.gutter
+        return int(gutter.top) + int(gutter.bottom)
+
     def _update_height(self) -> None:
-        lines = self.document.line_count
-        target = min(max(lines + 1, MIN_INPUT_HEIGHT), MAX_INPUT_HEIGHT)
+        # 用视觉行数：TextArea 默认 soft_wrap=True，一个逻辑行折行后可能占多行
+        lines = self.wrapped_document.height
+        target = min(max(lines + self._chrome_rows(), MIN_INPUT_HEIGHT), MAX_INPUT_HEIGHT)
         if target != self._target_height:
             self._target_height = target
             self.styles.height = target
