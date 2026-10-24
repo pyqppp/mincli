@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import os
 
+from rich.cells import cell_len
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
+from textual.strip import Strip
 from textual.widget import Widget
 from textual.widgets import Static, TextArea
 
@@ -134,22 +137,67 @@ class ChatInput(TextArea):
         spans.sort()
         return spans
 
-    def get_line(self, line_index: int) -> Text:
-        """渲染前给引用块上色（Rich Text 层着色，光标/选区/折行都不受影响）。"""
-        line = super().get_line(line_index)
-        chips = getattr(self, "_chips", None)
-        if not chips:
-            return line
+    def _chip_cell_ranges(self, y: int) -> list[tuple[int, int]]:
+        """某显示行上引用块占用的单元格区间（已考虑软换行与横向滚动）。"""
+        try:
+            scroll_x, scroll_y = self.scroll_offset
+            line_index, section_offset = self.wrapped_document._offset_to_line_info[
+                scroll_y + y
+            ]
+        except (AttributeError, IndexError, TypeError):
+            return []
         self._ensure_line_starts()
         if line_index >= len(self._line_starts):
-            return line
-        base = self._line_starts[line_index]
-        end = base + len(line.plain)
+            return []
+        line_start = self._line_starts[line_index]
+        line = self.document.get_line(line_index)
+        width = max(0, self.size.width)
+        section_cell = cell_len(line[:section_offset])
+        ranges: list[tuple[int, int]] = []
         for start, stop in self.chip_spans():
-            left, right = max(start, base), min(stop, end)
-            if left < right:
-                line.stylize(self.CHIP_STYLE, left - base, right - base)
-        return line
+            if stop <= line_start or start >= line_start + len(line):
+                continue
+            left = max(0, start - line_start)
+            right = min(len(line), stop - line_start)
+            start_cell = cell_len(line[:left]) - section_cell - scroll_x
+            end_cell = cell_len(line[:right]) - section_cell - scroll_x
+            if end_cell <= 0 or start_cell >= width:
+                continue
+            ranges.append((max(0, start_cell), min(width, end_cell)))
+        return ranges
+
+    def render_line(self, y: int) -> Strip:
+        """在 TextArea 自己的行渲染之后给引用块上色。
+
+        TextArea 的 Theme 会用 base_style 覆盖整行，因此在 ``get_line`` 里
+        着色会被冲掉；只能等 Strip 生成后，按单元格区间重新贴样式。
+        """
+        strip = super().render_line(y)
+        if not getattr(self, "_chips", None):
+            return strip
+        width = strip.cell_length
+        for start, stop in reversed(self._chip_cell_ranges(y)):
+            start, stop = max(0, min(width, start)), max(0, min(width, stop))
+            if stop <= start:
+                continue
+            pieces: list[Strip] = []
+            if start > 0:
+                pieces.append(strip.crop(0, start))
+            middle = strip.crop(start, stop)
+            pieces.append(
+                Strip(
+                    list(
+                        Segment.apply_style(
+                            middle._segments, post_style=self.CHIP_STYLE
+                        )
+                    ),
+                    middle.cell_length,
+                )
+            )
+            if stop < width:
+                pieces.append(strip.crop(stop, width))
+            strip = Strip.join(pieces)
+        return strip
 
     def insert_chip(self, attachment: Attachment) -> None:
         """在光标处插入一个引用块（前后补空格，避免和文字粘连）。"""

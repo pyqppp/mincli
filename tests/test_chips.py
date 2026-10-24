@@ -73,5 +73,8 @@ async def test_chip_line_is_styled():
     async with app.run_test():
         widget = app.query_one("#input", ChatInput)
         widget.insert_chip(_attachment())
-        line = widget.get_line(0)
-        assert line.spans, "引用块应当被着色"
+        strip = widget.render_line(0)
+        styles = [segment.style for segment in strip._segments if segment.text == "[DOCX 报告.docx]"]
+        assert styles, "引用块应当单独成段"
+        assert styles[0].color.name == "bright_cyan"
+        assert styles[0].bgcolor.name == "grey27"
