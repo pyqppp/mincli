@@ -1,10 +1,11 @@
 """ChatController 单元测试（fake OpenAI client，不联网）。
 
-运行：`venv/bin/python -m tests.test_controller`
+运行：`python3 -m pytest -q tests/test_controller.py`
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -12,25 +13,53 @@ import tempfile
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from mincli.attachments import KIND_DOCUMENT, KIND_IMAGE, Attachment
+from mincli.config import MODEL_FLASH, MODEL_PRO, Config
 from mincli.controller import ChatController, ControllerEvent
-from mincli.tools.images import estimate_image_tokens
+from mincli.tools.images import estimate_image_tokens, make_path_attachment
 
 PASS = 0
 FAIL = 0
 
 _TMP = tempfile.mkdtemp(prefix="mincli_test_")
 
+# 所有配置写回都落在临时目录，绝不碰用户主目录（_save_config 读这两个环境变量）
+os.environ["MINCLI_CONFIG_PATH"] = os.path.join(_TMP, "config.toml")
+os.environ["MINCLI_PROMPT_PATH"] = os.path.join(_TMP, "prompt.md")
+
+
+def make_config(
+    files_mode: str = "read",
+    web_enabled: bool = True,
+    recall_enabled: bool = False,
+) -> Config:
+    """测试用配置：附件与提示词都指向临时目录。"""
+    return Config(
+        model=MODEL_FLASH,
+        temperature=1.0,
+        files_mode=files_mode,
+        web_enabled=web_enabled,
+        recall_enabled=recall_enabled,
+        attachment_dir=os.path.join(_TMP, "attachments"),
+        prompt_file=os.path.join(_TMP, "prompt.md"),
+    )
+
 
 def check(name: str, cond: bool) -> None:
+    """记录并打印一条断言；在 pytest 下失败即抛出，避免测试静默通过。"""
     global PASS, FAIL
     if cond:
         PASS += 1
         print(f"  PASS  {name}")
-    else:
-        FAIL += 1
-        print(f"  FAIL  {name}")
+        return
+    FAIL += 1
+    print(f"  FAIL  {name}")
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        raise AssertionError(name)
 
 
 # ---------------- fake OpenAI ----------------
@@ -149,11 +178,14 @@ class TestController(ChatController):
     """
 
     TREES_DIR = os.path.join(_TMP, "trees")
-    WORKFLOWS_FILE = os.path.join(_TMP, "workflows.json")
 
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("trees_dir", self.TREES_DIR)
-        super().__init__(*args, **kwargs)
+    def __init__(self, client, config=None, default_system=None, trees_dir=None):
+        super().__init__(
+            client,
+            config=config or make_config(),
+            default_system=default_system,
+            trees_dir=trees_dir or self.TREES_DIR,
+        )
         if not self.has_trees:
             self.create_tree()
 
@@ -164,14 +196,34 @@ class TestController(ChatController):
         os.makedirs(cls.TREES_DIR, exist_ok=True)
 
 
-def collect(ctrl, text):
+@pytest.fixture(autouse=True)
+def _fresh_trees():
+    """每个用例前后清空对话树目录：树是持久化的，不隔离会互相污染。"""
+    TestController.reset_store()
+    yield
+    TestController.reset_store()
+
+
+def _image_attachment(path: str, detail: str = "auto") -> Attachment:
+    """把本地图片包成 send_message 需要的 Attachment。"""
+    image = make_path_attachment(path, detail)
+    return Attachment(
+        kind=KIND_IMAGE,
+        name=image.name,
+        path=image.source,
+        image=image,
+        attachment_id="img-" + os.path.basename(path),
+    )
+
+
+def collect(ctrl, text, attachments=None):
     """调用 send_message 并收集事件。"""
     events = []
 
     def emit(ev: ControllerEvent):
         events.append(ev)
 
-    node = ctrl.send_message(text, emit)
+    node = ctrl.send_message(text, emit, attachments=attachments)
     return node, events
 
 
@@ -185,7 +237,9 @@ def test_simple_qa():
         ],
         FakeChatResponse(content="测试标题"),
     ]
-    ctrl = TestController(FakeClient(script), default_system="你是助手", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(
+        FakeClient(script), config=make_config(), default_system="你是助手"
+    )
     node, events = collect(ctrl, "打个招呼")
     check("返回节点", node is not None)
     check("节点内容", node.assistant_msg == "你好，世界！")
@@ -206,43 +260,197 @@ def test_simple_qa():
 
 
 def test_tool_round():
-    print("== 工具调用轮（write_file → 继续问答） ==")
+    print("== 工具调用轮（read_file → 继续问答） ==")
+    target = os.path.join(_TMP, "tool_round.txt")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("第一行\n第二行\n第三行\n")
     tool_chunks = [
         FakeChunk(
             tool_calls=[
                 FakeToolCall(
                     index=0,
                     id="call_1",
-                    name="write_file",
-                    arguments='{"filepath": "/tmp/mincli_test.txt", "content": "hi"}',
+                    name="read_file",
+                    arguments=json.dumps({"path": target, "offset": 2, "limit": 1}),
                 )
             ]
         )
     ]
-    content_chunks = [FakeChunk(content="文件已写入。")]
-    script = [tool_chunks, content_chunks, FakeChatResponse(content="写文件测试")]
-    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    ctrl.confirm = lambda title, text: True  # 允许确认
-    node, events = collect(ctrl, "帮我写个文件")
+    content_chunks = [FakeChunk(content="文件读完了。")]
+    script = [tool_chunks, content_chunks, FakeChatResponse(content="读文件测试")]
+    ctrl = TestController(FakeClient(script), config=make_config(files_mode="read"))
+    node, events = collect(ctrl, "帮我读个文件")
     check("工具轮返回节点", node is not None)
-    check("最终回答", node.assistant_msg == "文件已写入。")
+    check("最终回答", node.assistant_msg == "文件读完了。")
     tool_events = [e for e in events if e.kind == "tool"]
     check("工具事件成对（开始+结果）", len(tool_events) == 2)
-    check("工具名正确", tool_events[0].tool_name == "write_file")
-    check("工具结果摘要", tool_events[1].tool_summary == "写文件工具不可用")
+    check("工具名正确", tool_events[0].tool_name == "read_file")
+    check("工具结果摘要", tool_events[1].tool_summary.startswith("文件："))
     # 验证发给模型的消息包含 tool 结果
     calls = ctrl.client.chat.completions.calls
     msgs2 = calls[1]["messages"]
     roles = [m["role"] for m in msgs2]
     check("第二轮消息含 assistant+tool", "assistant" in roles and "tool" in roles)
     check("tool 消息携带 tool_call_id", any(m.get("tool_call_id") == "call_1" for m in msgs2 if m["role"] == "tool"))
+    check("工具结果含文件内容", any("第二行" in str(m.get("content")) for m in msgs2 if m["role"] == "tool"))
     check("工具轮消息写入节点", bool(node.tool_messages))
+
+
+def test_tool_gating_matrix():
+    print("== 工具门控矩阵：files_mode × 联网 × 树查询 ==")
+    file_names = {
+        "off": set(),
+        "read": {"read_file", "list_directory"},
+        "confirm": {"read_file", "list_directory", "write_file", "edit_file"},
+        "direct": {"read_file", "list_directory", "write_file", "edit_file"},
+    }
+    web_tools = {"web_search", "web_fetch"}
+    recall_tools = {"query_conversation_tree", "read_conversation_nodes"}
+
+    for mode in ("off", "read", "confirm", "direct"):
+        for web_on in (False, True):
+            for recall_on in (False, True):
+                cfg = make_config(
+                    files_mode=mode,
+                    web_enabled=web_on,
+                    recall_enabled=recall_on,
+                )
+                ctrl = TestController(FakeClient([]), config=cfg)
+                names = {t["function"]["name"] for t in ctrl.llm_tools}
+                expected = set(file_names[mode])
+                if web_on:
+                    expected |= web_tools
+                if recall_on:
+                    expected |= recall_tools
+                check(
+                    f"门控 {mode} / web={web_on} / recall={recall_on}",
+                    names == expected,
+                )
+
+    off_ctrl = TestController(
+        FakeClient([]), config=make_config("off", web_enabled=False, recall_enabled=False)
+    )
+    check("off 且无附件时工具列表为空", off_ctrl.llm_tools == [])
+
+
+def test_send_with_attachment_persists():
+    print("== 附件发送：元数据 / 落盘 / read_attachment 续读 ==")
+    script = [
+        [FakeChunk(content="看过了", usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2))],
+        FakeChatResponse(content="附件标题"),
+    ]
+    ctrl = TestController(FakeClient(script), config=make_config(files_mode="off"))
+    text = "第一行\n第二行\n第三行"
+    att = Attachment(
+        kind=KIND_DOCUMENT,
+        name="a.txt",
+        path=os.path.join(_TMP, "a.txt"),
+        text=text,
+        attachment_id="a1",
+    )
+    node, events = collect(ctrl, "看看", attachments=[att])
+    check("返回节点", node is not None)
+    check("正文仍由调用方拼好", node.user_msg == "看看")
+    check("附件元数据写入节点", len(node.attachments) == 1)
+    meta = node.attachments[0]
+    check("元数据字段完整", meta["id"] == "a1" and meta["name"] == "a.txt"
+          and meta["kind"] == KIND_DOCUMENT)
+    check("元数据记录行数与字符数", meta["lines"] == 3 and meta["chars"] == len(text))
+    stored = os.path.join(ctrl.config.attachment_dir, "a1.txt")
+    check("正文落盘到 attachment_dir", os.path.exists(stored))
+    with open(stored, "r", encoding="utf-8") as f:
+        check("落盘内容与附件一致", f.read() == text)
+    check("元数据带落盘路径", meta["stored_path"] == stored)
+    names = {t["function"]["name"] for t in ctrl.llm_tools}
+    check("有附件时下发 read_attachment（与 files_mode=off 无关）",
+          "read_attachment" in names and "read_file" not in names)
+    out = ctrl._run_tool(
+        "read_attachment",
+        {"name": "a.txt", "offset": 2, "limit": 1},
+        lambda ev: None,
+        node,
+    )
+    check("read_attachment 能续读", "第二行" in out and "第 2-2 行" in out)
+    check("续读提示下一段 offset", "offset=3" in out)
+
+
+def test_write_confirmation():
+    print("== 写文件确认：confirm 拒绝 / direct 直写 / off 不下发 ==")
+    target = os.path.join(_TMP, "write_confirm.txt")
+    if os.path.exists(target):
+        os.remove(target)
+
+    confirm_ctrl = TestController(FakeClient([]), config=make_config("confirm"))
+    asked = []
+
+    def _deny(title, text):
+        asked.append(title)
+        return False
+
+    confirm_ctrl.confirm = _deny
+    confirm_ctrl.tree.create_root("q", "a", "", "t", 0, 0)
+    node = confirm_ctrl.tree.current_node
+    out = confirm_ctrl._run_tool(
+        "write_file", {"path": target, "content": "hi"},
+        lambda ev: None, node,
+    )
+    check("confirm 模式先询问", asked == ["确认写入"])
+    check("confirm 拒绝时不写文件", not os.path.exists(target))
+    check("confirm 拒绝返回取消文案", "取消" in out)
+
+    confirm_ctrl.confirm = lambda title, text: True
+    out = confirm_ctrl._run_tool(
+        "write_file", {"path": target, "content": "hi"},
+        lambda ev: None, node,
+    )
+    check("confirm 同意后写文件", os.path.exists(target) and "已写入" in out)
+    with open(target, "r", encoding="utf-8") as f:
+        check("写文件内容正确", f.read() == "hi")
+
+    direct_target = os.path.join(_TMP, "write_direct.txt")
+    if os.path.exists(direct_target):
+        os.remove(direct_target)
+    direct_ctrl = TestController(FakeClient([]), config=make_config("direct"))
+    direct_asked = []
+    direct_ctrl.confirm = lambda title, text: direct_asked.append(title) or False
+    direct_ctrl.tree.create_root("q", "a", "", "t", 0, 0)
+    direct_out = direct_ctrl._run_tool(
+        "write_file", {"path": direct_target, "content": "direct"},
+        lambda ev: None, direct_ctrl.tree.current_node,
+    )
+    check("direct 模式直接写文件",
+          os.path.exists(direct_target) and "已写入" in direct_out)
+    check("direct 模式不弹确认", direct_asked == [])
+
+    off_ctrl = TestController(FakeClient([]), config=make_config("off"))
+    off_names = {t["function"]["name"] for t in off_ctrl.llm_tools}
+    check("off 模式不下发 write_file/edit_file",
+          "write_file" not in off_names and "edit_file" not in off_names)
+
+
+def test_web_disabled_hides_tools():
+    print("== 联网关闭时不下发搜索/抓取 ==")
+    disabled = TestController(
+        FakeClient([]), config=make_config("read", web_enabled=False)
+    )
+    disabled_names = {t["function"]["name"] for t in disabled.llm_tools}
+    check("web_enabled=False 时没有 web_search/web_fetch",
+          "web_search" not in disabled_names and "web_fetch" not in disabled_names)
+    check("文件只读工具仍可用",
+          {"read_file", "list_directory"} <= disabled_names)
+
+    enabled = TestController(
+        FakeClient([]), config=make_config("read", web_enabled=True)
+    )
+    enabled_names = {t["function"]["name"] for t in enabled.llm_tools}
+    check("web_enabled=True 时下发 web_search/web_fetch",
+          {"web_search", "web_fetch"} <= enabled_names)
 
 
 def test_api_error():
     print("== API 错误处理（节点保留，可继续） ==")
     script = [RuntimeError("connection reset")]
-    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient(script), config=make_config())
     node, events = collect(ctrl, "hello")
     check("返回已保存的节点（不再回滚）", node is not None and ctrl.tree.root is node)
     check("节点仍是当前节点", ctrl.tree.current_node is node and node.id in ctrl.tree.nodes)
@@ -280,7 +488,7 @@ def test_partial_save_on_error():
 
     ctrl = TestController(
         FakeClient([_chunks_then_raise()]),
-        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+        config=make_config(),
     )
     node, events = collect(ctrl, "写个长回答")
     check("中断节点已保存", node is not None and node.id in ctrl.tree.nodes)
@@ -315,7 +523,7 @@ def test_partial_save_on_error():
     # 中断标记与部分回答随会话持久化（重启后仍能看到并继续）
     check("保存带中断标记的会话", ctrl.save_session())
     ctrl_reload = TestController(
-        FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+        FakeClient([]), config=make_config(),
     )
     reloaded = ctrl_reload.tree.nodes.get(node.id)
     check("重载后部分回答仍在",
@@ -327,14 +535,17 @@ def test_partial_save_on_error():
 
 def test_tool_round_partial_save():
     print("== 工具轮之后中断：工具结果一并保存 ==")
+    target = os.path.join(_TMP, "tool_partial.txt")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("检索到的资料\n")
     tool_chunks = [
         FakeChunk(
             tool_calls=[
                 FakeToolCall(
                     index=0,
                     id="call_9",
-                    name="write_file",
-                    arguments='{"filepath": "/tmp/mincli_p.txt", "content": "hi"}',
+                    name="read_file",
+                    arguments=json.dumps({"path": target}),
                 )
             ],
             usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3),
@@ -347,10 +558,9 @@ def test_tool_round_partial_save():
 
     ctrl = TestController(
         FakeClient([tool_chunks, _answer_then_raise()]),
-        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+        config=make_config(files_mode="read"),
     )
-    ctrl.confirm = lambda title, text: True
-    node, events = collect(ctrl, "帮我写文件再总结")
+    node, events = collect(ctrl, "帮我读文件再总结")
     check("工具轮后中断的节点保留", node is not None and node.assistant_msg == "基于检索结果，")
     check("已完成的工具轮写入节点", bool(node.tool_messages))
     check("工具轮 token 用量保留", node.input_tokens >= 7 and node.output_tokens >= 3)
@@ -371,30 +581,19 @@ def test_session_roundtrip():
     print("== 会话持久化 ==")
     TestController.reset_store()
     script = [[FakeChunk(content="第一轮")], FakeChatResponse(content="标题A")]
-    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient(script), config=make_config())
     check("首次无已存会话", not ctrl.session_loaded)
     collect(ctrl, "第一问")
     check("save_session 成功", ctrl.save_session())
     check("文件已写入", os.path.exists(os.path.join(TestController.TREES_DIR, "1.json")))
 
     script2 = [[FakeChunk(content="第二轮")], FakeChatResponse(content="标题B")]
-    ctrl2 = TestController(FakeClient(script2), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl2 = TestController(FakeClient(script2), config=make_config())
     check("重新加载会话", ctrl2.session_loaded)
     check("树已恢复", ctrl2.tree.root is not None and ctrl2.tree.root.title == "标题A")
     node, _ = collect(ctrl2, "第二问")
     check("在已有树上追加节点", node is not None and node.parent_id is not None and node.id != "main")
     TestController.reset_store()
-
-
-def test_import_target():
-    print("== /import 导入 ==")
-    src = os.path.join(_TMP, "sample.txt")
-    with open(src, "w", encoding="utf-8") as f:
-        f.write("导入的上下文内容")
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    check("导入文件成功", ctrl.import_target(src) is None)
-    check("imported_content 已设置", ctrl.imported_content is not None and "导入的上下文内容" in ctrl.imported_content)
-    check("导入不存在文件返回错误", ctrl.import_target("/nonexistent/xxx.md") is not None)
 
 
 def test_path_args():
@@ -423,44 +622,9 @@ def test_path_args():
           isinstance(split_path_args('"/tmp/unclosed'), list))
 
 
-def test_import_multi():
-    print("== /import 多文件混合（图片+文本） ==")
-    a_txt = os.path.join(_TMP, "multi_a.txt")
-    b_md = os.path.join(_TMP, "multi_b.md")
-    png = _make_png(os.path.join(_TMP, "multi.png"))
-    with open(a_txt, "w", encoding="utf-8") as f:
-        f.write("文本一")
-    with open(b_md, "w", encoding="utf-8") as f:
-        f.write("文本二")
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    res = ctrl.import_targets([a_txt, png, b_md])
-    check("混合导入无错误", not res["errors"])
-    check("图片计数", res["images_added"] == 1 and len(ctrl.pending_images) == 1)
-    check("文本计数", res["text_added"] == 2 and len(ctrl.imported_files) == 2)
-    check("内容拼接", "文本一" in ctrl.imported_content and "文本二" in ctrl.imported_content)
-    summary = ctrl.import_summary()
-    check("状态栏含数量与前2文件名", "已导入 3 个文件" in summary and "multi_a.txt" in summary and "multi.png" in summary)
-    check("第3个文件名省略", "multi_b.md" not in summary and "…" in summary)
-    items = ctrl.import_file_list()
-    check("完整列表含全部", len(items) == 3 and items[0]["kind"] == "image")
-    check("清除导入", ctrl.clear_imports() == 3 and not ctrl.pending_images and not ctrl.imported_files)
-
-    # 发送：文本导入随消息附带并清空，图片绑定到节点
-    script = [
-        [FakeChunk(content="好", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
-        FakeChatResponse(content="标题"),
-    ]
-    ctrl2 = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    ctrl2.import_targets([a_txt, png])
-    node, _ = collect(ctrl2, "结合以上内容回答")
-    check("发送后文本导入清空", ctrl2.imported_content is None and not ctrl2.imported_files)
-    check("图片已绑定到节点", node is not None and node.user_images and node.user_images[0].name == "multi.png")
-    check("发送后待发送图片清空", not ctrl2.pending_images)
-
-
 def test_delete_nodes():
     print("== 批量删除 /delete a1 b3 g5 ==")
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient([]), config=make_config())
     ctrl.tree.create_root("根", "回", "", "根", 1, 1)
     a1 = ctrl.tree.add_child(ctrl.tree.root, "q", "a", "", "t", 1, 1)
     a2 = ctrl.tree.add_child(a1, "q", "a", "", "t", 1, 1)
@@ -481,7 +645,7 @@ def test_delete_nodes():
     check("根节点跳过", res2["deleted"] == [b1.id] and res2["skipped"] == ["main"] and ctrl.tree.root is not None)
 
     # 删除摘要节点后压缩状态清除（避免悬挂）
-    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl2 = TestController(FakeClient([]), config=make_config())
     ctrl2.tree.create_root("根", "回", "", "根", 1, 1)
     s = ctrl2.tree.add_child(ctrl2.tree.root, "摘要", "", "", "上下文压缩摘要", 0, 0)
     ctrl2.tree.compaction = {"summary": "摘要", "boundary_id": s.id}
@@ -491,17 +655,21 @@ def test_delete_nodes():
 
 
 def test_settings():
-    print("== 设置 ==")
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    check("切换模型 flash", ctrl.set_model("flash") and ctrl.current_model.endswith("flash"))
-    check("切换模型 pro", ctrl.set_model("pro") and ctrl.current_model.endswith("pro"))
-    check("非法模型拒绝", not ctrl.set_model("turbo"))
-    check("effort 校验", ctrl.set_effort("max") and not ctrl.set_effort("extreme"))
-    check("audit 校验", ctrl.set_audit(4) and not ctrl.set_audit(9))
+    print("== 设置：温度 / 思考 / 推理强度 / 模型 ==")
+    ctrl = TestController(FakeClient([]), config=make_config())
+    ctrl.set_temperature(0.3)
+    check("温度写入运行时", ctrl.current_temperature == 0.3)
+    check("温度写入配置", ctrl.config.temperature == 0.3)
     ctrl.set_thinking(True)
-    check("thinking 设置", ctrl.thinking_enabled)
-    ctrl.set_system("新系统提示词")
-    check("system 同步到树", ctrl.current_system == "新系统提示词" and ctrl.tree.system_prompt == "新系统提示词")
+    check("thinking 设置", ctrl.thinking_enabled and ctrl.config.thinking is True)
+    check("effort 校验", ctrl.set_effort("max") and not ctrl.set_effort("extreme"))
+    check("effort 写入运行时与配置",
+          ctrl.reasoning_effort == "max" and ctrl.config.effort == "max")
+    check("切换模型 flash", ctrl.set_model("flash") and ctrl.current_model == MODEL_FLASH)
+    check("切换模型 pro", ctrl.set_model("pro") and ctrl.current_model == MODEL_PRO)
+    check("切回 flash", ctrl.set_model("flash") and ctrl.current_model == MODEL_FLASH)
+    check("非法模型拒绝", not ctrl.set_model("turbo") and ctrl.current_model == MODEL_FLASH)
+    check("模型写入配置", ctrl.config.model == MODEL_FLASH)
 
 
 def test_compact():
@@ -516,7 +684,7 @@ def test_compact():
     script.append(FakeChatResponse(content="【摘要】目标X；已执行命令Y；待办Z。"))
     script.append([FakeChunk(content="回答新：" + "新内容" * 60)])
     script.append(FakeChatResponse(content="标题新"))
-    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient(script), config=make_config())
     for i in range(1, 6):
         collect(ctrl, f"问题{i}")
 
@@ -584,14 +752,14 @@ def test_compact():
 
     # 压缩随会话持久化
     ctrl.save_session()
-    ctrl3 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3 = TestController(FakeClient([]), config=make_config())
     check("重载后压缩仍在", ctrl3.session_loaded and ctrl3.tree.compaction is not None)
     TestController.reset_store()
 
     # 空会话无可压缩内容
     ctrl2 = TestController(
         FakeClient([]),
-        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+        config=make_config(),
     )
     check("空会话返回 None", ctrl2.compact_history() is None)
 
@@ -618,15 +786,19 @@ def test_multimodal():
         [FakeChunk(content="图", usage=SimpleNamespace(prompt_tokens=100, completion_tokens=5))],
         FakeChatResponse(content="图题"),
     ]
-    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient(script), config=make_config())
     events = []
-    added, errors = ctrl.add_pending_images([png])
-    check("添加图片成功", added == 1 and not errors)
-    node = ctrl.send_message("描述图片", events.append)
+    node = ctrl.send_message(
+        "描述图片", events.append, attachments=[_image_attachment(png)]
+    )
     check("发送成功", node is not None)
     check("file_id 已写入节点", node.user_images[0].file_id == "file-api-0")
-    check("Flash 原生支持图片（模型不切换）", ctrl.current_model == "deepseek-flash")
+    check("Flash 原生支持图片（模型不切换）", ctrl.current_model == MODEL_FLASH)
     check("上传调用 1 次", len(ctrl.client.files.calls) == 1)
+    check("附件元数据写入节点", len(node.attachments) == 1
+          and node.attachments[0]["kind"] == KIND_IMAGE)
+    check("发图片后工具列表含 read_attachment",
+          "read_attachment" in {t["function"]["name"] for t in ctrl.llm_tools})
     sent = ctrl.client.chat.completions.calls[0]["messages"]
     blocks = sent[-1]["content"]
     check("消息为块数组", isinstance(blocks, list) and blocks[0]["type"] == "text")
@@ -640,10 +812,11 @@ def test_multimodal():
         [FakeChunk(content="ok", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
         FakeChatResponse(content="标题2"),
     ]
-    ctrl2 = TestController(FakeClient(script2, files_fail=True), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl2 = TestController(FakeClient(script2, files_fail=True), config=make_config())
     events2 = []
-    ctrl2.add_pending_images([png])
-    node2 = ctrl2.send_message("看图", events2.append)
+    node2 = ctrl2.send_message(
+        "看图", events2.append, attachments=[_image_attachment(png)]
+    )
     check("回退发送成功", node2 is not None and node2.user_images[0].file_id is None)
     sent2 = ctrl2.client.chat.completions.calls[0]["messages"]
     blocks2 = sent2[-1]["content"]
@@ -661,41 +834,42 @@ def test_multimodal():
     ]
     # 独立场景：清空树目录，保证 ctrl3 从空树开始（前两个控制器已把树落盘）
     TestController.reset_store()
-    ctrl3 = TestController(FakeClient(script3), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3 = TestController(FakeClient(script3), config=make_config())
     ctrl3.current_model = "gpt-4o"
     events3 = []
-    ctrl3.add_pending_images([png])
-    node3 = ctrl3.send_message("看图", events3.append)
+    node3 = ctrl3.send_message(
+        "看图", events3.append, attachments=[_image_attachment(png)]
+    )
     check("自定义模型被拒但节点保留", node3 is not None and "不支持图片" in node3.error)
-    check("图片保留在中断节点里（不再重复放回待发送）",
-          len(ctrl3.pending_images) == 0 and len(node3.user_images) == 1)
+    check("图片保留在中断节点里", len(node3.user_images) == 1)
     check("发出 error 事件（提示不支持图片）", any(
         e.kind == "error" and "不支持图片" in e.message for e in events3
     ))
     check("节点留在树中", node3.id in ctrl3.tree.nodes and ctrl3.tree.root is node3)
 
     # 3b) Pro 不支持图片 → 提示手动切换，且不自动改模型
-    ctrl3b = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3b = TestController(FakeClient([]), config=make_config())
     ctrl3b.set_model("pro")
     events3b = []
-    ctrl3b.add_pending_images([png])
-    node3b = ctrl3b.send_message("看图", events3b.append)
+    node3b = ctrl3b.send_message(
+        "看图", events3b.append, attachments=[_image_attachment(png)]
+    )
     check("Pro 收到图片被拒但节点保留",
-          node3b is not None and ctrl3b.current_model == "deepseek-v4-pro")
+          node3b is not None and ctrl3b.current_model == MODEL_PRO)
     check("Pro 提示切到 flash", any(
-        e.kind == "error" and "/set model flash" in e.message for e in events3b
+        e.kind == "error" and "/model flash" in e.message for e in events3b
     ))
-    check("Pro 图片保留在中断节点里",
-          len(ctrl3b.pending_images) == 0 and len(node3b.user_images) == 1)
+    check("Pro 图片保留在中断节点里", len(node3b.user_images) == 1)
 
     # 4) 历史重放：第一轮回退 base64，第二轮补传 → file 块
     script4 = [
         [FakeChunk(content="a", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
         FakeChatResponse(content="题A"),
     ]
-    c4 = TestController(FakeClient(script4, files_fail=True), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    c4.add_pending_images([png])
-    n1 = c4.send_message("图一", lambda e: None)
+    c4 = TestController(FakeClient(script4, files_fail=True), config=make_config())
+    n1 = c4.send_message(
+        "图一", lambda e: None, attachments=[_image_attachment(png)]
+    )
     check("第一轮回退成功", n1 is not None)
     c4.client.files.fail = False
     c4.client.chat.completions.script = [
@@ -712,23 +886,18 @@ def test_multimodal():
     ))
     check("补传后 file_id 写入", n1.user_images[0].file_id == "file-api-0")
 
-    # 5) import_target 图片路由
-    c5 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    check("import 图片 → 待发送", c5.import_target(png) is None
-          and len(c5.pending_images) == 1 and c5.imported_content is None)
-    check("import 缺失文件报错", c5.import_target("/nonexistent/x.md") is not None)
-
-    # 6) 文件管理 + 节点删除清理
+    # 5) 文件管理 + 节点删除清理
     script6 = [
         [FakeChunk(content="a", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
         FakeChatResponse(content="题A"),
         [FakeChunk(content="b", usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1))],
         FakeChatResponse(content="题B"),
     ]
-    c6 = TestController(FakeClient(script6, files_script=["file-api-abc"]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c6 = TestController(FakeClient(script6, files_script=["file-api-abc"]), config=make_config())
     n6a = c6.send_message("第一问", lambda e: None)
-    c6.add_pending_images([png])
-    n6b = c6.send_message("看图", lambda e: None)
+    n6b = c6.send_message(
+        "看图", lambda e: None, attachments=[_image_attachment(png)]
+    )
     check("上传取脚本 id", n6b.user_images[0].file_id == "file-api-abc")
     files = c6.files_list()
     check("files_list 返回文件", len(files["items"]) == 1
@@ -749,21 +918,23 @@ def test_multimodal():
         [FakeChunk(content="x", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
         FakeChatResponse(content="题"),
     ]
-    c7 = TestController(FakeClient(script7), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    c7.add_pending_images([png])
-    n7 = c7.send_message("图", lambda e: None)
+    c7 = TestController(FakeClient(script7), config=make_config())
+    n7 = c7.send_message(
+        "图", lambda e: None, attachments=[_image_attachment(png)]
+    )
     check("压缩用例发送成功", n7 is not None)
     src = c7._build_compact_source([n7])
     check("压缩源含图片占位", "[图片: m.png (800x600)]" in src)
 
     # 8) 会话持久化保留附件（路径与 file_id，不含 base64）
     TestController.reset_store()
-    c8 = TestController(FakeClient(script6, files_script=["file-api-persist"]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    c8.add_pending_images([png])
-    n8 = c8.send_message("图", lambda e: None)
+    c8 = TestController(FakeClient(script6, files_script=["file-api-persist"]), config=make_config())
+    n8 = c8.send_message(
+        "图", lambda e: None, attachments=[_image_attachment(png)]
+    )
     check("持久化前 file_id", n8.user_images[0].file_id == "file-api-persist")
     c8.save_session()
-    c8b = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c8b = TestController(FakeClient([]), config=make_config())
     check("重载后附件保留", c8b.session_loaded
           and c8b.tree.current_node is not None
           and c8b.tree.current_node.user_images
@@ -771,13 +942,13 @@ def test_multimodal():
     TestController.reset_store()
 
     # 9) set_detail 校验
-    c9 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    c9 = TestController(FakeClient([]), config=make_config())
     check("set_detail low", c9.set_detail("low") and c9.image_detail == "low")
     check("set_detail 非法拒绝", not c9.set_detail("huge"))
-    check("set_model vision 别名 → flash", c9.set_model("vision") and c9.current_model == "deepseek-flash")
+    check("set_model vision 别名 → flash", c9.set_model("vision") and c9.current_model == MODEL_FLASH)
     check("旧名 deepseek-v4-flash 改写为 flash",
-          c9.set_model("deepseek-v4-flash") and c9.current_model == "deepseek-flash")
-    check("set_model pro", c9.set_model("pro") and c9.current_model == "deepseek-v4-pro")
+          c9.set_model("deepseek-v4-flash") and c9.current_model == MODEL_FLASH)
+    check("set_model pro", c9.set_model("pro") and c9.current_model == MODEL_PRO)
 
     # 10) detail=low → 内联发送（file 块没有 detail 字段，只有内联才真正生效）
     TestController.reset_store()
@@ -785,17 +956,12 @@ def test_multimodal():
         [FakeChunk(content="ok", usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))],
         FakeChatResponse(content="标题10"),
     ]
-    c10 = TestController(FakeClient(script10), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    c10.add_pending_images([png])
-    hint = c10.images_tokens_hint()
-    check("导入后有 token 估算提示", "图片约" in hint and "tokens" in hint)
-    check("状态栏含 token 估算", "图片约" in c10.import_summary())
-    check("set_detail 改写待发送图片的 detail", c10.set_detail("low"))
-    check("待发送图片 detail 已改写", c10.pending_images[0].detail == "low")
-    check("待发送图片重算 token", c10.pending_images[0].tokens_est
-          == estimate_image_tokens(800, 600, "low"))
+    c10 = TestController(FakeClient(script10), config=make_config())
+    att10 = _image_attachment(png, detail="low")
+    check("low 档图片 token 估算",
+          att10.image.tokens_est == estimate_image_tokens(800, 600, "low"))
     events10 = []
-    n10 = c10.send_message("看图", events10.append)
+    n10 = c10.send_message("看图", events10.append, attachments=[att10])
     check("low 档不上传 Files API", n10.user_images[0].file_id is None
           and not c10.client.files.calls)
     blocks10 = c10.client.chat.completions.calls[0]["messages"][-1]["content"]
@@ -817,11 +983,10 @@ def test_multimodal():
         FakeChatResponse(content="标题11"),
     ]
     c11 = TestController(FakeClient(script11, files_script=["file-api-big"]),
-                         default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    c11.add_pending_images([big])
-    c11.set_detail("low")
+                         config=make_config())
+    att11 = _image_attachment(big, detail="low")
     events11 = []
-    n11 = c11.send_message("大图", events11.append)
+    n11 = c11.send_message("大图", events11.append, attachments=[att11])
     check("超内联上限的 low 图仍上传", n11.user_images[0].file_id == "file-api-big")
     check("提示 detail 将被忽略", any(
         e.kind == "status" and "detail 将被忽略" in e.message for e in events11))
@@ -834,13 +999,15 @@ def test_multimodal():
         [FakeChunk(content="b", usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))],
         FakeChatResponse(content="题B"),
     ]
-    c12 = TestController(FakeClient(script12), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    c12.add_pending_images([png])
-    n12 = c12.send_message("树1看图", lambda e: None)
+    c12 = TestController(FakeClient(script12), config=make_config())
+    n12 = c12.send_message(
+        "树1看图", lambda e: None, attachments=[_image_attachment(png)]
+    )
     ref1 = n12.user_images[0].file_id
-    second = c12.create_tree(activate=True)  # 另一棵树里也传一张
-    c12.add_pending_images([png])
-    n12b = c12.send_message("树2看图", lambda e: None)
+    c12.create_tree()  # 另一棵树里也传一张
+    n12b = c12.send_message(
+        "树2看图", lambda e: None, attachments=[_image_attachment(png)]
+    )
     ref2 = n12b.user_images[0].file_id
     c12.client.files.created.append({"id": "file-api-orphan", "name": "orphan.png"})
     res12 = c12.files_clean()
@@ -866,7 +1033,7 @@ def test_usage_stats():
             prompt_cache_hit_tokens=180, prompt_cache_miss_tokens=20))],
         FakeChatResponse(content="标题2"),
     ]
-    ctrl = TestController(FakeClient(script), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient(script), config=make_config())
     collect(ctrl, "问题1")
     collect(ctrl, "问题2")
 
@@ -900,20 +1067,22 @@ def test_usage_stats():
     node.last_prompt_tokens, node.last_output_tokens = saved
 
     # 多轮工具调用：状态条用「最后一次请求」，页脚仍显示整轮累加
+    target = os.path.join(_TMP, "usage_tool.txt")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("资料\n")
     tool_round = [FakeChunk(
         tool_calls=[FakeToolCall(
-            index=0, id="call_1", name="write_file",
-            arguments='{"filepath": "/tmp/mincli_test.txt", "content": "hi"}',
+            index=0, id="call_1", name="read_file",
+            arguments=json.dumps({"path": target}),
         )],
         usage=SimpleNamespace(prompt_tokens=500, completion_tokens=40,
                               prompt_cache_hit_tokens=0, prompt_cache_miss_tokens=500),
     )]
-    answer_round = [FakeChunk(content="写好了。", usage=SimpleNamespace(
+    answer_round = [FakeChunk(content="读好了。", usage=SimpleNamespace(
         prompt_tokens=900, completion_tokens=50,
         prompt_cache_hit_tokens=800, prompt_cache_miss_tokens=100))]
     ctrl.client.chat.completions.script = [tool_round, answer_round, FakeChatResponse(content="标题3")]
-    ctrl.confirm = lambda title, text: True
-    node3, _ = collect(ctrl, "帮我写文件")
+    node3, _ = collect(ctrl, "帮我读文件")
     check("多轮：页脚=各轮累加", node3.input_tokens == 1400 and node3.output_tokens == 90)
     check("多轮：最后一次请求单独记录", node3.last_prompt_tokens == 900 and node3.last_output_tokens == 50)
     check("多轮：下次输入用最后一次请求",
@@ -921,9 +1090,8 @@ def test_usage_stats():
 
     # 会话持久化保留缓存统计
     ctrl.tree.current_node = node
-    TestController.reset_store()
     ctrl.save_session()
-    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl2 = TestController(FakeClient([]), config=make_config())
     check("重载后缓存统计保留", ctrl2.tree.current_node is not None
           and ctrl2.tree.current_node.cache_hit_tokens == 180
           and ctrl2.tree.current_node.cache_miss_tokens == 20)
@@ -933,120 +1101,10 @@ def test_usage_stats():
     TestController.reset_store()
 
     # 无节点时返回默认值
-    ctrl3 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl3 = TestController(FakeClient([]), config=make_config())
     stats3 = ctrl3.usage_stats()
     check("无节点显示默认", stats3["cache_hit_rate"] is None
           and stats3["next_input_tokens"] == 0 and stats3["estimated_price"] is None)
-
-
-def test_workflows():
-    """工作流（/wf）：存储持久化 / 提炼 / 合成 / 修订 / 管理。"""
-    from mincli.workflows import FALLBACK_MARK, Workflow
-
-    if os.path.exists(TestController.WORKFLOWS_FILE):
-        os.remove(TestController.WORKFLOWS_FILE)
-
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    check("工作流：初始无文件", not os.path.exists(TestController.WORKFLOWS_FILE))
-    check("工作流：列表初始为空", ctrl.wf_list() == [])
-
-    DOC = (
-        "目标：为 Git 仓库生成 changelog 并写入文件\n\n"
-        "变量：\n"
-        "- {start}：起始版本（示例：v1.0）\n"
-        "- {end}：目标版本（示例：v2.0）\n\n"
-        "步骤：\n"
-        "1. 查看自 {start} 以来的提交：`git log {start}..{end} --oneline`\n"
-        "2. 生成 CHANGELOG.md"
-    )
-    ctrl._wf_store.put(Workflow(name="rel", doc=DOC))
-    check("工作流：put 后文件已写入", os.path.exists(TestController.WORKFLOWS_FILE))
-
-    # “重启”后从同一文件加载
-    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    wf = ctrl2.wf_get("rel")
-    check("工作流：重启后仍在且内容一致", wf is not None and wf.doc == DOC)
-    check("工作流：占位符推导", wf is not None and wf.placeholders() == ["start", "end"])
-    lst = ctrl2.wf_list()
-    check("工作流：list 摘要正确", len(lst) == 1 and lst[0]["name"] == "rel"
-          and "changelog" in lst[0]["goal"] and lst[0]["steps"] == 2
-          and lst[0]["vars"] == ["start", "end"])
-    check("工作流：同名 put 需 overwrite", ctrl2._wf_store.put(Workflow(name="rel", doc="x")) is False)
-    check("工作流：同名 put overwrite 成功",
-          ctrl2._wf_store.put(Workflow(name="rel", doc="x"), overwrite=True) is True)
-    ctrl2.wf_import_text("rel", DOC)
-    check("工作流：import_text 回写文档", ctrl2.wf_get("rel").doc == DOC)
-    check("工作流：重命名非法名报错", ctrl2.wf_rename("rel", "bad name") is not None)
-    check("工作流：重命名成功", ctrl2.wf_rename("rel", "rel2") is None
-          and ctrl2.wf_get("rel") is None and ctrl2.wf_get("rel2") is not None)
-    ctrl2.wf_rename("rel2", "rel")
-    check("工作流：删除不存在返回 False", ctrl2.wf_delete("nope") is False)
-    check("工作流：删除成功", ctrl2.wf_delete("rel") is True and ctrl2.wf_get("rel") is None)
-
-    # 提炼：构造带工具调用的节点 + stub 模型
-    ctrl3 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    ctrl3.tree.create_root("请为仓库生成 changelog 并写入文件", "已完成", "", "生成 changelog", 1, 1)
-    node = ctrl3.tree.current_node
-    node.tool_messages = [
-        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command": "git log --oneline v1.0..HEAD"}'}}]},
-        {"role": "tool", "tool_call_id": "c1", "content": "a1b2c3 提交说明"},
-    ]
-    src = ctrl3._wf_build_source([node])
-    check("工作流：提炼源含用户指令", "请为仓库生成 changelog" in src)
-    check("工作流：提炼源含工具调用细节", "调用工具: execute_command" in src and "git log" in src)
-    check("工作流：提炼源含工具结果", "工具结果" in src and "a1b2c3" in src)
-
-    ctrl3._wf_call_model = lambda messages, max_tokens: DOC  # stub 提炼
-    r = ctrl3.wf_save("demo")
-    check("工作流：自动提炼保存", r.get("status") == "saved" and r.get("from") == "extract"
-          and r.get("placeholders") == ["start", "end"])
-    check("工作流：记录来源节点", ctrl3.wf_get("demo").source_nodes == ["main"])
-    check("工作流：同名未 force 返回 exists", ctrl3.wf_save("demo").get("status") == "exists")
-    check("工作流：force 覆盖成功", ctrl3.wf_save("demo", force=True).get("status") == "saved")
-    check("工作流：起点不在链上报错", ctrl3.wf_save("x", start_id="bogus").get("status") == "error")
-    # 一连串操作：起点 → 当前链（a1 挂在 main 下）
-    a1 = ctrl3.tree.add_child(ctrl3.tree.root, "第二轮追问", "第二轮回答", "", "追问", 1, 1)
-    ctrl3.tree.current_node = a1
-    r_chain = ctrl3.wf_save("chain", start_id="main")
-    check("工作流：一连串操作提炼（起点→当前）",
-          r_chain.get("status") == "saved" and r_chain.get("nodes") == 2)
-    wf_chain = ctrl3.wf_get("chain")
-    check("工作流：来源记录整条链", wf_chain is not None and wf_chain.source_nodes == ["main", "a1"])
-    ctrl3._wf_call_model = lambda messages, max_tokens: ""  # 提炼失败
-    rfb = ctrl3.wf_save("fb")
-    check("工作流：提炼失败回退原文", rfb.get("status") == "saved" and rfb.get("from") == "fallback")
-    check("工作流：回退文档含提示标记", FALLBACK_MARK in ctrl3.wf_get("fb").doc)
-
-    # 合成：use / run 与变量替换、运行计数
-    ctrl4 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    ctrl4._wf_store.put(Workflow(name="rel", doc=DOC))
-    m_use = ctrl4.wf_compose("rel", typed="这次发布到 v2.0")
-    check("工作流：use 合成含规范与本次输入", m_use is not None
-          and "请执行工作流「rel」" in m_use and "本次输入：这次发布到 v2.0" in m_use)
-    m_run = ctrl4.wf_compose("rel", values={"start": "v1.0", "end": "v2.0"})
-    check("工作流：run 合成替换变量", m_run is not None
-          and "{start}" not in m_run and "{end}" not in m_run
-          and "v1.0" in m_run and "v2.0" in m_run)
-    m_win = ctrl4.wf_compose("rel", values={"start": r"C:\work\a", "end": r"D:\out\b"})
-    check("工作流：替换值含反斜杠不崩溃且原样写入", m_win is not None
-          and r"C:\work\a" in m_win and r"D:\out\b" in m_win
-          and "bad escape" not in m_win)
-    m_part = ctrl4.wf_compose("rel", values={"start": "v1.0"})
-    check("工作流：缺失变量提示推断", m_part is not None
-          and "{end}" in m_part and "未提供值的变量" in m_part)
-    check("工作流：未知名合成返回 None", ctrl4.wf_compose("nope") is None)
-    wf4 = ctrl4.wf_get("rel")
-    check("工作流：运行计数递增", wf4 is not None and wf4.run_count == 4 and wf4.last_run_at is not None)
-
-    # 修订
-    ctrl4._wf_call_model = lambda messages, max_tokens: "目标：修订版\n\n步骤：\n1. 校验步骤"
-    rr = ctrl4.wf_revise("rel", "增加校验")
-    check("工作流：模型修订成功", rr.get("status") == "revised" and "修订版" in ctrl4.wf_get("rel").doc)
-    ctrl4._wf_call_model = lambda messages, max_tokens: ""
-    rerr = ctrl4.wf_revise("rel", "x")
-    check("工作流：修订失败报错", rerr.get("status") == "error")
-    check("工作流：修订失败保留原文档", "修订版" in ctrl4.wf_get("rel").doc)
-    check("工作流：修订不存在名字报错", ctrl4.wf_revise("nope", "x").get("status") == "error")
 
 
 def test_pricing_config():
@@ -1120,33 +1178,21 @@ def test_pricing_config():
 
 
 def test_model_migration():
-    """旧模型名自动改写（会话加载 + 简写归一）。"""
-    from mincli.config import MODEL_FLASH, MODEL_PRO, normalize_model_name
-
-    check("归一：简写 flash", normalize_model_name("flash") == MODEL_FLASH)
-    check("归一：简写 vision → flash", normalize_model_name("vision") == MODEL_FLASH)
-    check("归一：旧名 vision-exp → flash",
-          normalize_model_name("deepseek-v4-flash-vision-exp") == MODEL_FLASH)
-    check("归一：旧名 chat → flash", normalize_model_name("deepseek-chat") == MODEL_FLASH)
-    check("归一：pro 保持", normalize_model_name("deepseek-v4-pro") == MODEL_PRO)
-    check("归一：未知名原样", normalize_model_name("gpt-4o") == "gpt-4o")
-
-    TestController.reset_store()
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    ctrl.tree.create_root("问题", "回答", "", "标题", 1, 1)
-    ctrl.current_model = "deepseek-v4-flash-vision-exp"  # 模拟旧会话
-    ctrl.save_session()
-    ctrl2 = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
-    check("旧会话模型自动改写", ctrl2.current_model == MODEL_FLASH)
-    check("记录改写来源", ctrl2.model_migrated_from == "deepseek-v4-flash-vision-exp")
-    TestController.reset_store()
+    """/model 只在 flash / pro 之间切换，其余模型名一律拒绝。"""
+    ctrl = TestController(FakeClient([]), config=make_config())
+    check("默认模型为 flash", ctrl.current_model == MODEL_FLASH)
+    check("切到 pro", ctrl.set_model("pro") and ctrl.current_model == MODEL_PRO)
+    check("切回 flash", ctrl.set_model("flash") and ctrl.current_model == MODEL_FLASH)
+    for bad in ("turbo", "gpt-4o", "deepseek-v4-ultra", ""):
+        check(f"拒绝非 flash/pro 模型：{bad!r}",
+              not ctrl.set_model(bad) and ctrl.current_model == MODEL_FLASH)
 
 
 def test_image_limits():
     """图片请求限制校验（数量/像素/内联大小/总量）。"""
     from mincli.tools.images import ImageAttachment
 
-    ctrl = TestController(FakeClient([]), default_system="sys", default_temperature=1.0, auto_start_mcp=False)
+    ctrl = TestController(FakeClient([]), config=make_config())
     ctrl.tree.create_root("q", "a", "", "t", 1, 1)
     node = ctrl.tree.current_node
 
@@ -1203,28 +1249,6 @@ def test_open_path_with_os():
         helpers.subprocess.Popen = original
 
 
-def test_exec_timeout_config():
-    """execute_command 超时上限：默认放宽到 30 分钟，且可用环境变量覆盖。"""
-    from mincli import config
-
-    original = os.environ.get("MINCLI_EXEC_MAX_TIMEOUT")
-    try:
-        os.environ["MINCLI_EXEC_MAX_TIMEOUT"] = "600"
-        check("超时上限：可配置", config.exec_max_timeout() == 600)
-        os.environ["MINCLI_EXEC_MAX_TIMEOUT"] = "abc"
-        check("超时上限：非法值回退默认",
-              config.exec_max_timeout() == config.EXEC_MAX_TIMEOUT_DEFAULT)
-        os.environ.pop("MINCLI_EXEC_MAX_TIMEOUT", None)
-        check("超时上限：默认放宽（>=600s）", config.EXEC_MAX_TIMEOUT_DEFAULT >= 600)
-        check("超时上限：未设置用默认",
-              config.exec_max_timeout() == config.EXEC_MAX_TIMEOUT_DEFAULT)
-    finally:
-        if original is None:
-            os.environ.pop("MINCLI_EXEC_MAX_TIMEOUT", None)
-        else:
-            os.environ["MINCLI_EXEC_MAX_TIMEOUT"] = original
-
-
 def test_interrupt():
     """用户主动打断：流式中止，已生成部分落盘为「中断」节点。"""
     print("== 用户打断（流式中止 / 部分内容落盘） ==")
@@ -1251,7 +1275,7 @@ def test_interrupt():
 
     ctrl = TestController(
         FakeClient([InterruptStream()]),
-        default_system="sys", default_temperature=1.0, auto_start_mcp=False,
+        config=make_config(),
     )
     holder["ctrl"] = ctrl
     node, events = collect(ctrl, "写个长回答")
@@ -1268,292 +1292,26 @@ def test_interrupt():
           ctrl._interrupt_requested is True)
 
 
-def test_exec_cancel():
-    """execute_command：cancel_running_commands 立即终止进程组。"""
-    print("== 命令执行打断（终止进程组） ==")
-    if sys.platform == "win32":
-        check("命令打断：Windows 跳过", True)
-        return
-    import threading
-    import time
-
-    from mincli.tools import execute as exec_mod
-
-    with exec_mod._RUNNING_LOCK:
-        exec_mod._RUNNING_PROCS.clear()
-    result = {}
-
-    def run():
-        result["out"] = exec_mod.execute_command("sleep 30", timeout=60)
-
-    t = threading.Thread(target=run)
-    t.start()
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        with exec_mod._RUNNING_LOCK:
-            if exec_mod._RUNNING_PROCS:
-                break
-        time.sleep(0.02)
-    killed = exec_mod.cancel_running_commands()
-    t.join(timeout=5)
-    check("命令打断：进程组被终止", killed >= 1)
-    check("命令打断：执行线程及时结束", not t.is_alive())
-    check("命令打断：返回了结果（非挂起）", bool(result.get("out")))
-    with exec_mod._RUNNING_LOCK:
-        check("命令打断：注册表已清理", not exec_mod._RUNNING_PROCS)
-
-
-def test_mcp_parallel_connect():
-    """MCP 连接并发：总耗时接近最慢的一个，而不是各 server 相加。"""
-    print("== MCP 并发连接 ==")
-    import asyncio
-    import time
-
-    import mincli.mcp_client as mc
-    from mincli.mcp_client import McpToolClient
-
-    class _Result:
-        tools = []
-
-    class _FakeSdkClient:
-        async def list_tools(self):
-            return _Result()
-
-    client = McpToolClient()
-    delay = 0.4
-
-    async def fake_connect(name, kind, target, headers=None):
-        await asyncio.sleep(delay)
-        client._clients[name] = _FakeSdkClient()
-
-    client._connect_one = fake_connect
-    orig_servers = mc.load_mcp_servers
-    mc.load_mcp_servers = lambda: {
-        "s1": {"url": "http://127.0.0.1:1/mcp"},
-        "s2": {"url": "http://127.0.0.1:2/mcp"},
-        "s3": {"url": "http://127.0.0.1:3/mcp"},
-    }
-    try:
-        t0 = time.perf_counter()
-        client._loop = asyncio.new_event_loop()
-        client._loop.run_until_complete(client._connect_all())
-        elapsed = time.perf_counter() - t0
-        client._loop.close()
-    finally:
-        mc.load_mcp_servers = orig_servers
-
-    # 串行需要 4 × 0.4s = 1.6s；并发应接近 0.4s（阈值放宽以抗负载抖动）
-    check("并发连接：4 个 server 不再串行累加", elapsed < delay * 2)
-    check("并发连接：客户端全部登记", len(client._clients) == 4)
-    check("并发连接：整体就绪标志为 True", client.ok is True)
-
-
-def test_mcp_background_start():
-    """MCP 后台连接：start 立即返回，wait_ready 才阻塞等结果。"""
-    print("== MCP 后台连接（不阻塞首屏） ==")
-    import time
-
-    from mincli.mcp_client import McpToolClient
-
-    client = McpToolClient()
-
-    async def slow_connect():
-        import asyncio
-
-        await asyncio.sleep(1.0)
-        client.ok = True
-
-    client._connect_all = slow_connect
-    t0 = time.perf_counter()
-    client.start()
-    elapsed = time.perf_counter() - t0
-    check("后台连接：start 立即返回（不等连接完成）", elapsed < 0.5)
-    check("后台连接：连接中状态可查询", client.connecting and not client.ready)
-
-    t1 = time.perf_counter()
-    ok = client.wait_ready()
-    waited = time.perf_counter() - t1
-    check("后台连接：wait_ready 等到了结果", ok is True)
-    check("后台连接：wait_ready 确实等待了", waited >= 0.5)
-    check("后台连接：完成后状态翻转", client.ready and not client.connecting)
-
-    t2 = time.perf_counter()
-    client.close()
-    check("后台连接：关闭不卡住", time.perf_counter() - t2 < 5)
-
-
-def test_mcp_close_while_connecting():
-    """连接仍在后台进行时退出：close 必须及时返回，不能等连接超时。"""
-    print("== MCP 连接中退出 ==")
-    import time
-
-    from mincli.mcp_client import McpToolClient
-
-    client = McpToolClient()
-
-    async def very_slow():
-        import asyncio
-
-        await asyncio.sleep(30)
-
-    client._connect_all = very_slow
-    client.start()
-    check("连接中退出：仍处于连接状态", client.connecting)
-    t0 = time.perf_counter()
-    client.close()
-    elapsed = time.perf_counter() - t0
-    check("连接中退出：close 及时返回", elapsed < 8)
-    check("连接中退出：事件循环已释放", client._loop is None)
-
-
-def test_mcp_nonblocking_controller():
-    """控制器：启动不等待 MCP，首次等待时才同步工具列表。"""
-    print("== 控制器 MCP 懒就绪 ==")
-
-    import mincli.controller as controller_mod
-
-    class FakeMcp:
-        def __init__(self, log=None, external_config_path=None):
-            self.ok = False
-            self.connecting = True
-            self.waited = False
-
-        def start(self):
-            pass
-
-        def wait_ready(self, timeout=None):
-            self.waited = True
-            self.connecting = False
-            self.ok = True
-            return True
-
-        def tools(self):
-            # 真实客户端要等 list_tools 回来才有工具定义
-            if self.connecting:
-                return []
-            return [{
-                "type": "function",
-                "function": {"name": "read_file", "description": "", "parameters": {}},
-            }]
-
-        def tool_names(self):
-            return set() if self.connecting else {"read_file"}
-
-        def tool_owner(self, name):
-            return "mincli" if name == "read_file" else None
-
-        def tools_by_server(self):
-            if self.connecting:
-                return {}
-            return {"mincli": ["read_file"], "tavily": ["tavily_search"]}
-
-        def configured_servers(self):
-            return ["tavily"]
-
-        def call(self, name, arguments, timeout=None):
-            return "（stub）"
-
-        def cancel_running(self):
-            return True
-
-        def server_status(self):
-            return {"mincli": {"connected": True, "tools": 1}}
-
-        def reload(self):
-            pass
-
-        def close(self):
-            pass
-
-    orig = controller_mod.McpToolClient
-    controller_mod.McpToolClient = FakeMcp
-    try:
-        ctrl = TestController(
-            FakeClient([]), default_system="sys", default_temperature=1.0
-        )
-        check("懒就绪：构造期不等待 MCP", ctrl.mcp_connecting is True)
-        names = [t["function"]["name"] for t in ctrl.llm_tools]
-        check("懒就绪：工具同步前不带 MCP 工具", "read_file" not in names)
-
-        events = []
-        ok = ctrl.wait_mcp_ready(emit=events.append)
-        check("懒就绪：等待返回连接结果", ok is True)
-        names = [t["function"]["name"] for t in ctrl.llm_tools]
-        check("懒就绪：等待后工具列表补齐", "read_file" in names)
-        check("懒就绪：等待期间发出状态提示",
-              any(e.kind == "status" for e in events))
-        check("懒就绪：连上后状态可查询", ctrl.mcp_connected is True)
-
-        events.clear()
-        ctrl.wait_mcp_ready(emit=events.append)
-        check("懒就绪：已同步后不重复提示", not events)
-    finally:
-        controller_mod.McpToolClient = orig
-
-
-def test_mcp_internal_tools():
-    """MCP 内部工具：cancel_command 注册但不对模型暴露。"""
-    print("== MCP 内部工具（cancel_command 不暴露给模型） ==")
-    import asyncio
-
-    from mincli.mcp_client import INTERNAL_TOOLS, McpToolClient
-
-    class _Tool:
-        def __init__(self, name):
-            self.name = name
-            self.description = ""
-            self.input_schema = {}
-
-    class _Result:
-        def __init__(self, names):
-            self.tools = [_Tool(n) for n in names]
-
-    class _SdkClient:
-        async def list_tools(self):
-            return _Result(["read_file", "cancel_command"])
-
-    client = McpToolClient()
-    client._clients = {"mincli": _SdkClient()}
-    asyncio.run(client._register_tools())
-    names = [t["function"]["name"] for t in client.tools()]
-    check("内部工具：cancel_command 已注册 owner",
-          "cancel_command" in client.tool_names())
-    check("内部工具：不暴露给模型",
-          "cancel_command" not in names and "read_file" in names)
-    check("内部工具：INTERNAL_TOOLS 含 cancel_command",
-          "cancel_command" in INTERNAL_TOOLS)
-
-
 def test_multi_tree():
-    print("== 多对话树：新建 / 切换 / 每树设置 / 删除 ==")
+    print("== 多对话树：新建 / 切换 / 草稿 / 删除 ==")
     script = [
         [FakeChunk(content="树二回答", usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4))],
         FakeChatResponse(content="标题二"),
     ]
     ctrl = TestController(
-        FakeClient(script), default_system="sys", default_temperature=1.0,
-        auto_start_mcp=False,
+        FakeClient(script), config=make_config(),
     )
     check("默认只有树 1", ctrl.tree_numbers() == [1] and ctrl.active_number == 1)
     check("树 1 颜色为 1（青）", ctrl.tree_color(1) == 1)
 
-    n2 = ctrl.create_tree(system_tools=False, mcp_tools=["tavily_search"])
+    n2 = ctrl.create_tree()
     check("新建得到编号 2 并切过去", n2 == 2 and ctrl.active_number == 2)
     check("树 2 颜色为 2", ctrl.tree_color(2) == 2)
-    check("树 2 能力已记录",
-          ctrl.tree_caps(2) == {"system_tools": False, "mcp_tools": ["tavily_search"]})
-    check("树 1 能力仍是默认",
-          ctrl.tree_caps(1) == {"system_tools": True, "mcp_tools": []})
 
-    ctrl.audit_level = 3
-    ctrl.workspace = "/tmp/tree2"
     ctrl.draft = "树 2 的草稿"
-    check("切回树 1 后每树设置回到默认",
-          ctrl.switch_tree(1) and ctrl.audit_level == 1
-          and ctrl.workspace is None and ctrl.draft == "")
-    check("切回树 2 后每树设置还在",
-          ctrl.switch_tree(2) and ctrl.audit_level == 3
-          and ctrl.workspace == "/tmp/tree2" and ctrl.draft == "树 2 的草稿")
+    check("切回树 1 后草稿为空", ctrl.switch_tree(1) and ctrl.draft == "")
+    check("切回树 2 后草稿还在",
+          ctrl.switch_tree(2) and ctrl.draft == "树 2 的草稿")
 
     node2, _ = collect(ctrl, "树二的问题")
     check("树 2 的节点落在树 2", ctrl.tree.root is node2)
@@ -1562,13 +1320,11 @@ def test_multi_tree():
 
     ctrl.save_session()
     reloaded = TestController(
-        FakeClient([]), default_system="sys", default_temperature=1.0,
-        auto_start_mcp=False,
+        FakeClient([]), config=make_config(),
     )
     check("重载后两棵树都在", reloaded.tree_numbers() == [1, 2])
     check("重载后停在树 1", reloaded.active_number == 1)
     check("重载后树 2 的问答还在", reloaded.tree_summary(2)["title"] == "标题二")
-    check("重载后树 2 的能力还在", reloaded.tree_caps(2)["system_tools"] is False)
     check("重载后树 2 的草稿还在", reloaded._load_state(2).draft == "树 2 的草稿")
     check("每棵树一个文件",
           os.path.exists(os.path.join(TestController.TREES_DIR, "1.json"))
@@ -1586,8 +1342,8 @@ def test_multi_tree_no_tree_guard():
     base = tempfile.mkdtemp(prefix="mincli_notree_")
     try:
         ctrl = ChatController(
-            FakeClient([]), default_system="sys", default_temperature=1.0,
-            auto_start_mcp=False, trees_dir=base,
+            FakeClient([]), config=make_config(), default_system="sys",
+            trees_dir=base,
         )
         check("没有树时 has_trees 为假", not ctrl.has_trees and not ctrl.session_loaded)
         raised = False
@@ -1608,15 +1364,14 @@ def test_background_tree_mark():
         FakeChatResponse(content="标题"),
     ]
     ctrl = TestController(
-        FakeClient(script), default_system="sys", default_temperature=1.0,
-        auto_start_mcp=False,
+        FakeClient(script), config=make_config(),
     )
     ctrl.create_tree()          # 建树 2
     ctrl.switch_tree(1)         # 回到树 1 发起生成
 
     seen_trees = []
 
-    def fake_impl(text, emit):
+    def fake_impl(text, emit, attachments=None):
         # 模拟生成期间用户切到树 2
         ctrl.switch_tree(2)
         emit(ControllerEvent.done(None))
@@ -1630,69 +1385,6 @@ def test_background_tree_mark():
     check("切回该树时标记被清除", ctrl.switch_tree(1) and 1 not in ctrl.tree_marks)
 
 
-def test_tree_capability_filter():
-    print("== 能力白名单：系统工具开关 + 外置工具逐个放行 ==")
-
-    class FakeMcp:
-        """只提供工具定义与归属，不连接任何 server。"""
-
-        def tools(self):
-            return [
-                {"type": "function",
-                 "function": {"name": n, "description": "", "parameters": {}}}
-                for n in ("read_file", "execute_command", "tavily_search", "obsidian_note")
-            ]
-
-        def tool_owner(self, name):
-            return {
-                "read_file": "mincli",
-                "execute_command": "mincli",
-                "tavily_search": "tavily",
-                "obsidian_note": "obsidian",
-            }.get(name)
-
-        def tool_names(self):
-            return {"read_file", "execute_command", "tavily_search", "obsidian_note"}
-
-        def tools_by_server(self):
-            return {
-                "mincli": ["read_file", "execute_command"],
-                "tavily": ["tavily_search"],
-                "obsidian": ["obsidian_note"],
-            }
-
-        def configured_servers(self):
-            return ["tavily", "obsidian"]
-
-    ctrl = TestController(
-        FakeClient([]), default_system="sys", default_temperature=1.0,
-        auto_start_mcp=False,
-    )
-    ctrl._mcp = FakeMcp()
-    ctrl._rebuild_llm_tools()
-    names = {t["function"]["name"] for t in ctrl.llm_tools}
-    check("默认：进程内 + 内置 server 工具都在",
-          "query_conversation_tree" in names and "read_file" in names)
-    check("默认：外置工具一个都不挂",
-          "tavily_search" not in names and "obsidian_note" not in names)
-
-    ctrl.set_tree_caps(ctrl.active_number, mcp_tools=["tavily_search"])
-    names = {t["function"]["name"] for t in ctrl.llm_tools}
-    check("勾选后只放行勾到的那个工具",
-          "tavily_search" in names and "obsidian_note" not in names)
-
-    ctrl.set_tree_caps(ctrl.active_number, system_tools=False)
-    names = {t["function"]["name"] for t in ctrl.llm_tools}
-    check("关掉系统工具后内置工具消失",
-          "read_file" not in names and "query_conversation_tree" not in names)
-    check("外置白名单不受影响", "tavily_search" in names)
-
-    ctrl.create_tree(system_tools=False, mcp_tools=[])
-    check("新树不继承上一棵树的外置白名单",
-          {t["function"]["name"] for t in ctrl.llm_tools} == set())
-    check("可查询可选工具分组", ctrl.available_tool_groups()["tavily"] == ["tavily_search"])
-
-
 def test_cross_tree_tools():
     print("== 跨树查询工具（tree 参数） ==")
     script = [
@@ -1702,33 +1394,37 @@ def test_cross_tree_tools():
         FakeChatResponse(content="标题二"),
     ]
     ctrl = TestController(
-        FakeClient(script), default_system="sys", default_temperature=1.0,
-        auto_start_mcp=False,
+        FakeClient(script), config=make_config(recall_enabled=True),
     )
     collect(ctrl, "树一的问题")
     ctrl.create_tree()
     collect(ctrl, "树二的问题")
 
-    out = ctrl._run_tool("query_conversation_tree", {}, lambda ev: None)
+    names = {t["function"]["name"] for t in ctrl.llm_tools}
+    check("recall 开启后两个树查询工具都在",
+          {"query_conversation_tree", "read_conversation_nodes"} <= names)
+
+    node = ctrl.tree.current_node
+    out = ctrl._run_tool("query_conversation_tree", {}, lambda ev: None, node)
     check("不传 tree：列出全部对话树编号与首条提问",
           "树 1" in out and "树 2" in out and "标题一" in out and "标题二" in out)
     check("不传 tree：同时给出当前树的子树索引", "main:" in out)
 
-    out1 = ctrl._run_tool("query_conversation_tree", {"tree": "1"}, lambda ev: None)
+    out1 = ctrl._run_tool("query_conversation_tree", {"tree": "1"}, lambda ev: None, node)
     check("指定 tree=1 查到另一棵树", "标题一" in out1 and "标题二" not in out1)
     check("指定编号时不附带全树索引", "全部对话树" not in out1)
 
     search = ctrl._run_tool(
-        "query_conversation_tree", {"tree": "1", "search": "树一"}, lambda ev: None
+        "query_conversation_tree", {"tree": "1", "search": "树一"}, lambda ev: None, node
     )
     check("跨树搜索命中", "main" in search)
 
     read = ctrl._run_tool(
-        "read_conversation_nodes", {"node_ids": "main", "tree": "1"}, lambda ev: None
+        "read_conversation_nodes", {"node_ids": "main", "tree": "1"}, lambda ev: None, node
     )
     check("跨树读节点内容", "树一的问题" in read and "回答一" in read)
 
-    bad = ctrl._run_tool("query_conversation_tree", {"tree": "9"}, lambda ev: None)
+    bad = ctrl._run_tool("query_conversation_tree", {"tree": "9"}, lambda ev: None, node)
     check("不存在的编号给出可用编号提示", "不存在" in bad and "1" in bad)
 
 
@@ -1741,35 +1437,28 @@ def run_test(fn) -> None:
 if __name__ == "__main__":
     run_test(test_simple_qa)
     run_test(test_tool_round)
+    run_test(test_tool_gating_matrix)
+    run_test(test_send_with_attachment_persists)
+    run_test(test_write_confirmation)
+    run_test(test_web_disabled_hides_tools)
     run_test(test_api_error)
     run_test(test_partial_save_on_error)
     run_test(test_tool_round_partial_save)
     run_test(test_session_roundtrip)
-    run_test(test_import_target)
     run_test(test_path_args)
-    run_test(test_import_multi)
     run_test(test_delete_nodes)
     run_test(test_settings)
     run_test(test_compact)
     run_test(test_multimodal)
     run_test(test_usage_stats)
-    run_test(test_workflows)
     run_test(test_pricing_config)
     run_test(test_model_migration)
     run_test(test_image_limits)
     run_test(test_open_path_with_os)
-    run_test(test_exec_timeout_config)
     run_test(test_interrupt)
-    run_test(test_exec_cancel)
-    run_test(test_mcp_internal_tools)
-    run_test(test_mcp_parallel_connect)
-    run_test(test_mcp_background_start)
-    run_test(test_mcp_close_while_connecting)
-    run_test(test_mcp_nonblocking_controller)
     run_test(test_multi_tree)
     run_test(test_multi_tree_no_tree_guard)
     run_test(test_background_tree_mark)
-    run_test(test_tree_capability_filter)
     run_test(test_cross_tree_tools)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

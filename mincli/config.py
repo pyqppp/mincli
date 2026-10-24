@@ -1,6 +1,21 @@
-import json
+"""mincli 配置：单一配置文件 ``~/.mincli/config.toml``。
+
+设计原则：
+- 所有可调项都在一个 TOML 文件里，界面开关变化立即写回（注释按模板重新生成）。
+- 非法值静默回退默认值，不阻塞启动。
+- 系统提示词单独放在 ``~/.mincli/prompt.md``，客户端不展示、不可编辑。
+"""
+
+from __future__ import annotations
+
 import os
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
+
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 兜底
+    import tomli as tomllib  # type: ignore[no-redef]
 
 from dotenv import load_dotenv
 
@@ -36,6 +51,11 @@ MODEL_ALIASES = {
     "deepseek-reasoner": MODEL_FLASH,
 }
 
+# DeepSeek 官方 OpenAI 兼容端点（不含 /v1，由 SDK 拼接）
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+API_KEY_VAR = "DEEPSEEK_API_KEY"
+
 
 def normalize_model_name(name: str) -> str:
     """把简写/已下线的旧模型名归一为现役模型名；未知名称原样返回。"""
@@ -43,23 +63,67 @@ def normalize_model_name(name: str) -> str:
     return MODEL_ALIASES.get(key, name)
 
 
-# 内置模型映射：model_name -> base_url（OpenAI 兼容 API；官方 base_url 不带 /v1）
-MODELS_AVAILABLE = {
-    MODEL_FLASH: "https://api.deepseek.com",
-    MODEL_PRO: "https://api.deepseek.com",
-}
+def api_key() -> str:
+    """当前生效的 DeepSeek API Key（未配置时为空字符串）。"""
+    return (os.getenv(API_KEY_VAR) or "").strip()
 
-# API Provider 映射：provider_name -> 环境变量名
-# 未注册的自定义 provider 回退到 DEEPSEEK_API_KEY
-API_PROVIDERS = {
-    "deepseek": "DEEPSEEK_API_KEY",
-    "openai": "OPENAI_API_KEY",
-}
 
-# 用户注册的模型配置文件（如：{"custom_openai": {"url": ..., "key_var": ..., "model": ...}}）
-MODELS_CONFIG_PATH = os.path.expanduser(
-    os.getenv("MINCLI_MODELS_PATH", "~/.mincli/models.json")
-)
+# ---------------- 能力开关 ----------------
+# 文件权限四态，按限制从松到紧：direct > confirm > read > off
+FILE_MODES = ("off", "read", "confirm", "direct")
+FILE_MODE_LABELS = {
+    "off": "关闭",
+    "read": "只读",
+    "confirm": "写需确认",
+    "direct": "写直通",
+}
+DEFAULT_FILE_MODE = "off"
+
+EFFORTS = ("low", "high", "max")
+DEFAULT_EFFORT = "high"
+
+# 附件内联进消息的字符上限：超过则截断，并把完整正文留给 read_attachment
+INLINE_MAX_CHARS_DEFAULT = 3000
+INLINE_MAX_CHARS_MIN = 200
+INLINE_MAX_CHARS_MAX = 200_000
+
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 2.0
+
+
+def file_mode_rank(mode: str) -> int:
+    """文件模式的可比较等级：off=0 / read=1 / confirm=2 / direct=3。"""
+    return FILE_MODES.index(mode) if mode in FILE_MODES else 0
+
+
+def file_mode_label(mode: str) -> str:
+    return FILE_MODE_LABELS.get(mode, FILE_MODE_LABELS[DEFAULT_FILE_MODE])
+
+
+# ---------------- 路径 ----------------
+MINCLI_DIR = os.path.expanduser("~/.mincli")
+
+
+def config_path() -> str:
+    """配置文件路径；可用 MINCLI_CONFIG_PATH 覆盖（测试用）。"""
+    return os.path.expanduser(
+        os.getenv("MINCLI_CONFIG_PATH") or os.path.join(MINCLI_DIR, "config.toml")
+    )
+
+
+def default_prompt_path() -> str:
+    """系统提示词文件路径；可用 MINCLI_PROMPT_PATH 覆盖（调试/测试用）。"""
+    return os.path.expanduser(
+        os.getenv("MINCLI_PROMPT_PATH") or os.path.join(MINCLI_DIR, "prompt.md")
+    )
+
+
+def default_attachment_dir() -> str:
+    """附件正文落盘目录；可用 MINCLI_ATTACHMENTS_PATH 覆盖。"""
+    return os.path.expanduser(
+        os.getenv("MINCLI_ATTACHMENTS_PATH") or os.path.join(MINCLI_DIR, "attachments")
+    )
+
 
 SAVE_BASE_DIR = os.path.expanduser(
     os.getenv("MINCLI_SAVE_PATH", "~/Documents/mincli_Conversations")
@@ -70,7 +134,312 @@ TITLE_MAX_LENGTH = 30
 PREVIEW_USER_MSG_LEN = 100
 PREVIEW_ASSISTANT_MSG_LEN = 200
 
-# 网页正文长度上限（fetch_webpage 一次返回给模型的字符数）
+# 上下文压缩（/compact）：压缩当前分支全部对话并新建摘要节点
+COMPACT_MAX_TOKENS = 8192           # 压缩摘要的最大输出 token 数（生成失败时回退 4096）
+COMPACT_SOURCE_MAX_CHARS = 150_000  # 送入压缩模型的原文上限（超长时截头尾保中间）
+COMPACT_REASONING_MAX_CHARS = 800   # 每个节点思考过程计入摘要源的长度上限
+COMPACT_TOOL_RESULT_MAX_CHARS = 500  # 每个工具结果计入摘要源的长度上限
+
+# ---------------- 系统提示词 ----------------
+
+DEFAULT_PROMPT = """\
+你是 mincli 的 AI 助手，运行在用户的终端里，通过对话帮用户阅读资料、写作与查证。
+
+## 工作方式
+- 语言跟随用户；代码、命令、路径、标识符保持原样，不要翻译。
+- 用 Markdown 组织回答；数学公式用 LaTeX（行内 $...$，行间 $$...$$）。
+- 若用户要把内容写入 Obsidian 笔记，行内公式用 $...$，行间公式用 $$...$$。
+- 能用工具确认的事先去确认，不要凭猜测描述文件内容。
+- 改文件前先读原文件；小改动用 edit_file，整体重写才用 write_file；改完说明改了什么。
+- 工具失败或结果为空时如实说明，不要编造成功或结果。
+- 删除、覆盖这类不可逆操作，先说清影响再执行。
+
+## 资料与附件
+- 用户消息里的 [PDF ...]、[DOCX ...]、[IMAGE ...]、[WEB ...] 是附件引用。
+- 短附件正文直接附在消息末尾的 --- 之后；长附件只附前一段并标注「已截断」。
+- 标注已截断时，用 read_attachment 按行继续读取（可多次读同一附件）。
+- 图片以多模态块单独发送，正文里只有引用块。
+- 没有 read_file 这类工具时，说明当前文件权限是关闭的，请用户在底部状态栏打开。
+
+## 能力
+- 可用工具以本轮实际提供的为准；缺少完成当前任务的工具时，直接告诉用户当前能力状态，不要假装已执行。
+- 历史对话以树状保存，用户可以在任意节点继续提问；只有提供了树查询工具时你才看得到历史节点。
+
+## 客户端
+- 以 / 开头的输入由客户端处理，你不会收到；用户想用时直接给出正确的 /命令。
+"""
+
+
+def system_prompt(cfg: "Config" | None = None) -> str:
+    """读取生效的系统提示词：提示词文件为空/缺失时回退内置默认。"""
+    path = (cfg.prompt_file if cfg else default_prompt_path())
+    try:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError:
+        return DEFAULT_PROMPT.strip()
+    return content or DEFAULT_PROMPT.strip()
+
+
+# ---------------- 配置对象 ----------------
+
+_COMMENT_COL = 36
+
+
+def _entry(text: str, comment: str) -> str:
+    """一行「键 = 值」加对齐的注释；值过长时只补一个空格。"""
+    return (text.ljust(_COMMENT_COL) if len(text) < _COMMENT_COL else text + " ") + (
+        f"# {comment}"
+    )
+
+
+@dataclass
+class Config:
+    """一份生效配置。字段名与 TOML 结构一一对应。"""
+
+    model: str = DEFAULT_MODEL
+    temperature: float = 1.0
+    thinking: bool = False
+    effort: str = DEFAULT_EFFORT
+    files_mode: str = DEFAULT_FILE_MODE
+    inline_max_chars: int = INLINE_MAX_CHARS_DEFAULT
+    attachment_dir: str = ""
+    web_enabled: bool = True
+    recall_enabled: bool = False
+    prompt_file: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.attachment_dir:
+            self.attachment_dir = default_attachment_dir()
+        if not self.prompt_file:
+            self.prompt_file = default_prompt_path()
+
+    # ---- 派生属性 ----
+    @property
+    def files_read_enabled(self) -> bool:
+        return file_mode_rank(self.files_mode) >= 1
+
+    @property
+    def files_write_enabled(self) -> bool:
+        return file_mode_rank(self.files_mode) >= 2
+
+    @property
+    def files_write_needs_confirm(self) -> bool:
+        return self.files_mode == "confirm"
+
+    @property
+    def files_label(self) -> str:
+        return file_mode_label(self.files_mode)
+
+    @property
+    def web_label(self) -> str:
+        return "开" if self.web_enabled else "关"
+
+    def to_toml(self, path: Optional[str] = None) -> str:
+        lines = [
+            "# mincli 配置文件",
+            f"# 位置：{path or config_path()}",
+            "# 修改后在下次启动生效；界面里的开关变化会立即写回本文件（注释按模板重新生成）。",
+            "",
+            _entry(
+                f'model = "{self.model}"',
+                "deepseek-flash（支持图片）| deepseek-v4-pro",
+            ),
+            _entry(f"temperature = {self.temperature:.1f}", "0.0 - 2.0"),
+            _entry(
+                f"thinking = {'true' if self.thinking else 'false'}",
+                "是否默认开启思考",
+            ),
+            _entry(f'effort = "{self.effort}"', "low | high | max"),
+            "",
+            "[files]",
+            _entry(
+                f'mode = "{self.files_mode}"',
+                "off 关闭 | read 只读 | confirm 写需确认 | direct 写直通",
+            ),
+            _entry(
+                f"inline_max_chars = {self.inline_max_chars}",
+                "附件内联进消息的最大字符数，超出则截断并留 read_attachment",
+            ),
+            _entry(
+                f'attachment_dir = "{self.attachment_dir}"',
+                "附件正文落盘目录",
+            ),
+            "",
+            "[web]",
+            _entry(
+                f"enabled = {'true' if self.web_enabled else 'false'}",
+                "联网搜索与网页抓取",
+            ),
+            "",
+            "[recall]",
+            _entry(
+                f"enabled = {'true' if self.recall_enabled else 'false'}",
+                "对话树检索工具（也可在界面用 /recall on|off 切换）",
+            ),
+            "",
+            "[prompt]",
+            _entry(
+                f'file = "{self.prompt_file}"',
+                "系统提示词文件；客户端不显示、不可编辑",
+            ),
+            "",
+        ]
+        return "\n".join(lines)
+
+    def with_files_mode(self, mode: str) -> "Config":
+        from dataclasses import replace
+
+        return replace(self, files_mode=mode if mode in FILE_MODES else self.files_mode)
+
+    def with_web(self, enabled: bool) -> "Config":
+        from dataclasses import replace
+
+        return replace(self, web_enabled=bool(enabled))
+
+    def with_recall(self, enabled: bool) -> "Config":
+        from dataclasses import replace
+
+        return replace(self, recall_enabled=bool(enabled))
+
+
+# ---------------- 读取与校验 ----------------
+
+
+def _as_float(value: Any, default: float, lo: float, hi: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return max(lo, min(hi, number))
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _as_int(value: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, number))
+
+
+def _as_str(value: Any, default: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def config_from_dict(data: dict, path: Optional[str] = None) -> Config:
+    """把解析后的 TOML 字典转成 Config，非法值静默回退默认。"""
+    files = data.get("files") if isinstance(data.get("files"), dict) else {}
+    web = data.get("web") if isinstance(data.get("web"), dict) else {}
+    recall = data.get("recall") if isinstance(data.get("recall"), dict) else {}
+    prompt = data.get("prompt") if isinstance(data.get("prompt"), dict) else {}
+
+    model = normalize_model_name(_as_str(data.get("model"), DEFAULT_MODEL))
+    if model not in (MODEL_FLASH, MODEL_PRO):
+        model = DEFAULT_MODEL
+
+    effort = _as_str(data.get("effort"), DEFAULT_EFFORT).lower()
+    if effort not in EFFORTS:
+        effort = DEFAULT_EFFORT
+
+    files_mode = _as_str(files.get("mode"), DEFAULT_FILE_MODE).lower()
+    if files_mode not in FILE_MODES:
+        files_mode = DEFAULT_FILE_MODE
+
+    return Config(
+        model=model,
+        temperature=_as_float(
+            data.get("temperature"), 1.0, TEMPERATURE_MIN, TEMPERATURE_MAX
+        ),
+        thinking=_as_bool(data.get("thinking"), False),
+        effort=effort,
+        files_mode=files_mode,
+        inline_max_chars=_as_int(
+            files.get("inline_max_chars"),
+            INLINE_MAX_CHARS_DEFAULT,
+            INLINE_MAX_CHARS_MIN,
+            INLINE_MAX_CHARS_MAX,
+        ),
+        attachment_dir=os.path.expanduser(
+            _as_str(files.get("attachment_dir"), default_attachment_dir())
+        ),
+        web_enabled=_as_bool(web.get("enabled"), True),
+        recall_enabled=_as_bool(recall.get("enabled"), False),
+        prompt_file=os.path.expanduser(
+            _as_str(prompt.get("file"), default_prompt_path())
+        ),
+    )
+
+
+def load_config(path: Optional[str] = None) -> Config:
+    """读取配置；文件不存在或损坏时返回默认配置（不写盘）。"""
+    target = os.path.expanduser(path) if path else config_path()
+    try:
+        with open(target, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return Config()
+    if not isinstance(data, dict):
+        return Config()
+    return config_from_dict(data, target)
+
+
+def save_config(cfg: Config, path: Optional[str] = None) -> str:
+    """把配置按模板写回（值从当前状态填入，注释保留）。"""
+    target = os.path.expanduser(path) if path else config_path()
+    directory = os.path.dirname(target)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(cfg.to_toml(target))
+    return target
+
+
+def ensure_prompt_file(cfg: Config) -> str:
+    """提示词文件不存在或为空时写入默认提示词，返回路径。"""
+    target = os.path.expanduser(cfg.prompt_file)
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            if f.read().strip():
+                return target
+    except OSError:
+        pass
+    directory = os.path.dirname(target)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(DEFAULT_PROMPT)
+    return target
+
+
+def ensure_config(path: Optional[str] = None) -> Config:
+    """首次启动生成配置与提示词文件，返回生效配置。"""
+    target = os.path.expanduser(path) if path else config_path()
+    if not os.path.exists(target):
+        save_config(Config(), target)
+    cfg = load_config(target)
+    ensure_prompt_file(cfg)
+    return cfg
+
+
+# ---------------- 其他运行期常量 ----------------
+
+# 网页正文长度上限（web_fetch 一次返回给模型的字符数）
 # 默认 5000，可用环境变量 MINCLI_WEBPAGE_MAX_LENGTH 调整；为避免超长网页挤爆上下文，
 # 无论怎么配置都不会超过硬上限 WEBPAGE_MAX_LENGTH_LIMIT（默认值的 4 倍）。
 WEBPAGE_MAX_LENGTH_DEFAULT = 5000
@@ -92,11 +461,6 @@ def webpage_max_length() -> int:
         return WEBPAGE_MAX_LENGTH_DEFAULT
     return max(1, min(value, WEBPAGE_MAX_LENGTH_LIMIT))
 
-# 上下文压缩（/compact）：压缩当前分支全部对话并新建摘要节点
-COMPACT_MAX_TOKENS = 8192         # 压缩摘要的最大输出 token 数（生成失败时回退 4096）
-COMPACT_SOURCE_MAX_CHARS = 150_000  # 送入压缩模型的原文上限（超长时截头尾保中间）
-COMPACT_REASONING_MAX_CHARS = 800   # 每个节点思考过程计入摘要源的长度上限
-COMPACT_TOOL_RESULT_MAX_CHARS = 500  # 每个工具结果计入摘要源的长度上限
 
 # DeepSeek 官方定价默认值（元/百万 tokens；2026-09-10 V4.1-Flash 上线后降价）
 # 结构: 模型名 -> {"hit": (空闲价, 高峰价), "miss": (...), "output": (...)}
@@ -125,38 +489,6 @@ PRICING_PATH = os.path.expanduser(
 
 # 账户余额轮询刷新间隔（秒）
 BALANCE_REFRESH_SECONDS = 60
-TEMPERATURE_MIN = 0.0
-TEMPERATURE_MAX = 2.0
-
-# 命令执行工具（execute_command）
-EXEC_DEFAULT_TIMEOUT = 30          # 未传 timeout 时的默认截止时间（秒）
-# timeout 上限（秒）。早期固定 120s，渲染/构建/安装等长任务会被硬截断，模型只能
-# 反复「启动休眠」轮询；现在默认放宽到 30 分钟，并可用 MINCLI_EXEC_MAX_TIMEOUT
-# 覆盖。真正卡死的命令由用户主动打断终止（见 controller.interrupt）。
-EXEC_MAX_TIMEOUT_DEFAULT = 1800
-EXEC_DEFAULT_MAX_OUTPUT = 8000     # 输出截断上限（字符），超出时保留首尾并落盘完整输出
-EXEC_MAX_OUTPUT = 50_000           # max_output 参数允许的最大值
-EXEC_ALLOWED_SHELLS = ("sh", "bash", "zsh")
-
-
-def exec_max_timeout() -> int:
-    """当前生效的 execute_command 超时上限（秒）。
-
-    读取 MINCLI_EXEC_MAX_TIMEOUT（.env 同样生效）：空值/非法值回退默认值；
-    结果至少为 1。上限同时决定 MCP 客户端调用超时（见 mcp_client.CALL_TIMEOUT）。
-    """
-    raw = (os.getenv("MINCLI_EXEC_MAX_TIMEOUT") or "").strip()
-    if not raw:
-        return EXEC_MAX_TIMEOUT_DEFAULT
-    try:
-        value = int(raw)
-    except ValueError:
-        return EXEC_MAX_TIMEOUT_DEFAULT
-    return max(1, value)
-
-
-# 模块级常量：多数调用点直接引用（导入时求值一次，启动后不再变化）
-EXEC_MAX_TIMEOUT = exec_max_timeout()
 
 # ---------------- 多模态（图片理解，deepseek-flash 原生支持） ----------------
 # 官方限制（2026-09）：格式按文件内容识别（不看扩展名/声明 MIME）；图片仅限 user 消息；
@@ -200,173 +532,3 @@ FILES_MAX_COUNT = 10_000                   # 单用户最大存储文件数
 FILES_MAX_BYTES = 25 * 1024 * 1024 * 1024  # 单用户最大存储空间 25 GiB
 FILES_LIST_PAGE = 20                       # /files list 默认展示条数
 FILES_LIST_PAGE_MAX = 1000                 # 官方单页上限
-
-MCP_CONFIG_PATH = os.path.expanduser(
-    os.getenv("MINCLI_MCP_CONFIG", "~/.mincli/mcp_servers.json")
-)
-
-# 工作流持久化文件（/wf 系列命令；与会话分开长期保存）
-WORKFLOWS_PATH = os.path.expanduser(
-    os.getenv("MINCLI_WORKFLOWS_PATH", "~/.mincli/workflows.json")
-)
-
-# ---------------- 工作流（/wf）提炼 ----------------
-WF_EXTRACT_MAX_TOKENS = 4000      # 提炼输出上限（失败回退 2000）
-WF_SOURCE_MAX_CHARS = 60_000      # 送入提炼模型的原文上限（超长截头尾保中间）
-WF_REASONING_MAX_CHARS = 400      # 每节点思考计入提炼源的长度上限
-WF_TOOL_ARGS_MAX_CHARS = 800      # 每个工具调用参数计入提炼源的长度上限
-WF_TOOL_RESULT_MAX_CHARS = 400    # 每个工具结果计入提炼源的长度上限
-WF_ANSWER_MAX_CHARS = 1200        # 每节点最终回答计入提炼源的长度上限
-
-# 系统提示词独立存放在文件中，每次启动自动导入。分两个版本，按对话树的能力
-# 挂载选用（见 controller._system_prompt_for）：
-#
-#   完整版 system_prompt.md          挂了系统工具或外置 MCP 工具的树
-#   最小版 system_prompt_minimal.md  只挂「对话」能力的树
-#
-# 两个版本各自独立，加载优先级相同：
-# 1. MINCLI_SYSTEM_PROMPT_PATH / MINCLI_MINIMAL_SYSTEM_PROMPT_PATH 环境变量指定的文件
-# 2. ~/.mincli/system_prompt.md / ~/.mincli/system_prompt_minimal.md（用户自定义）
-# 3. 包内同名文件（随项目分发，默认提示词）
-SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "system_prompt.md")
-USER_SYSTEM_PROMPT_PATH = os.path.expanduser("~/.mincli/system_prompt.md")
-MINIMAL_SYSTEM_PROMPT_PATH = os.path.join(
-    os.path.dirname(__file__), "system_prompt_minimal.md"
-)
-USER_MINIMAL_SYSTEM_PROMPT_PATH = os.path.expanduser(
-    "~/.mincli/system_prompt_minimal.md"
-)
-
-# 所有提示词文件均不可用时的内置兜底（正常情况下不会用到）
-_FALLBACK_SYSTEM_PROMPT = "你是一个有用的人工智能助手。"
-
-
-def _load_prompt_file(
-    env_var: str, user_path: str, package_path: str, fallback: str
-) -> tuple[str, Optional[str]]:
-    """读取一个提示词文件，返回 (提示词内容, 实际使用的文件路径或 None)。
-
-    环境变量指定的文件不存在或为空时继续往下找，因此三个候选都是「可用才生效」。
-    """
-    candidates = []
-    env_path = os.getenv(env_var)
-    if env_path:
-        candidates.append(os.path.expanduser(env_path))
-    candidates.append(user_path)
-    candidates.append(package_path)
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-        except OSError:
-            continue
-        if content:
-            return content, path
-    return fallback, None
-
-
-DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPT_SOURCE = _load_prompt_file(
-    "MINCLI_SYSTEM_PROMPT_PATH",
-    USER_SYSTEM_PROMPT_PATH,
-    SYSTEM_PROMPT_PATH,
-    _FALLBACK_SYSTEM_PROMPT,
-)
-DEFAULT_MINIMAL_SYSTEM_PROMPT, MINIMAL_SYSTEM_PROMPT_SOURCE = _load_prompt_file(
-    "MINCLI_MINIMAL_SYSTEM_PROMPT_PATH",
-    USER_MINIMAL_SYSTEM_PROMPT_PATH,
-    MINIMAL_SYSTEM_PROMPT_PATH,
-    _FALLBACK_SYSTEM_PROMPT,
-)
-
-
-def load_mcp_servers() -> dict:
-    """加载第三方 MCP server 配置（Claude Desktop 兼容格式）。"""
-    if not os.path.exists(MCP_CONFIG_PATH):
-        return {}
-    try:
-        with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("mcpServers"), dict):
-            return data["mcpServers"]
-        return {}
-    except Exception:
-        return {}
-
-
-def get_mcp_config_path() -> str:
-    return MCP_CONFIG_PATH
-
-
-def save_mcp_servers(servers: dict) -> str:
-    """将第三方 MCP server 配置写回文件，返回文件路径。"""
-    os.makedirs(os.path.dirname(MCP_CONFIG_PATH), exist_ok=True)
-    with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"mcpServers": servers}, f, ensure_ascii=False, indent=2)
-    return MCP_CONFIG_PATH
-
-
-# ---------------- 模型注册配置管理 ----------------
-
-def load_models() -> dict:
-    """加载用户注册的模型配置：{"模型名": {"url": ..., "key_var": ...}}。"""
-    if not os.path.exists(MODELS_CONFIG_PATH):
-        return {}
-    try:
-        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-        return {}
-    except Exception:
-        return {}
-
-
-def save_models(models: dict) -> bool:
-    """保存模型注册配置到 ~/.mincli/models.json，成功返回 True。"""
-    try:
-        os.makedirs(os.path.dirname(MODELS_CONFIG_PATH), exist_ok=True)
-        with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(models, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
-
-
-def register_model(
-    provider: str,
-    model_name: str,
-    base_url: str,
-    api_key_var: Optional[str] = None,
-) -> bool:
-    """注册一个新的模型到配置（provider + 模型名 → URL / API Key 变量）。
-
-    - 内置 provider（deepseek/openai）按模型名注册；
-    - 自定义 provider 以 `custom_<provider>` 为键注册（可同时保存模型名）。
-    返回是否注册成功。
-    """
-    models = load_models()
-    key_var = api_key_var or API_PROVIDERS.get(provider, "DEEPSEEK_API_KEY")
-    models[model_name] = {"url": base_url, "key_var": key_var}
-    return save_models(models)
-
-
-def get_model_base_url(provider: str, model: str) -> str:
-    """解析 provider + 模型名 → API base_url。
-
-    优先级：注册配置 > 内置映射 > 默认 DeepSeek。
-    """
-    registered = load_models()
-    if model in registered:
-        return registered[model]["url"]
-    if model in MODELS_AVAILABLE:
-        return MODELS_AVAILABLE[model]
-    # 兜底：DeepSeek 默认端点
-    return "https://api.deepseek.com/v1"
-
-
-def get_model_key_var(provider: str, model: str) -> str:
-    """解析 provider + 模型名 → API Key 的环境变量名。"""
-    registered = load_models()
-    if model in registered:
-        return registered[model].get("key_var") or "DEEPSEEK_API_KEY"
-    return API_PROVIDERS.get(provider, "DEEPSEEK_API_KEY")

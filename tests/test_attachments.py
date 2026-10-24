@@ -74,3 +74,56 @@ def test_truncate_at_line():
     cut, lines = truncate_at_line("abcdef", 4)
     assert cut == "abcd"
     assert lines == 1
+
+
+def test_store_and_reload_attachment_text(tmp_path):
+    from mincli.attachments import collect_stale_attachments, store_attachment_text
+
+    att = _doc(text="正文\n第二行")
+    att.attachment_id = "abc123"
+    path = store_attachment_text(att, str(tmp_path))
+    assert path == str(tmp_path / "abc123.txt")
+    assert att.stored_path == path
+    assert open(path, encoding="utf-8").read() == "正文\n第二行"
+
+    meta = att.metadata()
+    assert meta["id"] == "abc123"
+    assert meta["lines"] == 2
+    assert meta["stored_path"] == path
+
+    restored = Attachment.from_metadata(meta)
+    assert restored.name == att.name
+    assert restored.text == ""
+    assert restored.stored_path == path
+
+    # 不在引用集合里的正文会被回收
+    assert collect_stale_attachments(str(tmp_path), {"other"}) == 1
+    assert not (tmp_path / "abc123.txt").exists()
+    assert collect_stale_attachments(str(tmp_path), set()) == 0
+
+
+def test_collect_keeps_referenced(tmp_path):
+    from mincli.attachments import collect_stale_attachments, store_attachment_text
+
+    att = _doc()
+    att.attachment_id = "keepme"
+    store_attachment_text(att, str(tmp_path))
+    assert collect_stale_attachments(str(tmp_path), {"keepme"}) == 0
+    assert (tmp_path / "keepme.txt").exists()
+
+
+def test_load_web_attachment_uses_fetch_api(monkeypatch):
+    from mincli.tools import web_tools
+
+    def fake_page(url):
+        return "页面标题", "# 正文\n\n内容"
+
+    monkeypatch.setattr(web_tools, "fetch_page", fake_page)
+    import mincli.attachments as attachments
+
+    monkeypatch.setattr(attachments, "fetch_page", fake_page)
+    att = attachments.load_attachment("https://example.com/post")
+    assert att.kind == KIND_WEB
+    assert att.name == "example.com/页面标题"
+    assert att.text == "# 正文\n\n内容"
+    assert att.chip_label == "[WEB example.com/页面标题]"

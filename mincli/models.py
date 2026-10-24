@@ -45,6 +45,9 @@ class ConversationNode:
     tool_messages: List[Dict] = field(default_factory=list)
     # 本节点用户消息附带的图片（多模态；发送时构造为 OpenAI 兼容内容块）
     user_images: List[ImageAttachment] = field(default_factory=list)
+    # 本节点附件的元数据（id/kind/name/path/stored_path/lines/chars）；
+    # 旧存档没有该字段时按空列表处理
+    attachments: List[Dict[str, Any]] = field(default_factory=list)
     # 生成中断（API 报错/异常）时的错误信息。节点仍会保留并保存已生成的部分
     # 内容，用户可在该节点下继续输入「继续」接着生成；该字段仅用于展示，
     # 不参与请求历史。
@@ -94,6 +97,7 @@ class ConversationNode:
             "cache_miss_tokens": self.cache_miss_tokens,
             "tool_messages": self.tool_messages,
             "user_images": [img.to_dict() for img in self.user_images],
+            "attachments": self.attachments,
             "error": self.error,
         }
 
@@ -117,6 +121,7 @@ class ConversationNode:
                 ImageAttachment.from_dict(d)
                 for d in data.get("user_images", [])
             ],
+            attachments=data.get("attachments") or [],
             error=data.get("error", ""),
         )
 

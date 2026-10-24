@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mincli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mini CLI AI Assistant"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,11 +12,11 @@ dependencies = [
     "typer",
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
-    "trafilatura",
+    "httpx>=0.27",
     "pdfminer.six",
     "python-docx",
-    "mcp>=2.0.0",
-    "textual>=4.0",
+    "textual>=8.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]

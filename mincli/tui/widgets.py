@@ -7,7 +7,6 @@ import os
 from rich.cells import cell_len
 from rich.segment import Segment
 from rich.style import Style
-from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
@@ -200,8 +199,18 @@ class ChatInput(TextArea):
         return strip
 
     def insert_chip(self, attachment: Attachment) -> None:
-        """在光标处插入一个引用块（前后补空格，避免和文字粘连）。"""
+        """在光标处插入一个引用块（前后补空格，避免和文字粘连）。
+
+        同名文件（不同目录）会加一级目录前缀，避免两个块共用一个标签后
+        发送时只附一份正文。
+        """
         label = attachment.chip_label
+        existing = self._chips.get(label)
+        if existing is not None and existing.dedupe_key != attachment.dedupe_key:
+            parent = os.path.basename(os.path.dirname(attachment.path or ""))
+            if parent and not attachment.name.startswith(parent + "/"):
+                attachment.name = f"{parent}/{attachment.name}"
+                label = attachment.chip_label
         self._chips[label] = attachment
         position = self.cursor_location
         offset = self._offset_of(position)
@@ -209,6 +218,28 @@ class ChatInput(TextArea):
         self.replace(f"{lead}{label} ", position, position)
         self._line_starts_key = None
         self._line_cache.clear()
+        self.refresh()
+
+    def chip_attachments(self) -> list[Attachment]:
+        """正文里实际出现的附件（按出现顺序），不清空登记表。"""
+        attachments: list[Attachment] = []
+        text = self.text
+        for start, stop in self.chip_spans():
+            attachment = self._chips.get(text[start:stop])
+            if attachment is not None:
+                attachments.append(attachment)
+        return attachments
+
+    def restore_chips(self, attachments) -> None:
+        """按正文里已有的引用块文字重新登记附件（恢复草稿用）。"""
+        if not attachments:
+            return
+        text = self.text
+        for attachment in attachments:
+            label = attachment.chip_label
+            if label and label in text:
+                self._chips[label] = attachment
+        self._line_starts_key = None
         self.refresh()
 
     def take_chip_attachments(self) -> list[Attachment]:

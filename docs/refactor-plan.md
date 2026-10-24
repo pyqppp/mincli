@@ -3,9 +3,9 @@
 > 这份文档是重构的唯一事实来源。对话被压缩后，先读本文件，再按「第 7 节 进度」继续执行；不要凭记忆补细节。
 
 最后更新：2026-10-24
-分支：`refactor`（从 `main` 的 `97d7bd6` 切出）
-最近提交：`6e734ee feat: Phase 0 输入框附件引用块与底部能力开关`
-当前有未提交改动：`mincli/tui/widgets.py`、`tests/test_chips.py`（引用块上色修复）
+分支：`refactor`
+最近提交：见 `git log --oneline -5`（每个 Phase 一个提交）
+当前状态：Phase 0-6 的实现已完成，等待统一验收
 
 ---
 
@@ -250,77 +250,69 @@ Phase 0 临时状态（后续 Phase 修）：
 - `/import`、`/files`、`/wf`、`/mcp` 仍在
 - 无树时仍弹旧建树向导
 
-### Phase 1 配置层：待做
+### Phase 1 配置层：已完成
 
-步骤：
-1. 重写 `mincli/config.py`：`tomllib` 加载、默认值、校验、模板生成、写回、提示词文件生成；删除模型注册 / MCP / 工作流 / 执行相关常量
-2. 重写 `mincli/cli.py`：只留 `chat`（无参数）与 `info`；删除 `register` / `models` / `--mcp-server`
-3. `ChatController` 构造改为读配置；`ChatApp` 的文件态 / 联网 / recall / 阈值从配置初始化，并在变更时写回
-4. `prompt.md` 默认内容（见附录 A）
-5. 测试：默认文件生成、非法值回退、写回后重新加载一致、`info` 不打印提示词
+- `mincli/config.py` 重写：`Config` 数据类 + `load_config/save_config/ensure_config`；
+  `tomllib`（3.10 用 `tomli`）；默认值生成、非法值静默回退、写回时按模板重新生成注释
+- 提示词收敛为 `~/.mincli/prompt.md` 单份；`system_prompt()` 读取，缺失时回退内置默认
+- 删除模型注册 / MCP / 工作流 / shell 执行的常量与配置读写
+- `mincli/cli.py` 只剩 `chat` 与 `info`；`info` 只读展示生效值，不打印提示词内容
+- 环境变量：`MINCLI_CONFIG_PATH`、`MINCLI_PROMPT_PATH`、`MINCLI_ATTACHMENTS_PATH`（测试/调试）
+- 测试：`tests/test_config.py`（12）
 
-验收：删掉 `~/.mincli/config.toml` 后首次启动自动生成；改 `files.mode` 重启生效；`mincli info` 只读展示生效值。
+### Phase 2 附件管线：已完成
 
-### Phase 2 附件管线：待做
+- `Attachment` 增 `stored_path`、`metadata()`、`from_metadata()`；正文按内容哈希落盘
+  `<attachment_dir>/<id>.txt`
+- `ConversationNode.attachments` 随节点序列化（旧存档缺字段按空处理）
+- `read_attachment` 按名字解析本轮/历史附件，重名给候选提示，按行续读
+- 启动时 `controller._collect_attachments()` 回收未被任何树引用的正文文件
+- 网页附件改走官方 Fetch API（`fetch_page`），chip 标题取 `title`，缺失退化为域名
+- `compose_message` 规则不变：短全文、长截断、单行长文按字符截、图片不进文本段、同轮去重
+- 测试：`tests/test_attachments.py`（10）
 
-步骤：
-1. 附件正文落盘与索引（内容哈希、目录、行数统计）
-2. 节点序列化带附件元数据；旧会话无该字段时按空处理
-3. `read_attachment` 解析当前会话附件（按名字；重名规则见第 9 节）
-4. 启动回收未被引用的附件文件
-5. 与 `compose_message` 打通：短全文、长截断、单行长文、图片不进文本段、同轮去重
-6. 测试：组装字符串逐字比对、截断边界、去重、附件回收
+### Phase 3 工具层：已完成
 
-验收：一份 5 万字符 PDF 与一份 20 行 txt 同轮发送，消息结构符合 5.1；`read_attachment` 能从第 43 行继续读。
+- `mincli/tools/file_tools.py`：`read_file`（按行、行号、续读提示）、`write_file`、
+  `edit_file`（唯一匹配，多处报错）、`list_directory`（目录在前、文件带大小）
+- `mincli/tools/web_tools.py`：`web_search` / `web_fetch` / `fetch_page`；httpx、30/60s 超时、
+  按状态码给出可读错误；Search 结果带标题/链接/摘要，正文按需摘录
+- `mincli/tools/builtin.py`：唯一工具表 + `available_tools(cfg, has_attachments)` 门控 +
+  `ToolContext` + `dispatch_tool` 进程内分派（无 MCP、无子进程）
+- `ChatController._rebuild_llm_tools()` / 发送时按本轮附件重算；写确认走
+  `_confirm_write`（仅 `confirm` 模式弹窗）；树查询走 `_recall_dispatch`
+- 删除 shell 执行、审核层级、工作区、`tools/execute.py`、`tools/registry.py`、`tools/thinking.py`
+- 测试：`tests/test_tools.py`（23，含门控矩阵与联网错误分支）
 
-### Phase 3 工具层：待做
+### Phase 4 输入与聊天区完善：已完成
 
-步骤：
-1. `mincli/tools/file_tools.py`：`read_file` / `write_file` / `edit_file` / `list_directory`（分段、行号、写确认回调）
-2. `mincli/tools/web_tools.py`：`web_search` / `web_fetch`（httpx、错误文案、超时）
-3. 工具定义集中到一个 `TOOLS` 表，含 JSON Schema
-4. `ChatController._rebuild_llm_tools()` 按 4.2 门控；`_run_tool` 直接分发（无 MCP）
-5. 写确认弹窗复用 `ConfirmScreen`
-6. 删除 `execute` / `thinking` / `audit_level` / `workspace` / `cancel_command` / MCP 相关方法
-7. 测试：四种文件模式 + 联网开关 + recall 开关下工具集正确；`off` 下只有 `read_attachment`
+- 聊天区用户消息里的引用块渲染为行内代码（`_chips_as_code`）
+- 用户消息下方附件按钮行（`att-<节点ID>-<序号>`），点击弹出只读 `AttachmentViewScreen`
+- 草稿与附件随树持久化：`TreeState.draft` + `draft_attachments`，`ChatInput.restore_chips`
+- 节点删除：侧栏选中后 `Delete`（`check_action` 限定焦点在树上）+ `/delete`
+- 附件导入改到线程执行（`asyncio.to_thread`），网页抓取不卡 UI
 
-验收：矩阵逐项断言；写直通不弹窗、写需确认可取消；联网关闭时无搜索/抓取工具。
+### Phase 5 命令面与界面：已完成
 
-### Phase 4 输入与聊天区完善：待做
+- `mincli/tui/commands.py` 收敛为 15 个一级命令并同步补全与 `/help`
+- 删除 `/wf` `/mcp` `/import` `/view` `/info` `/full` `/set`
+- 欢迎页（`#welcome` + `#welcome-new`）、侧栏新建、`Ctrl+N`；删除 `tui/tree_wizard.py`
+- `/recall on|off`；底部状态栏三路入口一致
+- 删除导入提示与悬停弹窗
+- 测试：`tests/test_tui.py`
 
-步骤：
-1. 聊天区用户消息中的块渲染成行内代码样式
-2. 消息下方附件按钮行 + 只读全文弹窗
-3. 草稿与附件随树持久化（切换树再回来，块与内容都在）
-4. 节点删除：`Delete` 键 + `/delete`
-5. 测试：块回显、弹窗内容、草稿恢复
+### Phase 6 清理、文档与测试：已完成
 
-验收：发送带附件消息后回看，块是等宽样式，按钮能打开全文；切换树后草稿与块仍在。
-
-### Phase 5 命令面与界面：待做
-
-步骤：
-1. `commands.py` 收敛到 14 条（第 2 节 #16），补全与 `/help` 同步
-2. 删除 `/wf` `/mcp` `/import` `/info` `/view` `/full` `/set`（`/files` 保留）
-3. 欢迎页、侧栏新建、`Ctrl+N`；删除 `tree_wizard.py`
-4. `/recall on|off`
-5. 清理导入提示与悬停弹窗（附件已在输入框内）
-6. 测试：命令表、补全、欢迎页、三路开关一致
-
-验收：`/help` 只有 14 条；无树时是欢迎页；新建不弹向导。
-
-### Phase 6 清理、文档与测试：待做
-
-步骤：
-1. 删除 `mcp_client.py`、`mcp_server.py`、`workflows.py`、`tools/execute.py`、`tools/thinking.py`、`tools/registry.py`、`tui/tree_wizard.py`
-2. `pyproject.toml`：移除 `mcp`、`trafilatura`；新增 `httpx`、`tomli; python_version < "3.11"`；`textual>=8`；版本 `0.2.0`
-3. 测试重写：删工作流 / MCP / shell / 向导相关；保留多树、压缩、图片、定价；新增配置 / 工具 / 附件 / 命令
-4. `readme.md` 与 `readme.zh.md` 重写（特性、命令、配置、工具、附件、限制）
-5. 全量测试 + `mincli chat` 冒烟（不启动任何子进程）
-
-验收：测试全绿；启动无 stdio 子进程；readme 与实现一致。
-
----
+- 删除 `mcp_client.py`、`mcp_server.py`、`workflows.py`、`tools/execute.py`、
+  `tools/thinking.py`、`tools/registry.py`、`tools/web_fetch.py`、`tui/tree_wizard.py`、
+  双份 `system_prompt*.md`
+- `pyproject.toml`：移除 `mcp`、`trafilatura`、`requests`；新增 `httpx`、`tomli`（<3.11）；
+  `textual>=8`；版本 `0.2.0`
+- 测试重写：`test_controller`（25）、`test_tui`（25）、`test_config`（12）、
+  `test_tools`（23）、`test_attachments`（10）、`test_images`、`test_trees`；
+  删除 `test_web_fetch.py`；`check()` 在 pytest 下失败会抛断言（不再静默通过）
+- `readme.md` / `readme.zh.md` 重写
+- 全量测试 + `mincli info` 冒烟（临时 HOME）
 
 ## 8. 技术结论与坑（已验证）
 
@@ -356,13 +348,12 @@ Phase 0 临时状态（后续 Phase 修）：
 cd /Users/pengyingqi/mincli
 python3 -m mincli chat        # 或 mincli chat（可编辑安装）
 python3 -m mincli info
-python3 -m pytest -q tests/   # 当前 85 passed
+python3 -m pytest -q tests/   # 当前 114 passed
 ```
 
 - 工作区：`/Users/pengyingqi/mincli`
 - 分支：`refactor`
-- 当前未提交：`mincli/tui/widgets.py`、`tests/test_chips.py`
-- 提交前先跑全量测试；每个 Phase 一个提交，提交信息用中文、不带 emoji
+- 提交前先跑全量测试；提交信息用中文、不带 emoji
 
 ---
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
@@ -27,10 +27,13 @@ from mincli.tools.images import (
     make_path_attachment,
     make_url_attachment,
 )
-from mincli.tools.web_fetch import fetch_webpage
+from mincli.tools.web_tools import WebApiError, fetch_page
 
 # 附件正文内联上限（字符）。超出的部分不随消息发送，改由 read_attachment 分段读取。
 INLINE_MAX_CHARS = 3000
+
+# 引用块里网页标题的最大显示长度
+WEB_TITLE_MAX_CHARS = 24
 
 # parse_file / fetch_webpage 的失败文案前缀（视为导入失败而非正文）
 _FAIL_PREFIXES = (
@@ -66,6 +69,7 @@ class Attachment:
     image: Optional[ImageAttachment] = None
     is_url: bool = False
     attachment_id: str = ""
+    stored_path: str = ""        # 正文落盘副本（长附件续读用）
 
     @property
     def dedupe_key(self) -> str:
@@ -93,6 +97,34 @@ class Attachment:
         if not self.text:
             return 0
         return self.text.count("\n") + 1
+
+    @property
+    def char_count(self) -> int:
+        return len(self.text or "")
+
+    def metadata(self) -> dict:
+        """随节点序列化的元数据（不含正文，正文在 stored_path）。"""
+        return {
+            "id": self.attachment_id,
+            "kind": self.kind,
+            "name": self.name,
+            "path": self.path,
+            "stored_path": self.stored_path,
+            "lines": self.line_count,
+            "chars": self.char_count,
+        }
+
+    @classmethod
+    def from_metadata(cls, data: dict) -> "Attachment":
+        """从节点元数据恢复一个只带落盘正文的附件。"""
+        return cls(
+            kind=str(data.get("kind") or KIND_DOCUMENT),
+            name=str(data.get("name") or ""),
+            path=str(data.get("path") or ""),
+            is_url=bool(data.get("path", "").startswith(("http://", "https://"))),
+            attachment_id=str(data.get("id") or ""),
+            stored_path=str(data.get("stored_path") or ""),
+        )
 
 
 def _is_failure(text: str) -> bool:
@@ -124,7 +156,12 @@ def _strip_parse_header(raw: str, path: str) -> str:
 
 
 def _make_id(key: str, text: str) -> str:
-    return hashlib.sha1(f"{key}\0{text[:200]}".encode("utf-8", "ignore")).hexdigest()[:12]
+    """内容哈希：同一路径不同内容会得到不同 id，避免旧副本被复用。"""
+    digest = hashlib.sha1()
+    digest.update(key.encode("utf-8", "ignore"))
+    digest.update(b"\0")
+    digest.update((text or "").encode("utf-8", "ignore"))
+    return digest.hexdigest()[:16]
 
 
 def load_attachment(target: str, detail: str = "auto") -> Attachment:
@@ -147,11 +184,14 @@ def load_attachment(target: str, detail: str = "auto") -> Attachment:
                 is_url=True,
                 attachment_id=_make_id(target, ""),
             )
-        text = fetch_webpage(target)
-        if _is_failure(text):
-            raise ValueError(text)
-        title = _title_from_text(text)
+        try:
+            title, text = fetch_page(target)
+        except WebApiError as exc:
+            raise ValueError(str(exc)) from exc
         domain = urlparse(target).netloc or target
+        title = (title or "").strip().replace("]", "）").replace("[", "（")
+        if len(title) > WEB_TITLE_MAX_CHARS:
+            title = title[:WEB_TITLE_MAX_CHARS]
         name = f"{domain}/{title}" if title else domain
         return Attachment(
             kind=KIND_WEB,
@@ -260,3 +300,55 @@ def compose_message(
         return user_text, images
     body = "\n---\n".join(blocks)
     return f"{user_text}\n\n---\n\n{body}", images
+
+
+# ---------------- 正文落盘（长附件续读与旧会话恢复） ----------------
+
+
+def store_attachment_text(att: Attachment, directory: str) -> str:
+    """把附件正文写到 ``<directory>/<id>.txt``，返回落盘路径（图片或空正文返回空串）。"""
+    if not att.text or not att.attachment_id:
+        return att.stored_path
+    directory = os.path.expanduser(directory)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{att.attachment_id}.txt")
+    if not os.path.exists(path):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(att.text)
+        os.replace(tmp, path)
+    att.stored_path = path
+    return path
+
+
+def load_stored_text(att: Attachment) -> str:
+    """读取附件落盘正文（内存里没有时用）。"""
+    if att.text:
+        return att.text
+    if not att.stored_path:
+        return ""
+    try:
+        with open(os.path.expanduser(att.stored_path), "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def collect_stale_attachments(directory: str, keep_ids: set) -> int:
+    """删除目录里不再被任何会话引用的正文文件，返回删除数量。"""
+    directory = os.path.expanduser(directory)
+    if not os.path.isdir(directory):
+        return 0
+    removed = 0
+    for name in os.listdir(directory):
+        if not name.endswith(".txt"):
+            continue
+        stem = name[: -len(".txt")]
+        if stem in keep_ids:
+            continue
+        try:
+            os.remove(os.path.join(directory, name))
+            removed += 1
+        except OSError:
+            continue
+    return removed

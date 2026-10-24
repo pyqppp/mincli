@@ -1,4 +1,4 @@
-"""mincli ChatApp 主应用（阶段 3：斜杠命令迁移到 TUI）。
+"""mincli ChatApp 主应用：对话树 + 消息流 + 底部能力开关。
 
 运行：`venv/bin/python -m mincli.tui.app`（需要真实终端 + DEEPSEEK_API_KEY）
 """
@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+from typing import Optional
 
 # 必须在 Textual Markdown 组件创建解析器之前执行：
 # 防御 markdown-it-py 解析极端输入（引用块内表格被流式截断等）时的越界崩溃
@@ -26,7 +27,8 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Header, Markdown, Static, Tree
+from textual.screen import ModalScreen
+from textual.widgets import Button, Header, Markdown, Static, TextArea, Tree
 from textual.widgets._header import HeaderIcon, HeaderTitle
 
 # 防御 Textual 选区提取越界：流式渲染会重建 Markdown 块，拖选跨越重建
@@ -97,31 +99,20 @@ def _safe_screen_forward_event(self, event) -> None:
 _patch_textual_screen_forward_event()
 
 from mincli.config import (
-    DEFAULT_SYSTEM_PROMPT,
-    DEFAULT_MINIMAL_SYSTEM_PROMPT,
-    MODEL_FLASH,
+    API_KEY_VAR,
     BALANCE_REFRESH_SECONDS,
+    DEEPSEEK_BASE_URL,
     FILES_LIST_PAGE,
     FILES_LIST_PAGE_MAX,
     FILES_MAX_BYTES,
     FILES_MAX_COUNT,
-    PREVIEW_ASSISTANT_MSG_LEN,
-    PREVIEW_USER_MSG_LEN,
-    TEMPERATURE_MAX,
-    TEMPERATURE_MIN,
-    MODELS_AVAILABLE,
-    API_PROVIDERS,
-    load_models,
-    register_model,
-    get_mcp_config_path,
-    load_mcp_servers,
-    save_mcp_servers,
+    api_key as configured_api_key,
+    ensure_config,
+    system_prompt,
 )
-from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
+from mincli.controller import ChatController, ControllerEvent
 from mincli.attachments import Attachment, compose_message, load_attachment
-from mincli.helpers import open_path_with_os, split_path_args
 from mincli.tools.files import FilesAPIError
-from mincli.tools.images import image_placeholder_text
 from mincli.tui.commands import (
     Completion,
     command_block,
@@ -132,7 +123,6 @@ from mincli.tui.commands import (
 )
 from mincli.tui.confirm import ConfirmScreen
 from mincli.tui.theme import TREE_THEMES, color_label, theme_name
-from mincli.tui.tree_wizard import TreeWizardScreen
 from mincli.tui.widgets import ChatInput, ToolCard, TreeRow
 
 WELCOME = """# mincli
@@ -142,30 +132,29 @@ DeepSeek 树状对话 TUI
 - **左侧**：对话树（点击节点切换，点小三角收起/展开）
 - **中间**：消息流（Markdown 流式渲染）
 - **底部**：多行输入框（**Enter** 发送，**Ctrl+J** 换行）
-- **Esc** / 生成中 **Ctrl+C**：打断当前生成或正在执行的命令
-- **Ctrl+C**：退出（自动保存会话）
+- **Esc** / 生成中 **Ctrl+C**：打断当前生成
+- **Ctrl+N**：新建对话树
 
 直接输入问题开始对话，输入 `/help` 查看命令。
 """
 
 # 命令补全/提示、/help、各处的用法提示都来自 mincli/tui/commands.py 的同一份
-# 命令规格（三级：/set → /set thinking → /set thinking on），这里不再维护文案表。
+# 命令规格，这里不再维护文案表。
 COMPLETION_HINT = "Tab 切换 · Shift+Tab 反向 · Enter 补全"
 
 # /help 尾部：命令清单由命令规格生成，这里只补规格里没有的说明
 HELP_TAIL = """
 **补充说明**
 - 输入 `/` 打开命令补全：继续输入过滤候选，**Tab** 循环（**Shift+Tab** 反向），**Enter** 补全；命令写完按 **Enter** 执行
-- 二级命令（如 `/set thinking on|off`）与运行时候选（对话树编号、工作流名、MCP server 名）都能补全
 - `/<节点ID>`（如 `/a3`）— 直接跳转到指定节点
-- 图片理解仅 deepseek-flash 支持；其他模型会提示切换
-- 配置类命令（`/set ...`）对当前对话树生效，工作目录与审核层级也是每棵树独立
+- 图片理解仅 flash 支持；当前模型不支持时会提示切换
+- 底部状态栏的「文件」「联网」可点击，也可用 `/file`、`/web` 切换
 
 **快捷键**
 - **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行
 - **Tab** 命令补全/循环候选 · **Shift+Tab** 反向循环候选
-- **Esc** / 生成中 **Ctrl+C** 打断当前生成或正在执行的命令（再按一次 **Ctrl+C** 强制退出） · **Ctrl+C** 退出
-- **Ctrl/Alt+1~8** 切换对话树
+- **Ctrl+N** 新建对话树 · **Ctrl/Alt+1~8** 切换对话树 · 侧栏选中节点后 **Delete** 删除
+- **Esc** / 生成中 **Ctrl+C** 打断当前生成（再按一次 **Ctrl+C** 强制退出） · **Ctrl+C** 退出
 """
 
 # 思考过程：灰色块引用（不再折叠/点击展开；多轮工具调用时每个思考段
@@ -190,6 +179,10 @@ FLUSH_INTERVAL_MAX = 0.35        # 自适应刷新间隔上限（秒）
 
 # 列表项行首（有序/无序），封段处若正好落在列表项上会把列表拆成两段、序号重排
 _LIST_ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s")
+
+# 输入框引用块：[IMAGE x.jpg] / [DOCX x.docx] / [WEB example.com]。
+# 聊天区回显时转成行内代码样式（不能丢字，也不能被 Markdown 当链接解析）。
+_CHIP_BLOCK_RE = re.compile(r"\[((?:IMAGE|WEB|[A-Z0-9]{1,8})) ([^\[\]\n]+)\]")
 
 
 def _strip_quote_prefix(line: str) -> str:
@@ -272,6 +265,32 @@ def quote_block_text(text: str) -> str:
 # 第 9 棵起循环复用。背景/面板色 8 套一致，只轮换主色与强调色。
 
 
+class AttachmentViewScreen(ModalScreen[None]):
+    """附件正文只读弹窗（带行号，Escape 关闭）。"""
+
+    BINDINGS = [Binding("escape", "dismiss", "关闭", show=False)]
+
+    def __init__(self, name: str, text: str, note: str = "") -> None:
+        super().__init__()
+        self._name = name
+        self._text = text
+        self._note = note
+
+    def compose(self) -> ComposeResult:
+        lines = self._text.count("\n") + 1 if self._text else 0
+        with Vertical(id="attachment-view-box"):
+            title = f"{self._name}（{lines} 行）" if lines else self._name
+            yield Static(title, id="attachment-view-title", markup=False)
+            if self._note:
+                yield Static(self._note, id="attachment-view-note", markup=False)
+            yield TextArea(
+                self._text,
+                read_only=True,
+                show_line_numbers=True,
+                id="attachment-view-text",
+            )
+
+
 class ChatHeader(Header):
     """顶栏：左侧标题，右侧显示当前对话树编号与后台完成状态。
 
@@ -322,6 +341,9 @@ class ChatApp(App):
         # 用 priority 覆盖掉（删词仍可用 Ctrl+Backspace / Alt+Backspace）。
         Binding("ctrl+r", "cycle_file_mode", "文件权限", show=False, priority=True),
         Binding("ctrl+w", "toggle_web", "联网开关", show=False, priority=True),
+        # 新建对话树 / 删除侧栏选中节点（输入框聚焦时由 check_action 让位）
+        Binding("ctrl+n", "new_tree", "新建对话树", show=False, priority=True),
+        Binding("delete", "delete_node", "删除节点", show=False, priority=True),
     ] + _TREE_SWITCH_BINDINGS
 
     def __init__(self, controller: ChatController | None = None, **kwargs) -> None:
@@ -361,19 +383,8 @@ class ChatApp(App):
         self._stream_seg_chars = 0  # 已 append 到当前段的字符数
         self._stream_seg_raw = ""  # 当前段的原始文本（未加 `> ` 前缀），用于结构判断
         self._balance_txt: Optional[str] = None  # 最近一次拉取的账户余额（字符串）
-        # 工作流（/wf）：已挂载到“下一次输入”的工作流名（发送后自动解除）
-        self._pending_wf: Optional[str] = None
         # /files：最近一次列表结果（供 /files info|delete 用序号引用，免手抄 file_id）
         self._files_listing: list = []
-        # 能力开关（Phase 0 先放内存，Phase 1 接 config.toml 持久化）
-        self._file_mode = "off"   # off | read | confirm | direct
-        self._web_on = True
-        # /wf edit：系统编辑器打开的临时文档轮询（检测改动后自动回写）
-        self._wf_edit_timer = None  # textual Interval
-        self._wf_edit_path: Optional[str] = None
-        self._wf_edit_name: Optional[str] = None
-        self._wf_edit_mtime: Optional[float] = None
-        self._wf_edit_deadline: Optional[float] = None
 
     def action_ignore_lock(self) -> None:
         """忽略锁定键（Caps Lock / Num Lock / Scroll Lock）。"""
@@ -396,7 +407,7 @@ class ChatApp(App):
         if self.ctrl is None or not self._turn_active:
             return
         self.ctrl.interrupt()
-        self.notify("⏹ 正在打断当前生成/命令…", timeout=3)
+        self.notify("正在打断当前生成…", timeout=3)
 
     def _set_turn_active(self, active: bool) -> None:
         """切换「生成中」状态：占用期间输入框占位提示如何打断。"""
@@ -438,6 +449,7 @@ class ChatApp(App):
             with Vertical(id="sidebar"):
                 with Horizontal(id="sidebar-header"):
                     yield Static("会话", id="sidebar-title")
+                    yield Button("＋ 新建", id="sidebar-new", compact=True)
                     yield Button("全览", id="fullview-btn", compact=True)
                 # 对话树列表：最多 3 行，超出这栏内部滚动（见 chat.tcss）
                 yield VerticalScroll(id="tree-list")
@@ -448,13 +460,9 @@ class ChatApp(App):
         yield ChatInput(
             id="chat-input", placeholder="输入消息，Enter 发送，Ctrl+J 换行"
         )
-        # 悬停弹窗放独立布局层（见 chat.tcss #import-popup），固定显示在状态条上方
-        # markup=False：这里显示文件名/工作流名，方括号或 `x="y"` 会被当标签解析而报错
-        yield Static("", id="import-popup", markup=False)
-        # 状态条合并三分栏：左=缓存/余额，中=已导入文件提示（悬停显示完整列表），右=下次输入
+        # 状态条：左=缓存/余额，右=下次输入估算
         with Horizontal(id="usage-bar"):
             yield Static("", id="usage-left", markup=False)
-            yield Static("", id="usage-center", markup=False)
             yield Static("", id="usage-right", markup=False)
         with Horizontal(id="status-footer"):
             yield Static("", id="footer-hint", markup=False)
@@ -466,65 +474,61 @@ class ChatApp(App):
         if self._injected_controller is not None:
             self.ctrl = self._injected_controller
         else:
-            api_key = os.getenv("DEEPSEEK_API_KEY")
-            if not api_key:
-                self.notify("未设置 DEEPSEEK_API_KEY（请在 .env 或环境变量中配置）", severity="error", timeout=10)
+            key = configured_api_key()
+            if not key:
+                self.notify(
+                    f"未设置 {API_KEY_VAR}（请在 .env 或环境变量中配置）",
+                    severity="error",
+                    timeout=10,
+                )
                 return
+            cfg = ensure_config()
             from openai import OpenAI
             self.ctrl = ChatController(
-                client=OpenAI(api_key=api_key, base_url="https://api.deepseek.com"),
-                default_system=DEFAULT_SYSTEM_PROMPT,
-                default_system_minimal=DEFAULT_MINIMAL_SYSTEM_PROMPT,
-                default_temperature=1.0,
-                default_model=MODEL_FLASH,
-                # MCP 由 _start_mcp 在首屏之后后台启动（日志出口也得先接好）
-                auto_start_mcp=False,
+                client=OpenAI(api_key=key, base_url=DEEPSEEK_BASE_URL),
+                config=cfg,
+                default_system=system_prompt(cfg),
             )
         self.ctrl.confirm = self._confirm
-        self._start_mcp()
         self.query_one("#tree", Tree).auto_expand = False  # 点击节点名只切换节点，不收起/展开
-        # 状态条中段导入提示 + 其上方的悬停弹窗（缓存引用，on_mouse_move 高频使用）
-        self._import_center_w = self.query_one("#usage-center", Static)
-        self._import_popup_w = self.query_one("#import-popup", Static)
         self._rebuild_tree()
         self.query_one("#chat-input", ChatInput).focus()
         self._refresh_tree_ui()
         self._start_balance_refresh()
         self._refresh_usage_bar()
-        self._refresh_import_status()
         self._refresh_status_footer()
         # 启动即进入上次会话的当前节点：渲染放在首帧之后（恢复长对话的
         # Markdown 要 0.5s 左右，没必要挡在界面出现之前），界面先出来，
         # 内容紧接着补上——见 _restore_current_view。
         self.call_after_refresh(self._restore_current_view)
-        # 一棵树都没有：界面先出来，再弹建树向导（取消则退出程序）
-        if not self.ctrl.has_trees:
-            self.call_after_refresh(lambda: self._open_tree_wizard(initial=True))
 
     async def _restore_current_view(self) -> None:
-        """首帧渲染完成后显示当前节点内容（无节点时显示欢迎页）。"""
+        """首帧渲染完成后显示当前节点内容（无树时显示欢迎页）。"""
         if self.ctrl is None or self.ctrl.tree is None:
             return
         # 首帧到这里的间隙里用户已经发了消息：别用旧节点内容盖掉当前视图
         if self._turn_active or self._stream_active:
             return
         if not self.ctrl.has_trees:
-            await self._chat_reset(WELCOME)
+            await self._show_welcome()
             return
         node = self.ctrl.tree.current_node
         if node is not None:
             await self._switch_to(node.id)
         else:
             await self._chat_reset(WELCOME)
-        self._load_draft()
+        # 首帧期间用户可能已经拖入文件或粘了路径：不要用空草稿把它盖掉
+        try:
+            if not self.query_one("#chat-input", ChatInput).text:
+                self._load_draft()
+        except Exception:
+            self._load_draft()
 
     def on_unmount(self) -> None:
         self._cancel_flush()
-        self._wf_stop_edit()
         if self.ctrl is not None:
             self._save_draft()
             self.ctrl.save_session()
-            self.ctrl.close()
 
     # ---------------- 对话树：侧栏列表 / 顶部徽标 / 配色 / 草稿 ----------------
 
@@ -567,8 +571,8 @@ class ChatApp(App):
         numbers = self.ctrl.tree_numbers()
         active = self.ctrl.active_number
         if not numbers:
-            # 一棵树都没有：这一栏不占行（只剩上面那行「会话/全览」）。
-            # 此时界面由建树向导 + 徽标/输入框提示引导，不需要占位文字。
+            # 一棵树都没有：这一栏不占行（只剩上面那行「会话/新建」）。
+            # 此时聊天区显示欢迎页引导新建。
             self._tree_rows = []
             try:
                 container.styles.height = 0
@@ -641,7 +645,10 @@ class ChatApp(App):
         if self.ctrl is None:
             return
         try:
-            self.ctrl.draft = self.query_one("#chat-input", ChatInput).text
+            inp = self.query_one("#chat-input", ChatInput)
+            self.ctrl.draft = inp.text
+            # 引用块随草稿一起存（切回来时按同样的名字恢复成块）
+            self.ctrl.draft_attachments = [a.metadata() for a in inp.chip_attachments()]
         except Exception:
             pass
 
@@ -660,6 +667,9 @@ class ChatApp(App):
                 inp.move_cursor((inp.document.line_count - 1, len(inp.document.lines[-1])))
             except Exception:
                 pass
+        metas = self.ctrl.draft_attachments
+        if metas:
+            inp.restore_chips([Attachment.from_metadata(m) for m in metas])
         self._update_command_popup(inp.text)
 
     def _reset_view_state(self) -> None:
@@ -671,14 +681,20 @@ class ChatApp(App):
         self._active_tool_card = None
 
     async def _render_active_tree(self) -> None:
-        """把界面切到当前树的当前节点（无节点则显示欢迎页）。"""
+        """把界面切到当前树的当前节点（无树显示欢迎页，空树显示引导）。"""
         if self.ctrl is None:
             return
         self._reset_view_state()
+        if not self.ctrl.has_trees:
+            await self._show_welcome()
+            self._rebuild_tree()
+            self._load_draft()
+            self._refresh_usage_bar()
+            return
         tree = self.ctrl.tree
         node = tree.current_node if tree is not None else None
         if node is not None:
-            await self._chat_reset(self._node_content(node))
+            await self._render_node_view(node)
             await self._chat_shrink_lists(scroll=False)
             self._answer_started = True
         else:
@@ -688,7 +704,6 @@ class ChatApp(App):
             self._select_tree_node(node.id)
         self._load_draft()
         self._refresh_usage_bar()
-        self._refresh_import_status()
 
     async def _switch_tree(self, number: int, notify: bool = True) -> bool:
         """切换到指定对话树（正在生成的那棵树会继续在后台跑）。"""
@@ -719,130 +734,41 @@ class ChatApp(App):
         """点击侧栏某一行对话树 → 切换过去。"""
         await self._switch_tree(int(event.number))
 
-    # ---------------- 建树 / 改能力向导 ----------------
+    # ---------------- 新建对话树 / 欢迎页 ----------------
 
-    def _open_tree_wizard(
-        self, initial: bool = False, edit_number: int | None = None
-    ) -> None:
-        """弹出建树向导（initial=True 表示启动时没有树，取消则退出程序）。"""
+    def action_new_tree(self) -> None:
+        """新建一棵空对话树（所有树完全一样）。"""
         if self.ctrl is None:
             return
-        if edit_number is None:
-            heading = "新建对话树"
-            note = (
-                "对话能力必选；系统工具与外置 MCP 工具按需勾选。"
-                "两者都不勾选 = 纯对话（使用最小系统提示词）。"
-                "建好后可用 /tree N tools 修改。"
-            )
-            caps = {"system_tools": True, "mcp_tools": []}
-        else:
-            heading = f"对话树 {edit_number} 的能力"
-            note = "改动对下一次请求生效。"
-            caps = self.ctrl.tree_caps(edit_number)
-        screen = TreeWizardScreen(
-            heading=heading,
-            note=note,
-            groups=self.ctrl.available_tool_groups(),
-            servers=self.ctrl.external_servers(),
-            initial=caps,
-            mcp_ready=self.ctrl.mcp_ready,
-        )
-
-        def on_done(result) -> None:
-            if result is None:
-                if initial:
-                    self.notify("未创建对话树，退出程序")
-                    self.exit()
-                return
-            if edit_number is None:
-                number = self.ctrl.create_tree(
-                    result["system_tools"], result["mcp_tools"]
-                )
-                asyncio.ensure_future(self._after_tree_created(number))
-            else:
-                self.ctrl.set_tree_caps(
-                    edit_number, result["system_tools"], result["mcp_tools"]
-                )
-                self._refresh_tree_ui()
-                self.notify(f"对话树 {edit_number} 的能力已更新")
-
-        self.push_screen(screen, callback=on_done)
+        number = self.ctrl.create_tree()
+        asyncio.ensure_future(self._after_tree_created(number))
 
     async def _after_tree_created(self, number: int) -> None:
         self._refresh_tree_ui()
         await self._render_active_tree()
-        self.notify(
-            f"已创建对话树 {number}（{color_label(self.ctrl.tree_color())}）"
-        )
+        self.notify(f"已创建对话树 {number}（{color_label(self.ctrl.tree_color())}）")
 
-    def _refresh_wizard_tools(self) -> None:
-        """MCP 连完后把工具列表补进正开着的建树向导。"""
-        if self.ctrl is None:
-            return
-        try:
-            screen = self.screen
-        except Exception:
-            return
-        if isinstance(screen, TreeWizardScreen):
-            screen.refresh_tools(
-                self.ctrl.available_tool_groups(),
-                self.ctrl.external_servers(),
-                self.ctrl.mcp_ready,
+    async def _show_welcome(self) -> None:
+        """一棵树都没有：聊天区显示欢迎页（含新建按钮）。"""
+        container = self._chat_container()
+        await container.remove_children()
+        self._chat_blocks = []
+        self._chat_md = None
+        self._active_tool_card = None
+        self._reasoning_open = False
+        self._stream_seg_chars = 0
+        self._stream_seg_raw = ""
+        await container.mount(
+            Vertical(
+                Static("mincli", id="welcome-title"),
+                Static(
+                    "树状对话工作台：新建一棵对话树，开始阅读资料与写作。",
+                    id="welcome-desc",
+                ),
+                Button("新建对话树", id="welcome-new", variant="primary"),
+                id="welcome",
             )
-
-    # ---------------- MCP 后台连接 ----------------
-
-    def _start_mcp(self) -> None:
-        """接上 MCP 日志出口并确保后台连接已启动。
-
-        MCP 连接不再挡在首屏前面（原本要等 4 秒左右），改为后台进行：界面先
-        出来，连接完成后再补上 MCP 工具；期间发送消息会短暂等待（见
-        ChatController.wait_mcp_ready）。
-        """
-        if self.ctrl is None:
-            return
-        self.ctrl.mcp_logger = self._on_mcp_log
-        if not self.ctrl.mcp_started:
-            self.ctrl.start_mcp()
-        if self.ctrl.mcp_started and self.ctrl.mcp_connecting:
-            self._watch_mcp_ready()
-
-    def _watch_mcp_ready(self) -> None:
-        """后台等待 MCP 连接结束，完成后刷新状态条（不阻塞 UI）。"""
-        self.run_worker(
-            self._wait_mcp_worker, name="mcp-ready", thread=True, exit_on_error=False
         )
-
-    def _wait_mcp_worker(self) -> None:
-        if self.ctrl is None:
-            return
-        try:
-            self.ctrl.wait_mcp_ready()
-        finally:
-            try:
-                self.call_from_thread(self._on_mcp_ready_ui)
-            except Exception:
-                pass
-
-    def _on_mcp_ready_ui(self) -> None:
-        """MCP 连接结束：刷新状态条，并把刚取到的工具列表补进建树向导。"""
-        self._refresh_usage_bar()
-        self._refresh_wizard_tools()
-
-    def _on_mcp_log(self, message: str) -> None:
-        """MCP 客户端日志（后台线程）→ 主线程通知。
-
-        这些消息以前是 print 在 TUI 启动之前输出的；现在连接在后台进行，
-        直接写 stdout 会把界面冲乱，所以统一转成通知。
-        """
-        try:
-            self.call_from_thread(self._show_mcp_log, message)
-        except Exception:
-            pass
-
-    def _show_mcp_log(self, message: str) -> None:
-        self.notify(message, timeout=5)
-        self._refresh_usage_bar()
 
     # ---------------- 输入栏状态条（缓存命中率 / 余额 / 下次输入） ----------------
 
@@ -887,64 +813,70 @@ class ChatApp(App):
         else:
             bal_txt = f"¥{self._balance_txt}"
         left = f"缓存命中 {rate_txt}   余额 {bal_txt}"
-        if self.ctrl.mcp_connecting:
-            left += "   MCP 连接中…"
         self.query_one("#usage-left", Static).update(left)
         tokens = stats["next_input_tokens"]
         price = stats["estimated_price"]
         price_txt = f"≈ ¥{price:.4f}" if price is not None else "--"
         peak_txt = "高峰" if stats["peak"] else "空闲"
         self.query_one("#usage-right", Static).update(
-            f"⏭ 下次输入 {tokens:,} tok {price_txt}（{peak_txt}价）"
+            f"下次输入 {tokens:,} tok {price_txt}（{peak_txt}价）"
         )
 
-    # ---------------- 能力开关（文件四态 / 联网） ----------------
+    # ---------------- 能力开关（文件四态 / 联网，状态以 ctrl.config 为准） ----------------
 
-    FILE_MODE_LABELS = {
-        "off": "文件 关闭",
-        "read": "文件 只读",
-        "confirm": "文件 写需确认",
-        "direct": "文件 写直通",
-    }
     FILE_MODE_ORDER = ("off", "read", "confirm", "direct")
 
     def _refresh_status_footer(self) -> None:
         """把当前能力状态写进底部状态栏（失败静默：首帧前控件可能还没挂）。"""
+        if self.ctrl is None:
+            return
+        cfg = self.ctrl.config
         try:
             self.query_one("#footer-hint", Static).update(
                 "Ctrl+R 文件权限   Ctrl+W 联网   /help 帮助"
             )
-            self.query_one("#footer-file", Static).update(
-                self.FILE_MODE_LABELS.get(self._file_mode, "文件 关闭")
-            )
-            self.query_one("#footer-web", Static).update(
-                f"联网 {'开' if self._web_on else '关'}"
-            )
+            self.query_one("#footer-file", Static).update(f"文件 {cfg.files_label}")
+            self.query_one("#footer-web", Static).update(f"联网 {cfg.web_label}")
         except Exception:
             pass
 
     def _set_file_mode(self, mode: str) -> None:
-        if mode not in self.FILE_MODE_LABELS:
-            self.notify(f"无效文件权限: {mode}", severity="warning")
+        """切换文件四态：写回配置（controller 负责落盘）后只刷新界面。"""
+        if self.ctrl is None:
             return
-        self._file_mode = mode
+        if not self.ctrl.set_files_mode(mode):
+            self.notify(
+                f"无效文件权限：{mode}；{usage_line('/file')}", severity="warning"
+            )
+            return
         self._refresh_status_footer()
-        self.notify(f"文件权限：{self.FILE_MODE_LABELS[mode]}")
+        self.notify(f"文件权限：{self.ctrl.config.files_label}")
 
     def action_cycle_file_mode(self) -> None:
         """Ctrl+R：关闭 → 只读 → 写需确认 → 写直通 → 关闭。"""
-        current = self._file_mode if self._file_mode in self.FILE_MODE_ORDER else "off"
-        index = self.FILE_MODE_ORDER.index(current)
+        if self.ctrl is None:
+            return
+        current = self.ctrl.config.files_mode
+        index = (
+            self.FILE_MODE_ORDER.index(current)
+            if current in self.FILE_MODE_ORDER
+            else 0
+        )
         self._set_file_mode(self.FILE_MODE_ORDER[(index + 1) % len(self.FILE_MODE_ORDER)])
 
     def _set_web(self, enabled: bool) -> None:
-        self._web_on = bool(enabled)
+        """切换联网：写回配置后只刷新界面。"""
+        if self.ctrl is None:
+            return
+        self.ctrl.set_web(bool(enabled))
         self._refresh_status_footer()
-        self.notify(f"联网：{'开' if self._web_on else '关'}")
+        self.notify(f"联网：{self.ctrl.config.web_label}")
 
     def action_toggle_web(self) -> None:
         """Ctrl+W：开 / 关联网。"""
-        self._set_web(not self._web_on)
+        if self.ctrl is None:
+            return
+        self._set_web(not self.ctrl.config.web_enabled)
 
     def on_click(self, event) -> None:
         """点击底部状态栏上的开关（鼠标路径）。"""
@@ -956,132 +888,35 @@ class ChatApp(App):
             event.stop()
             self.action_toggle_web()
 
-    def _refresh_import_status(self) -> None:
-        """刷新状态条中段的提示：工作流挂载提示优先，其次「已导入文件」提示。
-
-        无任何提示时清空隐藏（弹窗随之隐藏）。
-        """
-        if self.ctrl is None:
-            return
-        hint = self._import_center_w
-        if self._pending_wf:
-            text = f"工作流已挂载：{self._pending_wf}（发送即执行 · /wf stop 取消）"
-            hint.update(text)
-            hint.add_class("visible")
-            self._import_popup_w.remove_class("visible")
-            return
-        text = self.ctrl.import_summary()
-        if text:
-            hint.update(text)
-            hint.add_class("visible")
-        else:
-            hint.update("")
-            hint.remove_class("visible")
-            self._import_popup_w.remove_class("visible")
-
-    def _pending_images_md(self) -> str:
-        """待发送图片在聊天区里的 Markdown 占位行（提交回显用）。"""
-        if self.ctrl is None or not self.ctrl.pending_images:
-            return ""
-        marks = "\n".join(
-            f"- {image_placeholder_text(a)}" for a in self.ctrl.pending_images
-        )
-        return f"\n\n{marks}"
-
-    # ---------------- 状态条上方固定悬停弹窗（完整文件名列表） ----------------
-    # 弹窗位于独立布局层（CSS layer），显隐不影响主内容布局；显示位置固定贴住
-    # 状态条上方（不跟随光标），设定最小宽度保证可读性。
-
-    _IMPORT_KIND_LABELS = {"image": "图片", "text": "文本", "web": "网页"}
-
-    def _show_import_popup(self) -> None:
-        """在状态条上方固定位置显示完整文件名列表弹窗（悬停中段时）。
-
-        已挂载工作流时中段显示的是工作流提示，不弹导入列表。
-        """
-        if self.ctrl is None:
-            return
-        if self._pending_wf:
-            self._import_popup_w.remove_class("visible")
-            return
-        items = self.ctrl.import_file_list()
-        if not items:
-            return
-        lines = []
-        for item in items:
-            name = item.get("name", "")
-            if len(name) > 100:
-                name = name[:97] + "…"
-            label = self._IMPORT_KIND_LABELS.get(item.get("kind", ""))
-            toks = item.get("tokens") or 0
-            suffix = f" · 约 {toks} tokens" if toks else ""
-            lines.append(
-                f"[{label}] {name}{suffix}" if label else f"· {name}{suffix}"
-            )
-        popup = self._import_popup_w
-        popup.update("\n".join(lines))
-        bar = self.query_one("#usage-bar", Horizontal).region
-        if bar.width <= 0 or bar.height <= 0:
-            return
-        # 绝对定位（offset 相对屏幕左上角）：弹窗左缘与状态条对齐、紧贴其上方。
-        # 高度按内容行数估算（内容 + 圆角边框 1 行，封顶屏幕 40%）。
-        max_h = int(self.screen.size.height * 0.4)
-        h = min(len(lines), max_h) + 1
-        top = max(0, bar.y - h - 1)
-        popup.styles.position = "absolute"
-        popup.styles.offset = (bar.x, top)
-        popup.add_class("visible")
-
-    def on_mouse_move(self, event) -> None:
-        """鼠标在状态条中段（导入提示）上悬停 → 显示完整文件列表；移出 → 自动消失。"""
-        center = getattr(self, "_import_center_w", None)
-        if center is None or event.screen_x is None or event.screen_y is None:
-            return
-        region = center.region
-        if region.width <= 0 or region.height <= 0:
-            return
-        if region.contains(int(event.screen_x), int(event.screen_y)):
-            if not self._import_popup_w.has_class("visible"):
-                self._show_import_popup()
-        else:
-            if self._import_popup_w.has_class("visible"):
-                self._import_popup_w.remove_class("visible")
-
     # ---------------- 拖入文件：在输入框里生成引用块 ----------------
 
-    def _attach_targets(self, targets: list[str], input_widget: ChatInput) -> None:
-        """把路径/URL 逐个解析为附件，成功一个就在光标处插一个引用块。"""
+    async def _attach_targets(self, targets: list[str], input_widget: ChatInput) -> None:
+        """把路径/URL 逐个解析为附件，成功一个就在光标处插一个引用块。
+
+        解析可能包含网页抓取（网络请求），放到线程里做，避免卡住 UI。
+        """
         detail = self.ctrl.image_detail if self.ctrl is not None else "auto"
         added = 0
         for target in targets:
             try:
-                attachment = load_attachment(target, detail=detail)
+                attachment = await asyncio.to_thread(
+                    load_attachment, target, detail
+                )
             except ValueError as exc:
                 self.notify(str(exc), severity="warning")
+                continue
+            except Exception as exc:  # 意外错误也要逐个跳过，不能中断整批
+                self.notify(f"导入失败：{exc}", severity="warning")
                 continue
             input_widget.insert_chip(attachment)
             added += 1
         if added:
             self.notify(f"已插入 {added} 个附件引用，内容将在发送时附在消息之后")
 
-    def _notify_import_result(self, res: dict) -> None:
-        """旧 /import 路径的结果通知（Phase 5 删掉 /import 时一并移除）。"""
-        bits = []
-        if res["images_added"]:
-            bits.append(f"{res['images_added']} 张图片")
-        if res["text_added"]:
-            bits.append(f"{res['text_added']} 个文本/网页")
-        if bits:
-            self.notify(f"已导入 {'、'.join(bits)}，发送时自动附带")
-        for err in res["errors"][:2]:
-            self.notify(err, severity="warning")
-        if len(res["errors"]) > 2:
-            self.notify(f"…共 {len(res['errors'])} 个失败", severity="warning")
-
     async def on_chat_input_files_dropped(self, message: ChatInput.FilesDropped) -> None:
         """输入框内拖入文件：终端把路径粘贴进来 → 转成引用块。"""
         input_widget = self.query_one("#chat-input", ChatInput)
-        self._attach_targets(message.paths, input_widget)
+        await self._attach_targets(message.paths, input_widget)
         input_widget.focus()
 
     async def on_paste(self, event: events.Paste) -> None:
@@ -1092,7 +927,7 @@ class ChatApp(App):
         if self.ctrl is None:
             return
         input_widget = self.query_one("#chat-input", ChatInput)
-        self._attach_targets(paths, input_widget)
+        await self._attach_targets(paths, input_widget)
         input_widget.focus()
 
     # ---------------- 对话树侧栏 ----------------
@@ -1142,6 +977,31 @@ class ChatApp(App):
             tree_w.move_cursor(tn, animate=False)
             tree_w.scroll_to_node(tn, animate=False)
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Delete 只在侧栏树获得焦点时生效，输入框里仍是正常删除字符。"""
+        if action == "delete_node":
+            return isinstance(self.focused, Tree)
+        return True
+
+    def action_delete_node(self) -> None:
+        """删除侧栏选中的节点（含子树，走确认弹窗）。"""
+        if self.ctrl is None:
+            return
+        tree_w = self.query_one("#tree", Tree)
+        tn = tree_w.cursor_node
+        node_id = tn.data if tn is not None else None
+        if not node_id or node_id not in self.ctrl.tree.nodes:
+            return
+        root_id = self.ctrl.tree.root.id if self.ctrl.tree.root else "main"
+        if node_id in ("main", root_id):
+            self.notify("不能删除根节点", severity="warning")
+            return
+        self._ask_confirm(
+            "删除节点",
+            f"确定要删除节点 {node_id} 及其所有子节点吗？",
+            lambda ok, ids=[node_id]: self._on_delete_confirmed(ids, ok),
+        )
+
     def _shrink_lists(self, chat: Markdown) -> None:
         """MarkdownBlock 默认 expand=True，列表块会被拉伸成整屏高度（项目间出现大间隔），
         每次渲染后关闭列表块的 expand。"""
@@ -1167,6 +1027,15 @@ class ChatApp(App):
             self._chat_md = md
             self._chat_blocks.append(md)
         return self._chat_md
+
+    async def _chat_mount_md(self, text: str) -> Markdown:
+        """在容器末尾挂一段新的正文 Markdown（并设为当前段）。"""
+        md = Markdown(text)
+        md.styles.height = "auto"
+        await self._chat_container().mount(md)
+        self._chat_md = md
+        self._chat_blocks.append(md)
+        return md
 
     async def _chat_stream_append(self, text: str) -> None:
         """正文增量 append 到当前段（防御 markdown 解析异常）。"""
@@ -1230,8 +1099,38 @@ class ChatApp(App):
         if scroll:
             self._chat_scroll_end()
 
-    def _node_content(self, node) -> str:
-        """把节点渲染为消息区 Markdown 内容（思考过程内联在提问与回答之间）。"""
+    @staticmethod
+    def _chips_as_code(text: str) -> str:
+        """把引用块显示为行内代码（``[DOCX x.docx]``），其余文字原样保留。"""
+        if not text:
+            return ""
+        return _CHIP_BLOCK_RE.sub(lambda m: f"`[{m.group(1)} {m.group(2)}]`", text)
+
+    def _user_display_text(self, node) -> str:
+        """节点视图里的用户原话：去掉发送时追加的附件正文段，引用块转行内代码。"""
+        text = node.user_msg or ""
+        # compose_message 追加的每段正文都以「--- + 文件名（」开头；按附件名定位，
+        # 避免把用户正文里自带的 --- 分隔线误当成附件段起点。
+        cut = -1
+        for meta in node.attachments or []:
+            if not isinstance(meta, dict):
+                continue
+            name = str(meta.get("name") or "")
+            if not name:
+                continue
+            marker = f"\n\n---\n\n{name}（"
+            pos = text.find(marker)
+            if pos != -1 and (cut == -1 or pos < cut):
+                cut = pos
+        if cut != -1:
+            text = text[:cut]
+        return self._chips_as_code(text)
+
+    def _node_view_parts(self, node) -> tuple[str, str]:
+        """把节点拆成（用户提问区, 思考与回答区）两段 Markdown。
+
+        拆成两段是为了把附件按钮行插在提问下方、回答上方。
+        """
         comp = (
             self.ctrl.tree.compaction
             if self.ctrl is not None and self.ctrl.tree is not None
@@ -1241,19 +1140,89 @@ class ChatApp(App):
             # 摘要节点：直接显示压缩后的信息
             return (
                 f"# {node.id}: {node.title}\n\n"
-                f"**📦 已压缩上下文**\n\n"
-                f"在此节点输入将基于以下摘要继续对话；切换到其他节点仍使用完整历史。\n\n"
-                f"---\n\n{node.user_msg}"
+                f"**已压缩上下文**\n\n"
+                "在此节点输入将基于以下摘要继续对话；切换到其他节点仍使用完整历史。\n\n"
+                f"---\n\n{node.user_msg}",
+                "",
             )
-        content = f"# {node.id}: {node.title}\n\n**你：**\n\n{node.user_msg}\n\n"
-        if node.reasoning:
-            content += "\n\n" + self._build_reasoning_md(node.reasoning) + "\n\n"
-        content += f"**mincli：**\n\n{node.assistant_msg}\n\n"
-        content += (
-            f"---\n\n"
-            f"*📊 输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*"
+        head = (
+            f"# {node.id}: {node.title}\n\n"
+            f"**你：**\n\n{self._user_display_text(node)}"
         )
-        return content
+        rest = ""
+        if node.reasoning:
+            rest += "\n\n" + self._build_reasoning_md(node.reasoning) + "\n\n"
+        rest += f"**mincli：**\n\n{node.assistant_msg}\n\n"
+        rest += (
+            f"---\n\n"
+            f"*输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*"
+        )
+        return head, rest
+
+    @staticmethod
+    def _attachment_buttons(node) -> list[Button]:
+        buttons = []
+        for index, meta in enumerate(node.attachments or []):
+            if not isinstance(meta, dict):
+                continue
+            name = str(meta.get("name") or "附件")
+            buttons.append(
+                # Textual 的 widget id 不允许冒号，这里用 att-<节点ID>-<序号>
+                Button(name, id=f"att-{node.id}-{index}", classes="att-btn")
+            )
+        return buttons
+
+    async def _mount_attachment_row(self, node) -> None:
+        """用户消息下方一行附件按钮（点击查看只读全文）。"""
+        buttons = self._attachment_buttons(node)
+        if not buttons:
+            return
+        row = Horizontal(*buttons, classes="att-row")
+        await self._chat_container().mount(row)
+        self._chat_blocks.append(row)
+
+    async def _render_node_view(self, node) -> None:
+        """渲染一个节点的完整视图（提问 → 附件按钮 → 思考与回答）。"""
+        head, rest = self._node_view_parts(node)
+        await self._chat_reset(head)
+        await self._mount_attachment_row(node)
+        if rest:
+            await self._chat_mount_md(rest)
+
+    def _open_attachment(self, node_id: str, index: int) -> None:
+        """打开节点附件正文（优先读落盘副本，读不到提示正文已不在本地）。"""
+        if self.ctrl is None:
+            return
+        node = self.ctrl.tree.nodes.get(node_id)
+        if node is None or not (0 <= index < len(node.attachments)):
+            self.notify("附件不存在", severity="warning")
+            return
+        meta = node.attachments[index]
+        if not isinstance(meta, dict):
+            self.notify("附件不存在", severity="warning")
+            return
+        name = str(meta.get("name") or "附件")
+        if meta.get("kind") == "image":
+            path = str(meta.get("path") or "")
+            self.push_screen(
+                AttachmentViewScreen(
+                    name,
+                    f"图片附件：{path}\n\n图片以多模态方式随消息发送，没有文本正文。",
+                )
+            )
+            return
+        text = ""
+        stored = str(meta.get("stored_path") or "")
+        if stored:
+            try:
+                with open(os.path.expanduser(stored), "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                text = ""
+        if not text:
+            self.notify("正文已不在本地", severity="warning")
+            return
+        self.push_screen(AttachmentViewScreen(name, text))
 
     # ---------------- 思考过程（灰色块引用；多轮工具调用时每段各自成块） ----------------
 
@@ -1313,9 +1282,17 @@ class ChatApp(App):
         self.query_one("#fullview-btn", Button).label = "分栏" if on else "全览"
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """侧栏「全览/分栏」按钮：切换全览模式。"""
-        if event.button.id == "fullview-btn":
+        """侧栏新建 / 全览按钮 / 附件按钮。"""
+        widget_id = event.button.id or ""
+        if widget_id == "fullview-btn":
             self._set_full_view(not self._full_view)
+        elif widget_id in ("sidebar-new", "welcome-new"):
+            self.action_new_tree()
+        elif widget_id.startswith("att-"):
+            parts = widget_id.split("-")
+            if len(parts) >= 3 and parts[-1].isdigit():
+                node_id = "-".join(parts[1:-1])
+                self._open_attachment(node_id, int(parts[-1]))
 
     # ---------------- 上下键滚动回答区（双击按住 = 2 倍速） ----------------
 
@@ -1340,7 +1317,7 @@ class ChatApp(App):
         self._rebuild_tree()
         self._select_tree_node(node_id)
         node = self.ctrl.tree.current_node
-        await self._chat_reset(self._node_content(node))
+        await self._render_node_view(node)
         await self._chat_shrink_lists(scroll=False)  # 切换节点：显示节点开头，不滚到底
         self._answer_started = True  # 节点视图已含 **mincli：** 头部
         self._refresh_usage_bar()
@@ -1385,7 +1362,7 @@ class ChatApp(App):
     def _update_command_popup(self, text: str) -> None:
         """根据输入内容更新输入框上方的命令补全/提示弹窗。
 
-        候选来自 commands.py 的命令树，支持三级（/set → thinking → on）；
+        候选来自 commands.py 的命令树，支持多级（/file → read）；
         命令写全但没有下一级时，弹窗转为「用法 + 说明」提示。
         """
         popup = self.query_one("#cmd-popup")
@@ -1397,7 +1374,7 @@ class ChatApp(App):
             return
         prev_title = self._completion.title if self._completion else ""
         self._completion = completion
-        # 同一层级内换候选不重置高亮；换了层级（如 /set → /set thinking）则回到第一项
+        # 同一层级内换候选不重置高亮；换了层级（如 /tree → /tree delete）则回到第一项
         if not completion.candidates or completion.title != prev_title:
             self._completion_index = 0
         if self._completion_index >= len(completion.candidates):
@@ -1496,109 +1473,163 @@ class ChatApp(App):
     async def _handle_command(self, text: str) -> bool:
         """处理斜杠命令；返回 True 表示已处理（不再发送给 LLM）。"""
         cmd = text.strip()
-        low = cmd.lower()
+        parts = cmd.split()
+        if not parts:
+            return False
+        head = parts[0].lower()
         ctrl = self.ctrl
 
-        if low in ("/exit", "/quit", "/q", "/e"):
+        if head in ("/exit", "/quit", "/q"):
             self.exit()
             return True
-        if low in ("/clear", "/c"):
-            ctrl.reset()
-            await self._chat_reset(WELCOME)
-            self._rebuild_tree()
+        if head in ("/clear", "/c"):
+            if ctrl is not None and ctrl.has_trees:
+                ctrl.reset()
+                self.notify("对话历史已清除")
+            await self._render_active_tree()
             self._answer_started = False
-            self.notify("对话历史已清除")
             self._refresh_usage_bar()
             return True
-        if low.startswith("/compact"):
+        if head == "/compact":
             await self._cmd_compact(cmd)
             return True
-        # /wf（及 /workflow 别名）：仅精确前缀 + 空格，避免误吞 /wf1 这类节点跳转
-        if (
-            low == "/wf"
-            or low.startswith("/wf ")
-            or low == "/workflow"
-            or low.startswith("/workflow ")
-        ):
-            await self._cmd_wf(cmd)
-            return True
-        if low in ("/view",):
-            self._cmd_view()
-            return True
-        if low in ("/help", "/h"):
+        if head in ("/help", "/h"):
             await self._cmd_help()
             return True
-        if low.startswith("/set"):
-            await self._cmd_set(cmd)
+        if head == "/tree":
+            await self._cmd_tree(cmd)
             return True
-        if low.startswith("/model"):
-            await self._cmd_model(cmd)
+        if head == "/up":
+            await self._cmd_up()
             return True
-        if low.startswith("/mcp"):
-            await self._cmd_mcp(cmd)
+        if head == "/home":
+            await self._cmd_home()
             return True
-        if low in ("/full", "/f"):
-            self._set_full_view(not self._full_view)
-            self.notify("已进入全览模式（切换节点或发送消息自动退出）" if self._full_view else "已退出全览模式")
+        if head == "/delete":
+            await self._cmd_delete(parts[1:])
             return True
-        if await self._cmd_tree(cmd):
+        if head == "/recall":
+            self._cmd_recall(parts[1:])
             return True
-        if low.startswith("/import"):
-            # 参数解析走跨平台 split_path_args：兼容 Windows 反斜杠路径（如 C:\a b\x.txt）
-            cmd_parts = cmd.split(maxsplit=1)
-            targets = split_path_args(cmd_parts[1]) if len(cmd_parts) > 1 else []
-            if not targets:
-                self.notify(usage_line("/import"), severity="warning")
-                return True
-            if targets[0].lower() in ("clear", "c"):
-                n = ctrl.clear_imports()
-                self._refresh_import_status()
-                self.notify(f"已清除 {n} 个待导入文件")
-                return True
-            self.notify("正在导入…")
-            res = ctrl.import_targets(targets)
-            self._refresh_import_status()
-            self._notify_import_result(res)
+        if head == "/file":
+            self._cmd_file(parts[1:])
             return True
-
-        if low == "/file" or low.startswith("/file "):
-            parts = cmd.split()
-            if len(parts) == 1:
-                self.notify(
-                    f"当前：{self.FILE_MODE_LABELS[self._file_mode]}"
-                    "；用法: /file off|read|confirm|direct"
-                )
-            else:
-                self._set_file_mode(parts[1].lower())
-            return True
-        if low == "/web" or low.startswith("/web "):
-            parts = cmd.split()
-            if len(parts) == 1:
-                self.notify(
-                    f"当前：联网{'开' if self._web_on else '关'}；用法: /web on|off"
-                )
-            else:
-                arg = parts[1].lower()
-                if arg in ("on", "开", "true", "1"):
-                    self._set_web(True)
-                elif arg in ("off", "关", "false", "0"):
-                    self._set_web(False)
-                else:
-                    self.notify("用法: /web on|off", severity="warning")
-            return True
-
-        if low.startswith("/files"):
+        if head == "/files":
             await self._cmd_files(cmd)
             return True
+        if head == "/save":
+            self._cmd_save(parts[1:])
+            return True
+        if head == "/web":
+            self._cmd_web(parts[1:])
+            return True
+        if head == "/model":
+            await self._cmd_model(cmd)
+            return True
 
+        # /<节点ID>：如 /a3、/main
         m = re.match(r"^/([A-Za-z]+\d+|main)$", cmd)
-        if m and ctrl.tree and m.group(1) in ctrl.tree.nodes:
+        if m and ctrl is not None and ctrl.tree and m.group(1) in ctrl.tree.nodes:
             await self._switch_to(m.group(1))
             return True
         if cmd.startswith("/"):
-            self.notify(f"未知命令: {cmd}。输入 /help 查看可用命令", severity="warning")
+            self.notify(f"未知命令：{cmd}。输入 /help 查看可用命令", severity="warning")
             return True
         return False
+
+    # ---------------- 命令实现：对话树 / 节点 ----------------
+
+    async def _cmd_up(self) -> None:
+        tree = self.ctrl.tree
+        if tree.current_node and tree.current_node.parent_id:
+            parent = tree.nodes.get(tree.current_node.parent_id)
+            if parent and not (await self._switch_to(parent.id)):
+                self.notify("返回父节点失败", severity="error")
+        else:
+            self.notify("已在根节点", severity="warning")
+
+    async def _cmd_home(self) -> None:
+        tree = self.ctrl.tree
+        if tree.root:
+            await self._switch_to(tree.root.id)
+
+    def _cmd_save(self, args: list[str]) -> None:
+        tree = self.ctrl.tree
+        current_id = tree.current_node.id if tree.current_node else None
+        node_id = args[0] if args else current_id
+        filepath = self.ctrl.save_node(node_id) if node_id else None
+        if filepath:
+            self.notify(f"节点已保存到 {filepath}")
+        else:
+            self.notify("节点不存在", severity="error")
+
+    async def _cmd_delete(self, nids: list[str]) -> None:
+        tree = self.ctrl.tree
+        if not nids:
+            self.notify(usage_line("/delete"), severity="warning")
+            return
+        missing = [n for n in nids if n not in tree.nodes]
+        if missing:
+            self.notify(f"未找到节点：{'、'.join(missing)}", severity="error")
+            return
+        roots = [n for n in nids if n == "main" or (tree.root and n == tree.root.id)]
+        if roots:
+            if len(roots) == len(nids):
+                self.notify("不能删除根节点", severity="warning")
+                return
+            self.notify(f"根节点不可删除，已忽略：{'、'.join(roots)}", severity="warning")
+            nids = [n for n in nids if n not in roots]
+        if not nids:
+            return
+        self._ask_confirm(
+            "删除节点",
+            f"确定要删除节点 {'、'.join(nids)} 及其所有子节点吗？",
+            lambda ok, ids=nids: self._on_delete_confirmed(ids, ok),
+        )
+
+    def _cmd_recall(self, args: list[str]) -> None:
+        if self.ctrl is None:
+            return
+        if not args:
+            state = "开" if self.ctrl.config.recall_enabled else "关"
+            self.notify(f"对话树检索：{state}；{usage_line('/recall')}")
+            return
+        arg = args[0].lower()
+        if arg in ("on", "开", "true", "1"):
+            self.ctrl.set_recall(True)
+        elif arg in ("off", "关", "false", "0"):
+            self.ctrl.set_recall(False)
+        else:
+            self.notify(usage_line("/recall"), severity="warning")
+            return
+        state = "开" if self.ctrl.config.recall_enabled else "关"
+        self.notify(f"对话树检索：{state}")
+
+    def _cmd_file(self, args: list[str]) -> None:
+        if self.ctrl is None:
+            return
+        if not args:
+            self.notify(
+                f"当前：文件 {self.ctrl.config.files_label}；{usage_line('/file')}"
+            )
+            return
+        self._set_file_mode(args[0].lower())
+
+    def _cmd_web(self, args: list[str]) -> None:
+        if self.ctrl is None:
+            return
+        if not args:
+            self.notify(
+                f"当前：联网{self.ctrl.config.web_label}；{usage_line('/web')}"
+            )
+            return
+        arg = args[0].lower()
+        if arg in ("on", "开", "true", "1"):
+            self._set_web(True)
+        elif arg in ("off", "关", "false", "0"):
+            self._set_web(False)
+        else:
+            self.notify(usage_line("/web"), severity="warning")
 
     async def _chat_append(self, markdown: str) -> None:
         """向消息区追加一段 Markdown（带分隔线并滚动到底）。"""
@@ -1616,139 +1647,9 @@ class ChatApp(App):
             except Exception:
                 pass
 
-    def _cmd_view(self) -> None:
-        node = self.ctrl.tree.current_node
-        if not node:
-            self.notify("当前没有节点", severity="warning")
-            return
-        filepath = self.ctrl.get_node_markdown_file(node.id)
-        if filepath is None:
-            self.notify("当前节点没有可打开的回答内容", severity="warning")
-            return
-        err = open_path_with_os(filepath)
-        if err:
-            self.notify(
-                f"打开文件失败（{err}）；文件路径: {filepath}",
-                severity="warning",
-                timeout=8,
-            )
-        else:
-            self.notify(f"已用系统默认程序打开节点 {node.id} 的回答")
-
     async def _cmd_help(self) -> None:
         # 命令清单由 commands.py 的命令规格生成（与补全弹窗、用法提示同源）
         await self._chat_append(help_markdown() + HELP_TAIL)
-
-    async def _cmd_set(self, cmd: str) -> None:
-        parts = cmd.split(maxsplit=2)
-        ctrl = self.ctrl
-        usage = usage_line("/set")
-        if len(parts) < 2:
-            self.notify(usage, severity="warning")
-            return
-        sub = parts[1]
-        if sub == "system" and len(parts) == 3:
-            ctrl.set_system(parts[2])
-            self.notify("系统提示词已更新")
-        elif sub == "temp" and len(parts) == 3:
-            try:
-                temp = float(parts[2])
-                if temp < TEMPERATURE_MIN or temp > TEMPERATURE_MAX:
-                    self.notify(f"温度建议在 {TEMPERATURE_MIN}~{TEMPERATURE_MAX} 之间", severity="warning")
-                ctrl.set_temperature(temp)
-                self.notify(f"温度已设置为 {ctrl.current_temperature}")
-            except ValueError:
-                self.notify("温度须为数字", severity="error")
-        elif sub == "model" and len(parts) == 3:
-            if ctrl.set_model(parts[2]):
-                self.notify(f"模型已切换为: {ctrl.current_model}")
-            else:
-                self.notify("未找到该模型。可用 /model list 查看，或 /model register <模型名> <URL> 注册", severity="warning")
-        elif sub == "thinking" and len(parts) == 3:
-            arg = parts[2].lower()
-            if arg in ("on", "1", "true"):
-                ctrl.set_thinking(True)
-                self.notify(f"思考模式已开启（effort: {ctrl.reasoning_effort}）")
-            elif arg in ("off", "0", "false"):
-                ctrl.set_thinking(False)
-                self.notify("思考模式已关闭")
-            else:
-                self.notify(usage_line("/set thinking"), severity="warning")
-        elif sub == "effort" and len(parts) == 3:
-            if ctrl.set_effort(parts[2]):
-                self.notify(f"推理强度已设置为: {ctrl.reasoning_effort}")
-            else:
-                self.notify(usage_line("/set effort"), severity="warning")
-        elif sub == "audit" and len(parts) == 3:
-            try:
-                level = int(parts[2])
-                if ctrl.set_audit(level):
-                    self.notify(f"审核层级已设置为: {AUDIT_LABELS[level]}")
-                else:
-                    self.notify("审核层级须为 1-4", severity="warning")
-            except ValueError:
-                self.notify("审核层级须为数字 1-4", severity="warning")
-        elif sub == "workspace" and len(parts) == 3:
-            path = os.path.expanduser(parts[2])
-            if ctrl.set_workspace(path):
-                self.notify(f"命令工作目录已设置为: {ctrl.workspace}")
-            else:
-                self.notify(f"无法创建/访问目录: {path}", severity="error")
-        elif sub == "workspace" and len(parts) == 2:
-            self.notify(
-                f"当前命令工作目录: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}"
-            )
-        elif sub == "detail" and len(parts) == 3:
-            if ctrl.set_detail(parts[2].lower()):
-                if ctrl.image_detail == "low":
-                    self.notify(
-                        "图片 detail 已设置为: low（本地图片将以内联 base64 发送，"
-                        "detail 才真正生效；file_id 方式会忽略 detail）"
-                    )
-                else:
-                    self.notify(
-                        f"图片 detail 已设置为: {ctrl.image_detail}"
-                        "（本地图片优先上传 Files API 复用；该档与上传后的处理一致）"
-                    )
-            else:
-                self.notify(usage_line("/set detail"), severity="warning")
-        elif sub == "file_confirm" and len(parts) == 3:
-            arg = parts[2].lower()
-            if arg in ("on", "1", "true"):
-                ctrl.set_file_confirm(True)
-                self.notify("写文件/编辑文件确认已开启")
-            elif arg in ("off", "0", "false"):
-                ctrl.set_file_confirm(False)
-                self.notify("写文件/编辑文件确认已关闭（AI 可直接写入/修改文件）", severity="warning")
-            else:
-                self.notify(usage_line("/set file_confirm"), severity="warning")
-        elif sub == "show":
-            ctrl = self.ctrl
-            lines = [
-                "**当前配置**",
-                "",
-                f"- **对话树**: 树 {ctrl.active_number}（{color_label(ctrl.tree_color())}，共 {len(ctrl.tree_numbers())} 棵）",
-                f"- **系统提示词**: "
-                + (
-                    f"最小版（{len(ctrl.active_system_prompt)} 字符，本树只挂对话能力）"
-                    if ctrl.active_system_minimal
-                    else f"完整版（{len(ctrl.active_system_prompt)} 字符）"
-                ),
-                f"- **温度**: {ctrl.current_temperature}",
-                f"- **模型**: {ctrl.current_model}",
-                f"- **思考模式**: {'开' if ctrl.thinking_enabled else '关'} | 推理强度: {ctrl.reasoning_effort}",
-                f"- **审核层级**: {ctrl.audit_level} - {AUDIT_LABELS[ctrl.audit_level]}",
-                f"- **文件写入确认**: {'开' if ctrl.file_confirm else '关（AI 可直接写入/修改文件）'}",
-                f"- **命令工作目录**: {ctrl.workspace or '（未设置，默认 mincli 启动目录）'}",
-                f"- **图片 detail**: {ctrl.image_detail}"
-                + ("（本地图片内联发送，真正生效）" if ctrl.image_detail == "low"
-                   else "（本地图片上传复用 file_id；该档与上传后处理一致）"),
-            ]
-            if ctrl.tree.current_node:
-                lines.append(f"- **当前节点**: {ctrl.tree.current_node.id} ({ctrl.tree.current_node.title})")
-            await self._chat_append("\n".join(lines))
-        else:
-            self.notify(usage, severity="warning")
 
     # ---------------- /files：Files API 已上传文件管理 ----------------
 
@@ -1960,105 +1861,33 @@ class ChatApp(App):
         else:
             self.notify(usage_line("/files"), severity="warning")
 
-    async def _cmd_tree(self, cmd: str) -> bool:
+    async def _cmd_tree(self, cmd: str) -> None:
         parts = cmd.split()
-        low = parts[0].lower()
-        tree = self.ctrl.tree
-        current_id = tree.current_node.id if tree.current_node else None
-
-        if low == "/tree":
-            await self._cmd_tree_list(parts[1:])
-            return True
-        if low.startswith("/info"):
-            nid = parts[1] if len(parts) > 1 else current_id
-            node = tree.nodes.get(nid) if nid else None
-            if node:
-                await self._chat_append(
-                    f"**节点 {node.id}: {node.title}**\n\n"
-                    f"- **用户**: {node.user_msg[:PREVIEW_USER_MSG_LEN]}…\n"
-                    f"- **助手**: {node.assistant_msg[:PREVIEW_ASSISTANT_MSG_LEN]}…\n"
-                    f"- **Tokens**: 输入 {node.input_tokens} / 输出 {node.output_tokens}"
-                )
-            else:
-                self.notify("节点不存在", severity="error")
-            return True
-        if low == "/up":
-            if tree.current_node and tree.current_node.parent_id:
-                parent = tree.nodes.get(tree.current_node.parent_id)
-                if parent and not (await self._switch_to(parent.id)):
-                    self.notify("返回父节点失败", severity="error")
-            else:
-                self.notify("已在根节点", severity="warning")
-            return True
-        if low == "/home":
-            if tree.root:
-                await self._switch_to(tree.root.id)
-            return True
-        if low.startswith("/save"):
-            nid = parts[1] if len(parts) > 1 else current_id
-            filepath = self.ctrl.save_node(nid) if nid else None
-            if filepath:
-                self.notify(f"✅ 节点已保存到 {filepath}")
-            else:
-                self.notify("节点不存在", severity="error")
-            return True
-        if low.startswith("/delete"):
-            nids = parts[1:]
-            if not nids:
-                self.notify(usage_line("/delete"), severity="warning")
-                return True
-            missing = [n for n in nids if n not in tree.nodes]
-            if missing:
-                self.notify(f"未找到节点: {'、'.join(missing)}", severity="error")
-                return True
-            roots = [n for n in nids if n == "main" or (tree.root and n == tree.root.id)]
-            if roots:
-                if len(roots) == len(nids):
-                    self.notify("不能删除根节点", severity="warning")
-                    return True
-                self.notify(f"根节点不可删除，已忽略: {'、'.join(roots)}", severity="warning")
-                nids = [n for n in nids if n not in roots]
-            self._ask_confirm(
-                "删除节点",
-                f"确定要删除节点 {'、'.join(nids)} 及其所有子节点吗？",
-                lambda ok, ids=nids: self._on_delete_confirmed(ids, ok),
-            )
-            return True
-        return False
+        await self._cmd_tree_list(parts[1:])
 
     async def _cmd_tree_list(self, args: list) -> None:
-        """对话树命令族：/tree | /tree N | /tree new | /tree delete N | /tree N tools。"""
+        """对话树命令族：/tree | /tree N | /tree new | /tree delete N。"""
         ctrl = self.ctrl
         usage = usage_line("/tree")
         if not args:
             numbers = ctrl.tree_numbers()
             if not numbers:
-                await self._chat_append(
-                    f"**对话树**\n\n（尚未创建）\n\n{usage}"
-                )
+                await self._chat_append(f"**对话树**\n\n（尚未创建）\n\n{usage}")
                 return
             lines = ["**对话树**", ""]
             for number in numbers:
                 summary = ctrl.tree_summary(number)
                 mark = ctrl.tree_marks.get(number)
-                state = ""
                 if mark == "done":
                     state = "（后台完成）"
                 elif mark == "error":
                     state = "（后台出错）"
-                here = "（当前）" if number == ctrl.active_number else ""
-                caps = ctrl.tree_caps(number)
-                if caps["system_tools"]:
-                    tools = "系统工具"
-                elif caps["mcp_tools"]:
-                    tools = "无系统工具"
                 else:
-                    tools = "仅对话（最小提示词）"
-                if caps["mcp_tools"]:
-                    tools += f" + {len(caps['mcp_tools'])} 个外置工具"
+                    state = ""
+                here = "（当前）" if number == ctrl.active_number else ""
                 lines.append(
                     f"- **树 {number}** · {color_label(ctrl.tree_color(number))} · "
-                    f"{summary['nodes']} 个节点 · {tools}{state}{here}"
+                    f"{summary['nodes']} 个节点{state}{here}"
                 )
             lines.append("")
             lines.append(command_block("/tree"))
@@ -2066,8 +1895,11 @@ class ChatApp(App):
             return
 
         sub = args[0].lower()
+        if sub in ("list", "ls"):
+            await self._cmd_tree_list([])
+            return
         if sub == "new":
-            self._open_tree_wizard()
+            self.action_new_tree()
             return
         if sub in ("delete", "rm", "del"):
             if len(args) < 2 or not args[1].isdigit():
@@ -2086,11 +1918,7 @@ class ChatApp(App):
             )
             return
         if sub.isdigit():
-            number = int(sub)
-            if len(args) > 1 and args[1].lower() in ("tools", "tool", "cap", "caps"):
-                self._open_tree_wizard(edit_number=number)
-                return
-            await self._switch_tree(number)
+            await self._switch_tree(int(sub))
             return
         self.notify(usage, severity="warning")
 
@@ -2108,8 +1936,6 @@ class ChatApp(App):
         self._refresh_tree_ui()
         await self._render_active_tree()
         self.notify(f"已删除对话树 {number}")
-        if not self.ctrl.has_trees:
-            self._open_tree_wizard()
 
     async def _on_delete_confirmed(self, nids: list, ok: bool) -> None:
         """确认弹窗回调：ok=True 时批量删除（App 消息泵空闲时才被调用）。"""
@@ -2137,191 +1963,37 @@ class ChatApp(App):
         else:
             self.notify("没有可删除的节点", severity="warning")
 
-    async def _cmd_model(self, cmd: str) -> None:
-        """管理模型注册：/model list | /model register <模型名> <URL> [-p provider] [-k key_var]"""
-        parts = cmd.strip().split(maxsplit=2)
-        sub = parts[1].lower() if len(parts) > 1 else ""
+    MODEL_CHOICES = (
+        ("flash", "deepseek-flash", "支持图片理解"),
+        ("pro", "deepseek-v4-pro", "不支持图片"),
+    )
 
-        if sub in ("", "list", "ls"):
+    async def _cmd_model(self, cmd: str) -> None:
+        """`/model` 列出 flash/pro；`/model flash|pro` 直接切换。"""
+        if self.ctrl is None:
+            return
+        parts = cmd.strip().split(maxsplit=1)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not sub or sub in ("list", "ls"):
             await self._model_list()
             return
-
-        if sub in ("register", "add"):
-            self._model_register(parts[2] if len(parts) > 2 else "")
+        if sub not in ("flash", "pro"):
+            self.notify(usage_line("/model"), severity="warning")
             return
-
-        self.notify(usage_line("/model"), severity="warning")
+        if self.ctrl.set_model(sub):
+            self.notify(f"模型已切换为：{self.ctrl.current_model}")
+        else:
+            self.notify("模型切换失败", severity="error")
 
     async def _model_list(self) -> None:
-        """列出内置 + 已注册模型。"""
-        registered = load_models()
-        lines = ["**可用模型**", "", "| 模型 | API URL | Key 环境变量 | 来源 |", "|---|---|---|---|"]
-        for name, url in MODELS_AVAILABLE.items():
-            key = API_PROVIDERS.get("deepseek", "DEEPSEEK_API_KEY")
-            lines.append(f"| {name} | {url} | {key} | 内置 |")
-        for name, cfg in registered.items():
-            lines.append(
-                f"| {name} | {cfg.get('url', '—')} | {cfg.get('key_var', 'DEEPSEEK_API_KEY')} | 已注册 |"
-            )
-        lines.append("\n注册新模型: `/model register <模型名> <URL>`")
-        lines.append("切换模型: `/set model <模型名>`")
+        """只列 flash 与 pro 两个现役模型，并标明当前。"""
+        current = self.ctrl.current_model if self.ctrl else ""
+        lines = ["**可用模型**", ""]
+        for short, name, desc in self.MODEL_CHOICES:
+            mark = "（当前）" if name == current else ""
+            lines.append(f"- `{short}` → `{name}` — {desc}{mark}")
+        lines += ["", "切换：`/model flash` 或 `/model pro`"]
         await self._chat_append("\n".join(lines))
-
-    def _model_register(self, rest: str) -> None:
-        """解析并注册模型：/model register <模型名> <URL> [-p provider] [-k key_var]"""
-        tokens = rest.split()
-        if len(tokens) < 2:
-            self.notify(usage_line("/model register"), severity="warning")
-            return
-        model_name = tokens[0]
-        url = tokens[1]
-        provider = "deepseek"
-        key_var = None
-        i = 2
-        while i < len(tokens):
-            if tokens[i] in ("-p", "--provider") and i + 1 < len(tokens):
-                provider = tokens[i + 1]
-                i += 2
-            elif tokens[i] in ("-k", "--key-var") and i + 1 < len(tokens):
-                key_var = tokens[i + 1]
-                i += 2
-            else:
-                self.notify(f"无法识别的参数: {tokens[i]}", severity="warning")
-                return
-
-        if register_model(provider, model_name, url, key_var):
-            self.notify(f"✅ 已注册模型「{model_name}」→ {url}")
-            if self.ctrl is not None:
-                # 注册后立即可用
-                self.ctrl.set_model(model_name)
-                self.notify(f"已切换当前模型为: {model_name}")
-        else:
-            self.notify("注册失败（请检查 ~/.mincli 目录写权限）", severity="error")
-
-    async def _cmd_mcp(self, cmd: str) -> None:
-        parts = cmd.strip().split(maxsplit=2)
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        rest = parts[2] if len(parts) > 2 else ""
-
-        if sub in ("", "list", "ls", "status", "show"):
-            await self._mcp_list()
-        elif sub == "add":
-            self._mcp_add(rest)
-        elif sub in ("remove", "rm", "del"):
-            name = rest.split()[0] if rest.split() else ""
-            if not name:
-                self.notify(usage_line("/mcp remove"), severity="warning")
-                return
-            servers = load_mcp_servers()
-            if name not in servers:
-                self.notify(f"未找到 server「{name}」", severity="error")
-                return
-            self._ask_confirm(
-                "移除 MCP server",
-                f"确定要移除「{name}」吗？",
-                lambda ok: self._on_mcp_remove_confirmed(name, ok),
-            )
-        elif sub == "reload":
-            try:
-                self.ctrl.mcp_reload()
-            except Exception as e:
-                self.notify(f"MCP 重载失败: {e}", severity="error")
-                return
-            # 重连在后台进行：完成后 MCP 客户端会通过日志出口报「MCP 就绪」
-            self.notify("正在重新连接 MCP servers…")
-            self._refresh_usage_bar()
-            self._watch_mcp_ready()
-        else:
-            self.notify(usage_line("/mcp"), severity="warning")
-
-    def _on_mcp_remove_confirmed(self, name: str, ok: bool) -> None:
-        """移除 MCP server 的确认回调（App 消息泵空闲时才被调用）。"""
-        if not ok:
-            return
-        servers = load_mcp_servers()
-        if name not in servers:
-            self.notify(f"未找到 server「{name}」", severity="error")
-            return
-        del servers[name]
-        path = save_mcp_servers(servers)
-        self.notify(f"✅ 已移除「{name}」，运行 /mcp reload 生效")
-
-    async def _mcp_list(self) -> None:
-        status = self.ctrl.mcp_status()
-        servers = load_mcp_servers()
-        lines = [f"**MCP Servers**（配置文件: {get_mcp_config_path()}）"]
-        if not status:
-            lines.append("\nMCP 客户端未就绪")
-        else:
-            lines += ["", "| 名称 | 命令 | 工具数 | 状态 |", "|---|---|---|---|"]
-            connecting = self.ctrl.mcp_connecting
-            for name in sorted(status):
-                st = status[name]
-                if name == "mincli":
-                    cmd = "内置 server"
-                else:
-                    cfg = servers.get(name, {})
-                    cmd = cfg.get("url") or cfg.get("command", "")
-                    if cfg.get("headers"):
-                        cmd += f"（带 {len(cfg['headers'])} 个请求头）"
-                if st["connected"]:
-                    state = "已连接"
-                elif connecting:
-                    state = "连接中…"
-                else:
-                    state = "未连接"
-                lines.append(f"| {name} | {cmd} | {st['tools']} | {state} |")
-        if not servers:
-            lines.append("\n（未配置第三方 server，可用 /mcp add 添加）")
-        await self._chat_append("\n".join(lines))
-
-    def _mcp_add(self, rest: str) -> None:
-        servers = load_mcp_servers()
-        is_url = lambda s: bool(re.match(r"^https?://", s))
-        # 跨平台解析：支持带引号的参数、--header 'K: V' 与 Windows 反斜杠命令路径
-        tokens = split_path_args(rest)
-        if len(tokens) < 2:
-            self.notify(
-                usage_line("/mcp add") + "（本地命令或远程 URL；--header 'K: V' 可重复）",
-                severity="warning",
-            )
-            return
-        name, target = tokens[0], tokens[1]
-        headers: dict = {}
-        extra: list = []
-        i = 2
-        while i < len(tokens):
-            t = tokens[i]
-            if t in ("--header", "-H"):
-                if i + 1 >= len(tokens):
-                    self.notify(f"缺少 {t} 的值，用法: {t} 'Key: Value'", severity="warning")
-                    return
-                hv = tokens[i + 1]
-                if ":" not in hv:
-                    self.notify(f"无效的 header「{hv}」（应为 'Key: Value'）", severity="warning")
-                    return
-                k, v = hv.split(":", 1)
-                headers[k.strip()] = v.strip()
-                i += 2
-            else:
-                extra.append(t)
-                i += 1
-        if name in servers:
-            self.notify(f"已存在同名 server「{name}」，将被覆盖", severity="warning")
-        if is_url(target):
-            entry: dict = {"url": target}
-            if headers:
-                entry["headers"] = headers
-            servers[name] = entry
-        else:
-            entry = {"command": target}
-            if extra:
-                entry["args"] = extra
-            if headers:
-                self.notify("--header 仅对远程（http/https）server 生效，已忽略", severity="warning")
-            servers[name] = entry
-        path = save_mcp_servers(servers)
-        self.notify(f"✅ 已保存到 {path}，运行 /mcp reload 生效")
 
     # ---------------- 上下文压缩 ----------------
 
@@ -2360,316 +2032,6 @@ class ChatApp(App):
             f"（节省 {stats['saved_tokens']:,}）"
         )
 
-    # ---------------- 工作流（/wf） ----------------
-
-    async def _cmd_wf(self, cmd: str) -> None:
-        """工作流命令入口（/wf 与 /workflow 等价）。"""
-        ctrl = self.ctrl
-        if ctrl is None:
-            self.notify("控制器未就绪", severity="error")
-            return
-        parts = cmd.strip().split(maxsplit=1)
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        # 跨平台解析：工作流的键=值里可能含 Windows 反斜杠路径
-        tokens = split_path_args(rest)
-        sub = tokens[0].lower() if tokens else ""
-        name = tokens[1] if len(tokens) > 1 else ""
-
-        if sub in ("", "help", "-h", "--help"):
-            await self._chat_append(
-                "**工作流命令**\n\n"
-                f"{command_block('/wf')}\n\n"
-                "- 不带 `<名>` 的用法见上；工作流长期保存于 `~/.mincli/workflows.json`，重启后仍在\n"
-                "- `/wf save` 会把每次变化的数据自动抽成 {变量}，`/wf run` 未提供的变量由模型结合当前情况推断"
-            )
-            return
-        if sub in ("list", "ls"):
-            await self._cmd_wf_list()
-            return
-        if sub == "show":
-            if not name:
-                self.notify(usage_line("/wf show"), severity="warning")
-                return
-            wf = ctrl.wf_get(name)
-            if wf is None:
-                self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
-                return
-            await self._chat_append(
-                f"**工作流 {wf.name}**（运行 {wf.run_count} 次）\n\n{wf.doc}"
-            )
-            return
-        if sub == "save":
-            if not name:
-                self.notify(usage_line("/wf save"), severity="warning")
-                return
-            start_id = tokens[2] if len(tokens) > 2 else None
-            if ctrl.wf_get(name) is not None:
-                self._ask_confirm(
-                    "覆盖工作流",
-                    f"工作流「{name}」已存在，重新提炼会覆盖旧版本，是否继续？",
-                    lambda ok, n=name, s=start_id: self._on_wf_save_confirmed(n, s, ok),
-                )
-                return
-            await self._wf_save_exec(name, start_id)
-            return
-        if sub == "use":
-            if not name:
-                self.notify(usage_line("/wf use") + "（/wf stop 取消挂载）", severity="warning")
-                return
-            if ctrl.wf_get(name) is None:
-                self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
-                return
-            self._pending_wf = name
-            self._refresh_import_status()
-            self.notify(
-                f"已挂载工作流「{name}」：发送下一条消息即按工作流执行（/wf stop 取消）"
-            )
-            return
-        if sub in ("stop", "unuse"):
-            if self._pending_wf:
-                self.notify(f"已解除工作流「{self._pending_wf}」的挂载")
-            else:
-                self.notify("当前没有已挂载的工作流")
-            self._pending_wf = None
-            self._refresh_import_status()
-            return
-        if sub == "run":
-            await self._cmd_wf_run(tokens)
-            return
-        if sub == "delete":
-            if not name:
-                self.notify(usage_line("/wf delete"), severity="warning")
-                return
-            if ctrl.wf_get(name) is None:
-                self.notify(f"工作流「{name}」不存在", severity="warning")
-                return
-            self._ask_confirm(
-                "删除工作流",
-                f"确定删除工作流「{name}」吗？此操作不可恢复。",
-                lambda ok, n=name: self._on_wf_delete_confirmed(n, ok),
-            )
-            return
-        if sub == "rename":
-            new_name = tokens[2] if len(tokens) > 2 else ""
-            if not name or not new_name:
-                self.notify(usage_line("/wf rename"), severity="warning")
-                return
-            err = ctrl.wf_rename(name, new_name)
-            if err:
-                self.notify(err, severity="warning")
-            else:
-                if self._pending_wf == name:
-                    self._pending_wf = new_name
-                    self._refresh_import_status()
-                self.notify(f"已重命名：{name} → {new_name}")
-            return
-        if sub == "edit":
-            if not name:
-                self.notify(usage_line("/wf edit"), severity="warning")
-                return
-            if ctrl.wf_get(name) is None:
-                self.notify(f"工作流「{name}」不存在", severity="warning")
-                return
-            if len(tokens) > 2:
-                request = " ".join(tokens[2:])
-                self.notify(f"正在按你的要求修订工作流「{name}」…")
-                res = await asyncio.to_thread(ctrl.wf_revise, name, request)
-                if res.get("status") == "error":
-                    self.notify(res.get("message", "修订失败"), severity="error")
-                else:
-                    self.notify(f"✅ 工作流「{name}」已按你的要求更新")
-                return
-            self._wf_start_editor(name)
-            return
-        self.notify(usage_line("/wf"), severity="warning")
-
-    async def _cmd_wf_list(self) -> None:
-        data = self.ctrl.wf_list() if self.ctrl else []
-        if not data:
-            await self._chat_append(
-                "**工作流**（暂无）\n\n把当前操作保存为可复用工作流：`/wf save <名>`；"
-                "已有工作流用 `/wf use <名>` 挂载到下次输入、`/wf run <名>` 立即执行。"
-            )
-            return
-        lines = [
-            "**工作流列表**",
-            "",
-            "| 名称 | 目标 | 步骤 | 变量 | 运行 | 更新于 |",
-            "|---|---|---|---|---|---|",
-        ]
-        for item in data:
-            upd = (item.get("updated_at") or "")[:16].replace("T", " ")
-            goal = item.get("goal") or "—"
-            if len(goal) > 40:
-                goal = goal[:40] + "…"
-            lines.append(
-                f"| `{item['name']}` | {goal} | {item.get('steps', 0)} "
-                f"| {len(item.get('vars') or [])} | {item.get('run_count', 0)} | {upd} |"
-            )
-        lines += [
-            "",
-            "使用: `/wf use <名>` 挂载下次输入 · `/wf run <名>` 立即执行 · "
-            "`/wf show <名>` 查看 · `/wf edit <名> <修改要求>` 修改",
-        ]
-        await self._chat_append("\n".join(lines))
-
-    async def _wf_save_exec(self, name: str, start_id: Optional[str]) -> None:
-        """后台提炼并保存工作流（force=True，覆盖同名）。"""
-        ctrl = self.ctrl
-        if ctrl is None:
-            return
-        self.notify(f"正在从对话提炼工作流「{name}」…")
-        res = await asyncio.to_thread(ctrl.wf_save, name, start_id, True)
-        if res.get("status") == "error":
-            self.notify(res.get("message", "保存失败"), severity="error")
-            return
-        if res.get("from") == "fallback":
-            self.notify(
-                f"已保存工作流「{name}」（未能自动提炼，原始记录已存档，"
-                f"可用 /wf edit {name} 修改）",
-                severity="warning",
-                timeout=8,
-            )
-        else:
-            n = res.get("nodes", 0)
-            v = len(res.get("placeholders") or [])
-            self.notify(
-                f"✅ 已提炼保存工作流「{name}」（{n} 轮 / {v} 个变量）；"
-                f"/wf use {name} 挂载到下次输入",
-                timeout=8,
-            )
-
-    async def _on_wf_save_confirmed(
-        self, name: str, start_id: Optional[str], ok: bool
-    ) -> None:
-        if not ok:
-            self.notify("已取消")
-            return
-        await self._wf_save_exec(name, start_id)
-
-    async def _cmd_wf_run(self, tokens: list) -> None:
-        name = tokens[1] if len(tokens) > 1 else ""
-        if not name:
-            self.notify(usage_line("/wf run") + "（位置参数按变量顺序填充）", severity="warning")
-            return
-        ctrl = self.ctrl
-        if ctrl is None:
-            return
-        wf = ctrl.wf_get(name)
-        if wf is None:
-            self.notify(f"工作流「{name}」不存在（/wf list 查看）", severity="warning")
-            return
-        values: dict = {}
-        positionals: list = []
-        for tok in tokens[2:]:
-            if "=" in tok:
-                k, _, v = tok.partition("=")
-                values[k.strip()] = v
-            else:
-                positionals.append(tok)
-        if positionals:
-            phs = wf.placeholders()
-            for i, pv in enumerate(positionals):
-                if i >= len(phs):
-                    break
-                key = phs[i]
-                if key not in values:
-                    values[key] = pv
-            if len(positionals) > len(phs):
-                ph_txt = "、".join("{" + p + "}" for p in phs) or "无"
-                self.notify(f"多余的位置参数已忽略（该工作流变量：{ph_txt}）", severity="warning")
-        composed = ctrl.wf_compose(name, values=values)
-        if composed is None:
-            self.notify(f"工作流「{name}」不存在", severity="warning")
-            return
-        self.notify(f"已开始执行工作流「{name}」")
-        await self._send_user_text(composed)
-
-    async def _on_wf_delete_confirmed(self, name: str, ok: bool) -> None:
-        if not ok:
-            self.notify("已取消")
-            return
-        if self.ctrl and self.ctrl.wf_delete(name):
-            if self._pending_wf == name:
-                self._pending_wf = None
-                self._refresh_import_status()
-            self.notify(f"已删除工作流「{name}」")
-        else:
-            self.notify(f"删除失败：工作流「{name}」不存在", severity="warning")
-
-    # ---------------- 工作流编辑器回写（跨平台） ----------------
-
-    def _wf_start_editor(self, name: str) -> None:
-        """用系统默认编辑器打开工作流临时文件，保存改动后自动回写（跨平台）。
-
-        macOS `open -e`（强制文本编辑器）；Windows `os.startfile`；
-        其他 Unix `xdg-open`。失败时提示改用模型修订方式。
-        """
-        ctrl = self.ctrl
-        if ctrl is None:
-            return
-        path = ctrl.wf_export_temp(name)
-        if path is None:
-            self.notify(f"工作流「{name}」不存在", severity="warning")
-            return
-        err = open_path_with_os(path, prefer_text_editor=True)
-        if err:
-            self.notify(
-                f"打开编辑器失败（{err}）；可改用 /wf edit {name} <修改要求> "
-                f"由模型修订，或手动编辑 {path}",
-                severity="warning",
-                timeout=8,
-            )
-            return
-        self._wf_stop_edit()
-        self._wf_edit_path = path
-        self._wf_edit_name = name
-        try:
-            self._wf_edit_mtime = os.path.getmtime(path)
-        except OSError:
-            self._wf_edit_mtime = None
-        self._wf_edit_deadline = time.time() + 60
-        self._wf_edit_timer = self.set_interval(1.0, self._wf_editor_poll)
-        self.notify(
-            f"已在编辑器中打开工作流「{name}」：保存改动后自动更新（60 秒内）"
-        )
-
-    def _wf_editor_poll(self) -> None:
-        """轮询编辑器临时文件：内容变化 → 回写工作流文档。"""
-        if not self._wf_edit_path or not self._wf_edit_name:
-            self._wf_stop_edit()
-            return
-        try:
-            mtime = os.path.getmtime(self._wf_edit_path)
-        except OSError:
-            self._wf_stop_edit()
-            return
-        if mtime != self._wf_edit_mtime:
-            try:
-                with open(self._wf_edit_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-            except OSError:
-                return
-            self._wf_edit_mtime = mtime
-            name = self._wf_edit_name
-            if self.ctrl and self.ctrl.wf_import_text(name, text):
-                self.notify(f"工作流「{name}」已从编辑器更新")
-        if self._wf_edit_deadline is not None and time.time() > self._wf_edit_deadline:
-            self._wf_stop_edit()
-
-    def _wf_stop_edit(self) -> None:
-        """停止编辑器轮询并清理状态（保留临时文件供用户继续编辑/另存）。"""
-        if self._wf_edit_timer is not None:
-            try:
-                self._wf_edit_timer.stop()
-            except Exception:
-                pass
-            self._wf_edit_timer = None
-        self._wf_edit_path = None
-        self._wf_edit_name = None
-        self._wf_edit_mtime = None
-        self._wf_edit_deadline = None
-
     # ---------------- 消息发送与流式渲染 ----------------
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
@@ -2680,22 +2042,22 @@ class ChatApp(App):
             return  # 命令未输完：先补全，等再次 Enter 执行
         if await self._handle_command(event.text):
             return
-        # 附件引用块：Submitted 已带上提交瞬间解析出的附件，内容在这里追加到
-        # 「---」之后；聊天区仍显示用户原话（Phase 4 再换成彩色块与按钮）。
         attachments = event.attachments
-        if attachments:
-            composed, images = compose_message(event.text, attachments)
-            if images:
-                self.ctrl.pending_images = images
-            await self._send_user_text(composed, display_text=event.text)
-            return
-        await self._send_user_text(event.text)
+        # 正文由 UI 拼好（引用块原话 + 末尾 ─── 附件正文段），图片交给 controller
+        composed, _images = compose_message(
+            event.text, attachments, self.ctrl.config.inline_max_chars
+        )
+        await self._send_user_text(
+            composed, display_text=event.text, attachments=attachments
+        )
 
-    async def _send_user_text(self, text: str, display_text: str | None = None) -> None:
-        """发送一条用户消息（普通输入或 /wf run）。
-
-        若已挂载工作流（/wf use），先把它合成为“按工作流执行”的消息再发送，
-        挂载随之解除（一次性）。
+    async def _send_user_text(
+        self,
+        text: str,
+        display_text: str | None = None,
+        attachments: list[Attachment] | None = None,
+    ) -> None:
+        """发送一条用户消息（附件正文已在 text 里，display_text 用于聊天区回显）。
 
         多对话树：同一时刻只允许一棵树在生成。别的树在后台生成时切过来可以看，
         但发送会被拒绝并提示是哪个编号的树在占用。
@@ -2713,39 +2075,32 @@ class ChatApp(App):
                 f"{where} 正在生成，等它结束或按 Esc 打断后再发送", severity="warning"
             )
             return
-        if self._pending_wf:
-            wf_name = self._pending_wf
-            self._pending_wf = None
-            composed = self.ctrl.wf_compose(wf_name, typed=text)
-            self._refresh_import_status()
-            if composed is None:
-                self.notify(f"工作流「{wf_name}」不存在，已解除挂载", severity="warning")
-                return
-            text = composed
-            self.notify(f"已按工作流「{wf_name}」执行")
         self._cancel_flush()  # 新消息开始前丢弃上一轮残留的流式缓冲
-        # 聊天区回显用户原话（带引用块）；附件正文只发给模型，不重复渲染。
-        shown = text if display_text is None else display_text
-        img_md = "" if display_text is not None else self._pending_images_md()
-        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{shown}{img_md}")
+        # 聊天区回显用户原话（带引用块，行内代码样式）；附件正文只发给模型。
+        shown = self._chips_as_code(
+            text if display_text is None else display_text
+        )
+        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{shown}")
         await self._chat_shrink_lists()
-        self._refresh_import_status()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False
         self._reasoning_open = False
         self._answer_started = False
         self._set_turn_active(True)
         self._refresh_tree_badge()
+        atts = list(attachments or [])
         self.run_worker(
-            lambda: self._run_message(text),
+            lambda: self._run_message(text, atts),
             name="chat-message",
             thread=True,
             exit_on_error=False,
         )
 
-    def _run_message(self, text: str) -> None:
+    def _run_message(self, text: str, attachments: list[Attachment]) -> None:
         """线程 worker 中运行 controller（阻塞 API 调用），事件转发到主线程。"""
         try:
-            self.ctrl.send_message(text, self._emit_from_thread)
+            self.ctrl.send_message(
+                text, self._emit_from_thread, attachments or None
+            )
         except Exception as e:
             self.call_from_thread(self._append_error, str(e))
         finally:
@@ -2871,7 +2226,6 @@ class ChatApp(App):
         单段超过 STREAM_SEG_* 阈值时先封段再写，避免尾块无限增长导致 O(n²)
         重渲染卡顿（见文件顶部常量注释）。
         """
-        chat = self._chat_container()
         if not self._stream_active:
             self._stream_active = True
             self._answer_started = True
@@ -2911,15 +2265,14 @@ class ChatApp(App):
                 # （不输出 **mincli：** 头部——思考过程在提问之后、头部与正文之前）
                 self._rebuild_tree()
                 self._select_tree_node(node.id)
-                view = f"# {node.id}: {node.title}\n\n" f"**你：**\n\n{node.user_msg}"
-                if node.user_images:
-                    marks = "\n".join(
-                        f"- {image_placeholder_text(a)}" for a in node.user_images
-                    )
-                    view += f"\n\n{marks}"
-                await self._chat_reset(view)
+                head, _rest = self._node_view_parts(node)
+                await self._chat_reset(head)
+                await self._mount_attachment_row(node)  # 提问下方的附件按钮
+                if node.attachments:
+                    # 有附件按钮行：后续流式内容另起一段，排在按钮行之后；
+                    # 没有按钮行时保持「头段 + 流式正文」的原有结构
+                    await self._chat_fix_segment()
                 await self._chat_shrink_lists(scroll=False)  # 新节点先显示开头，流式再滚到底
-                self._refresh_import_status()  # 图片已绑定到节点，隐藏提示行
                 self._stream_active = True  # 视图已含节点头部，后续流式内容直接追加
                 self._reasoning_open = False
                 self._answer_started = False
@@ -2946,13 +2299,12 @@ class ChatApp(App):
             await self._chat_stream_append(">\n> 本轮已保存到当前节点。\n")
             await self._chat_shrink_lists()
             self._rebuild_tree()  # 节点保留，刷新树
-            self._refresh_import_status()
             self._set_turn_active(False)
         elif ev.kind == "done":
             node = ev.node
             if node is not None:
                 await self._chat_stream_append(
-                    f"\n\n---\n\n*📊 输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*\n"
+                    f"\n\n---\n\n*输入 {node.input_tokens} tokens | 输出 {node.output_tokens} tokens*\n"
                 )
             await self._chat_shrink_lists()
             self._rebuild_tree()

@@ -7,7 +7,7 @@ import sys
 import datetime
 from typing import Optional, List, Dict
 
-import requests
+import httpx
 import tiktoken
 from openai import OpenAI
 
@@ -16,9 +16,9 @@ from mincli.config import (
     SAVE_BASE_DIR,
 )
 from mincli.pricing import (
-    estimate_input_price,
+    estimate_input_price,  # noqa: F401 - 供 controller 从这里转引
     image_tokens_per_image,
-    is_peak_hour,
+    is_peak_hour,  # noqa: F401 - 供 controller 从这里转引
 )
 
 
@@ -128,7 +128,9 @@ def get_balance(client: OpenAI) -> Optional[List[Dict]]:
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
         }
-        resp = requests.get("https://api.deepseek.com/user/balance", headers=headers, timeout=10)
+        resp = httpx.get(
+            "https://api.deepseek.com/user/balance", headers=headers, timeout=10
+        )
         resp.raise_for_status()
         data = resp.json()
         return data.get("balance_infos")
@@ -260,7 +262,7 @@ def save_conversation_to_file(
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
         if token_stats:
-            f.write(f"\n## Token 统计\n\n")
+            f.write("\n## Token 统计\n\n")
             f.write(f"- 输入 tokens: {token_stats.get('input_tokens', 0)}\n")
             f.write(f"- 输出 tokens: {token_stats.get('output_tokens', 0)}\n")
 

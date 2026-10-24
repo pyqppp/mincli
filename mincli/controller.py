@@ -5,11 +5,10 @@ Textual TUI 通过本控制器驱动；UI 通过 ControllerEvent 回调接收增
 （流式内容 / 工具调用 / 状态 / 完成）。
 
 多对话树：
-- 每棵树一个文件（见 mincli/trees.py），容量固定为「节点树 + 该树自己的设置」；
-- 模型/温度/思考模式等是全局设置，所有树共享；
-- 系统提示词是全局设置与每树能力挂载共同决定的：只挂「对话」能力的树用最小
-  提示词，挂了系统工具或外置 MCP 工具的树用完整版（见 _system_prompt_for）；
-- 审核层级、file_confirm、工作目录、能力白名单、输入草稿是每棵树独立的；
+- 每棵树一个文件（见 mincli/trees.py），只存节点树与该树的输入草稿；
+- 模型/温度/思考模式/能力开关都是全局的，统一来自 ~/.mincli/config.toml；
+- 系统提示词全局唯一（~/.mincli/prompt.md），客户端不显示、不可编辑；
+- 工具只有三组固定内置：文件、联网、对话树查询，按配置下发（见 tools/builtin.py）；
 - 同一时刻只允许一棵树在生成：后台生成期间切走，生成继续，但另一棵树
   必须等它结束才能发送（见 ChatApp._send_user_text）。
 """
@@ -18,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 import threading
 import time
@@ -27,15 +25,22 @@ from typing import Any, Callable, Dict, List, Optional
 
 from openai import OpenAI
 
+from mincli.attachments import (
+    KIND_IMAGE,
+    Attachment,
+    collect_stale_attachments,
+    store_attachment_text,
+)
 from mincli.config import (
-    MODEL_FLASH,
-    VISION_MODELS,
-    MODELS_AVAILABLE,
     COMPACT_MAX_TOKENS,
     COMPACT_SOURCE_MAX_CHARS,
     COMPACT_REASONING_MAX_CHARS,
     COMPACT_TOOL_RESULT_MAX_CHARS,
-    EXEC_DEFAULT_TIMEOUT,
+    EFFORTS,
+    FILE_MODES,
+    FILES_LIST_PAGE,
+    MODEL_FLASH,
+    MODEL_PRO,
     VISION_DEFAULT_DETAIL,
     VISION_LOW_INLINE_BUDGET_BYTES,
     VISION_MAX_SIDE,
@@ -45,17 +50,12 @@ from mincli.config import (
     VISION_REQUEST_INLINE_TOTAL_MAX_BYTES,
     VISION_REQUEST_MAX_BYTES,
     VISION_REQUEST_TOTAL_MAX_BYTES,
-    FILES_LIST_PAGE,
-    WORKFLOWS_PATH,
-    DEFAULT_MINIMAL_SYSTEM_PROMPT,
-    WF_EXTRACT_MAX_TOKENS,
-    WF_SOURCE_MAX_CHARS,
-    WF_REASONING_MAX_CHARS,
-    WF_TOOL_ARGS_MAX_CHARS,
-    WF_TOOL_RESULT_MAX_CHARS,
-    WF_ANSWER_MAX_CHARS,
-    load_models,
+    VISION_MODELS,
+    Config,
+    load_config,
     normalize_model_name,
+    save_config,
+    system_prompt,
 )
 from mincli.helpers import (
     convert_formulas,
@@ -69,8 +69,7 @@ from mincli.helpers import (
 )
 from mincli.models import ConversationNode, ConversationTree
 from mincli.streaming import stream_response
-from mincli.tools.execute import audit_command, is_safe_readonly, matches_dangerous
-from mincli.tools.file_ops import parse_file
+from mincli.tools.builtin import ToolContext, available_tools, dispatch_tool
 from mincli.tools.files import (
     FilesAPIError,
     delete_file,
@@ -82,36 +81,12 @@ from mincli.tools.files import (
 from mincli.tools.images import (
     ImageAttachment,
     collect_inline_bytes,
-    estimate_image_tokens,
     image_placeholder_text,
-    is_image_path,
-    looks_like_image_target,
-    make_path_attachment,
-    make_url_attachment,
     oversize_inline_attachments,
     oversize_side_attachments,
     split_low_inline,
-    total_tokens_est,
 )
-from mincli.tools.registry import TOOLS
-from mincli.tools.web_fetch import fetch_webpage
 from mincli.trees import TreeStore, color_of
-from mincli.workflows import (
-    FALLBACK_MARK,
-    Workflow,
-    WorkflowStore,
-    doc_placeholders,
-    now_iso,
-    substitute,
-    valid_name,
-)
-
-try:
-    from mincli.mcp_client import BUNDLED_NAME, READY_TIMEOUT, McpToolClient
-except ImportError:  # pragma: no cover
-    McpToolClient = None
-    BUNDLED_NAME = "mincli"
-    READY_TIMEOUT = 30
 
 
 @dataclass
@@ -166,14 +141,6 @@ class ControllerEvent:
 
 EventSink = Callable[[ControllerEvent], None]
 
-AUDIT_LABELS = {
-    1: "最高（AI审核 + 用户确认）",
-    2: "中等（AI审核，低风险自动执行）",
-    3: "最低（文本匹配，高风险询问）",
-    4: "无（直接执行）",
-}
-
-
 @dataclass
 class TreeState:
     """一棵对话树的运行时状态（编号 0 表示「尚未创建任何对话树」的占位）。"""
@@ -182,13 +149,8 @@ class TreeState:
     color: int
     tree: ConversationTree
     draft: str = ""
-    # 每棵树独立的运行设置（其余设置是全局的）
-    audit_level: int = 1
-    file_confirm: bool = True
-    workspace: Optional[str] = None
-    # 能力挂载：系统工具整组开关 + 外置 MCP 工具白名单（工具名）
-    system_tools: bool = True
-    mcp_tools: List[str] = field(default_factory=list)
+    # 草稿里的附件元数据（切换树再回来时恢复输入框里的引用块）
+    draft_attachments: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_placeholder(self) -> bool:
@@ -198,41 +160,28 @@ class TreeState:
 class ChatController:
     """对话引擎：状态 + 多对话树 + 流式输出 + 工具调用 + 持久化。"""
 
-    # 工作流持久化文件（测试子类可重写为临时路径）
-    WORKFLOWS_FILE = WORKFLOWS_PATH
-
     def __init__(
         self,
         client: OpenAI,
-        default_system: str,
-        default_temperature: float,
-        default_model: str = MODEL_FLASH,
-        thinking_enabled: bool = False,
-        reasoning_effort: str = "high",
-        auto_start_mcp: bool = True,
+        config: Optional[Config] = None,
+        default_system: Optional[str] = None,
         trees_dir: Optional[str] = None,
-        default_system_minimal: Optional[str] = None,
     ) -> None:
         self.client = client
+        # 配置是唯一事实来源；界面开关改动后立即写回 config.toml
+        self.config: Config = config or load_config()
         # ---------------- 全局设置（所有对话树共享） ----------------
-        self.current_system = default_system
-        # 最小提示词：只挂「对话」能力的树用它（不提及工具/历史/命令等任何信息）
-        self.current_system_minimal = (
-            default_system_minimal or DEFAULT_MINIMAL_SYSTEM_PROMPT
-        )
-        self.current_temperature = default_temperature
-        self.current_model = normalize_model_name(default_model)
+        self.current_system = default_system or system_prompt(self.config)
+        self.current_temperature = self.config.temperature
+        self.current_model = normalize_model_name(self.config.model)
         # 从磁盘加载时，若旧模型名被自动改写，这里记录原始名（供 UI 提示）
         self.model_migrated_from: Optional[str] = None
-        self.thinking_enabled = thinking_enabled
-        self.reasoning_effort = reasoning_effort
+        self.thinking_enabled = self.config.thinking
+        self.reasoning_effort = self.config.effort
         # 用户主动打断标志：streaming 循环在每个 chunk 处检查，工具调用后也会检查。
-        # 每次 send_message 开始时复位；interrupt() 置位并顺带终止正在执行的命令。
         self._interrupt_requested: bool = False
 
-        # 多模态：待发送图片（/import 导入的图片填充；发送后绑定到节点并清空）
-        self.pending_images: List[ImageAttachment] = []
-        # 图片 detail 全局默认（/set detail 可调；low 省 token，auto≈original 最清晰）
+        # 图片 detail 默认值（low 省 token，auto≈original 最清晰）
         self.image_detail: str = VISION_DEFAULT_DETAIL
 
         # ---------------- 多对话树 ----------------
@@ -247,52 +196,25 @@ class ChatController:
         # 后台生成结束标记：编号 → "done" | "error"（UI 取用后清除）
         self.tree_marks: Dict[int, str] = {}
 
-        self._wf_store = WorkflowStore(self.WORKFLOWS_FILE)
-
-        self.imported_content: Optional[str] = None
-        # /import 导入的文本/网页文件元数据（{"kind": "text"|"web", "name": str}），
-        # 用于输入框下方状态栏展示；内容拼接在 imported_content 中随下次发送附带
-        self.imported_files: List[Dict[str, str]] = []
         self.temp_dir = tempfile.mkdtemp(prefix="mincli_")
         self.temp_files: Dict[str, str] = {}
 
-        # UI 注入的确认回调（写文件 / 执行命令等工具用）。默认拒绝（安全）。
+        # UI 注入的确认回调（写文件等工具用）。默认拒绝（安全）。
         self.confirm: Callable[[str, str], bool] = lambda title, text: False
 
-        self._mcp: Optional[McpToolClient] = None
-        self._mcp_tool_names: set = set()
-        # MCP 工具列表是否已同步（后台连接完成后同步一次；重连后置回 False）
-        self._mcp_synced: bool = False
-        # MCP 连接日志出口：默认打印（无 UI 时）；TUI 会换成通知，避免
-        # 后台线程直接写 stdout 冲乱界面
-        self.mcp_logger: Callable[[str], None] = print
-        self.llm_tools: List[Dict] = list(TOOLS)
+        self.llm_tools: List[Dict] = available_tools(self.config, has_attachments=False)
 
         self.session_loaded = self._restore_from_store()
-        if auto_start_mcp:
-            self.start_mcp()
+        self._collect_attachments()
 
     # ---------------- 对话树：加载 / 保存 ----------------
 
     def _restore_from_store(self) -> bool:
-        """从磁盘恢复全局设置与上次激活的对话树。
+        """从磁盘恢复上次激活的对话树。
 
+        全局设置以 config.toml 为准，这里只恢复「上次在哪棵树」。
         返回是否恢复了已有对话树（False = 一棵都没有，UI 应先引导新建）。
         """
-        g = self._store.global_settings()
-        if g:
-            self.current_system = g.get("system_prompt", self.current_system)
-            self.current_temperature = g.get("temperature", self.current_temperature)
-            saved_model = g.get("model", self.current_model)
-            self.current_model = normalize_model_name(saved_model)
-            if self.current_model != saved_model:
-                self.model_migrated_from = saved_model
-            self.thinking_enabled = bool(g.get("thinking_enabled", False))
-            self.reasoning_effort = g.get("reasoning_effort", "high")
-            self.image_detail = g.get("image_detail", VISION_DEFAULT_DETAIL)
-            self.imported_content = g.get("imported_content")
-            self.imported_files = g.get("imported_files") or []
-
         numbers = self._store.numbers()
         active = self._store.active()
         if active is None and numbers:
@@ -306,6 +228,20 @@ class ChatController:
         # 一棵树都没有：放一棵占位空树，让 UI 有东西可渲染（发送前必须先建树）
         self._reset_placeholder()
         return False
+
+    def _collect_attachments(self) -> int:
+        """启动时回收没有任何会话引用的附件正文文件，返回删除数量。"""
+        referenced = set()
+        for number in self._store.numbers():
+            data = self._store.load_tree(number) or {}
+            nodes = (data.get("tree") or {}).get("nodes") or {}
+            for node_data in nodes.values():
+                if not isinstance(node_data, dict):
+                    continue
+                for meta in node_data.get("attachments") or []:
+                    if isinstance(meta, dict) and meta.get("id"):
+                        referenced.add(str(meta["id"]))
+        return collect_stale_attachments(self.config.attachment_dir, referenced)
 
     def _reset_placeholder(self) -> None:
         st = TreeState(number=0, color=1, tree=ConversationTree(self.current_system))
@@ -332,11 +268,7 @@ class ChatController:
             color=self._store.color_of(number),
             tree=tree,
             draft=data.get("draft", "") or "",
-            audit_level=int(data.get("audit_level") or 1),
-            file_confirm=bool(data.get("file_confirm", True)),
-            workspace=data.get("workspace") or None,
-            system_tools=bool(data.get("system_tools", True)),
-            mcp_tools=list(data.get("mcp_tools") or []),
+            draft_attachments=list(data.get("draft_attachments") or []),
         )
         self._apply_system_prompt(st)
         self._states[number] = st
@@ -366,24 +298,8 @@ class ChatController:
             "color": st.color,
             "tree": tree_data,
             "draft": st.draft,
-            "audit_level": st.audit_level,
-            "file_confirm": st.file_confirm,
-            "workspace": st.workspace,
-            "system_tools": st.system_tools,
-            "mcp_tools": list(st.mcp_tools),
+            "draft_attachments": list(st.draft_attachments),
             "saved_at": time.time(),
-        }
-
-    def _global_payload(self) -> Dict[str, Any]:
-        return {
-            "system_prompt": self.current_system,
-            "temperature": self.current_temperature,
-            "model": self.current_model,
-            "thinking_enabled": self.thinking_enabled,
-            "reasoning_effort": self.reasoning_effort,
-            "image_detail": self.image_detail,
-            "imported_content": self.imported_content,
-            "imported_files": self.imported_files,
         }
 
     def save_tree(self, number: Optional[int] = None) -> bool:
@@ -405,7 +321,6 @@ class ChatController:
             payload = self._tree_payload(st)
             if payload is None or not self._store.save_tree(number, payload):
                 ok = False
-        self._store.set_global_settings(self._global_payload())
         return ok
 
     # ---------------- 对话树：访问与切换 ----------------
@@ -442,32 +357,14 @@ class ChatController:
             st.tree = value
         self._apply_system_prompt(st)
 
-    # ---------------- 系统提示词：完整版 / 最小版 ----------------
-
-    @staticmethod
-    def _is_chat_only(st: Optional[TreeState]) -> bool:
-        """该树是否只挂了「对话」能力（无系统工具、无外置 MCP 工具）。"""
-        return st is not None and not st.system_tools and not st.mcp_tools
-
-    def _system_prompt_for(self, st: Optional[TreeState]) -> str:
-        """按树的能力挂载选提示词：只挂对话用最小版，挂了任何工具用完整版。"""
-        if self._is_chat_only(st):
-            return self.current_system_minimal
-        return self.current_system
-
     def _apply_system_prompt(self, st: TreeState) -> None:
-        """把当前该生效的提示词写回树对象（能力挂载或全局设置变化后调用）。"""
-        st.tree.system_prompt = self._system_prompt_for(st)
+        """提示词全局唯一：所有树用同一份。"""
+        st.tree.system_prompt = self.current_system
 
     @property
     def active_system_prompt(self) -> str:
-        """当前树实际生效的系统提示词。"""
-        return self._system_prompt_for(self._state())
-
-    @property
-    def active_system_minimal(self) -> bool:
-        """当前树是否使用最小提示词（只挂「对话」能力）。"""
-        return self._is_chat_only(self._state())
+        """当前生效的系统提示词（来自 ~/.mincli/prompt.md）。"""
+        return self.current_system
 
     @property
     def active_number(self) -> int:
@@ -527,16 +424,10 @@ class ChatController:
         self._store.set_active(number)
         self._interrupt_requested = False  # 打断标志只属于具体那棵树
         self.tree_marks.pop(number, None)
-        self._rebuild_llm_tools()
         return True
 
-    def create_tree(
-        self,
-        system_tools: bool = True,
-        mcp_tools: Optional[List[str]] = None,
-        activate: bool = True,
-    ) -> int:
-        """新建一棵空对话树并（默认）切过去，返回编号。"""
+    def create_tree(self, activate: bool = True) -> int:
+        """新建一棵空对话树并（默认）切过去，返回编号。所有树完全一样。"""
         if activate:
             self.save_tree()
         number = self._store.allocate()
@@ -544,8 +435,6 @@ class ChatController:
             number=number,
             color=self._store.color_of(number),
             tree=ConversationTree(self.current_system),
-            system_tools=bool(system_tools),
-            mcp_tools=list(mcp_tools or []),
         )
         self._apply_system_prompt(st)
         self._states[number] = st
@@ -555,7 +444,6 @@ class ChatController:
             self._states.pop(0, None)
             self._active = number
             self._store.set_active(number)
-            self._rebuild_llm_tools()
         return number
 
     def delete_tree(self, number: int) -> dict:
@@ -578,87 +466,7 @@ class ChatController:
                 self._states.pop(0, None)
                 self._reset_placeholder()
                 self._store.set_active(None)
-            self._rebuild_llm_tools()
         return {"ok": True, "was_active": was_active, "remaining": self._store.numbers()}
-
-    def tree_caps(self, number: Optional[int] = None) -> dict:
-        """某棵树的能力挂载配置（未加载的树按需读盘）。"""
-        st = self._state(number)
-        if st is None and number is not None and self._store.has_tree(int(number)):
-            st = self._load_state(int(number))
-        if st is None:
-            return {"system_tools": True, "mcp_tools": []}
-        return {"system_tools": st.system_tools, "mcp_tools": list(st.mcp_tools)}
-
-    def set_tree_caps(
-        self,
-        number: Optional[int] = None,
-        system_tools: Optional[bool] = None,
-        mcp_tools: Optional[List[str]] = None,
-    ) -> bool:
-        """修改某棵树的能力挂载（对下一次请求生效）。"""
-        st = self._state(number)
-        if st is None and number is not None and self._store.has_tree(int(number)):
-            st = self._load_state(int(number))
-        if st is None or st.is_placeholder:
-            return False
-        if system_tools is not None:
-            st.system_tools = bool(system_tools)
-        if mcp_tools is not None:
-            st.mcp_tools = list(mcp_tools)
-        # 能力变化可能让这棵树在「完整版 / 最小版」提示词之间切换
-        self._apply_system_prompt(st)
-        self.save_tree(st.number)
-        if st.number == self._active:
-            self._rebuild_llm_tools()
-        return True
-
-    def available_tool_groups(self) -> Dict[str, List[str]]:
-        """当前可勾选的工具：server 名 → 工具名（内置 server 的键为 "mincli"）。"""
-        if self._mcp is None:
-            return {}
-        return self._mcp.tools_by_server()
-
-    def external_servers(self) -> List[str]:
-        """已配置的第三方 MCP server 名（可能尚未连接完成）。"""
-        if self._mcp is None:
-            return []
-        return self._mcp.configured_servers()
-
-    # ---------------- 每棵树独立的设置 ----------------
-
-    @property
-    def audit_level(self) -> int:
-        st = self._state()
-        return st.audit_level if st is not None else 1
-
-    @audit_level.setter
-    def audit_level(self, value: int) -> None:
-        st = self._state()
-        if st is not None:
-            st.audit_level = int(value)
-
-    @property
-    def file_confirm(self) -> bool:
-        st = self._state()
-        return st.file_confirm if st is not None else True
-
-    @file_confirm.setter
-    def file_confirm(self, value: bool) -> None:
-        st = self._state()
-        if st is not None:
-            st.file_confirm = bool(value)
-
-    @property
-    def workspace(self) -> Optional[str]:
-        st = self._state()
-        return st.workspace if st is not None else None
-
-    @workspace.setter
-    def workspace(self, value: Optional[str]) -> None:
-        st = self._state()
-        if st is not None:
-            st.workspace = value
 
     @property
     def draft(self) -> str:
@@ -671,126 +479,27 @@ class ChatController:
         if st is not None:
             st.draft = value or ""
 
-    # ---------------- MCP ----------------
-
-    def _mcp_log(self, message: str) -> None:
-        """MCP 客户端日志回调（可能来自后台连接线程）。"""
-        try:
-            self.mcp_logger(message)
-        except Exception:
-            pass
-
     @property
-    def mcp_started(self) -> bool:
-        """MCP 客户端是否已创建（不代表已连接完成）。"""
-        return self._mcp is not None
-
-    @property
-    def mcp_ready(self) -> bool:
-        """后台连接是否已结束。"""
-        return self._mcp is not None and self._mcp.ready
-
-    @property
-    def mcp_connecting(self) -> bool:
-        """是否仍在后台连接（UI 据此显示「连接中」）。"""
-        return self._mcp is not None and self._mcp.connecting
-
-    @property
-    def mcp_connected(self) -> bool:
-        """是否至少连上一个 server（工具可用）。"""
-        return self._mcp is not None and self._mcp.ok
-
-    def start_mcp(self) -> None:
-        """创建 MCP 客户端并**在后台**开始连接（立即返回，不阻塞首屏）。"""
-        if McpToolClient is None or self._mcp is not None:
-            return
-        self._mcp = McpToolClient(log=self._mcp_log)
-        self._mcp_synced = False
-        try:
-            self._mcp.start()
-        except Exception:
-            self._mcp = None
-            self._mcp_tool_names = set()
-        self._rebuild_llm_tools()
-
-    def wait_mcp_ready(
-        self, emit: Optional[EventSink] = None, timeout: Optional[float] = READY_TIMEOUT
-    ) -> bool:
-        """等待后台 MCP 连接结束并同步工具列表（发送消息前调用）。
-
-        首次调用会阻塞到连接完成（通常启动后 1~2 秒内就已结束，此处瞬间返回）；
-        之后只做一次同步。超时或连不上时返回 False，调用方退回“无 MCP 工具”
-        继续，不因为 MCP 故障把发送卡死。
-        """
-        if self._mcp is None:
-            return False
-        if not self._mcp_synced:
-            if self._mcp.connecting and emit is not None:
-                emit(ControllerEvent.status("正在连接 MCP 服务…"))
-            self._mcp.wait_ready(timeout=timeout)
-            self._mcp_tool_names = self._mcp.tool_names()
-            self._mcp_synced = True
-            self._rebuild_llm_tools()
-        return self._mcp.ok
-
-    def _rebuild_llm_tools(self) -> None:
-        """按当前对话树的能力挂载重组发给模型的工具列表。
-
-        - 进程内工具（查询对话树）与内置 server 的工具同属「系统工具」整组开关；
-        - 外置 server 的工具按该树保存的白名单逐个放行（白名单为空 = 一个都不挂）；
-        - MCP 未就绪时只有进程内工具，其余等 wait_mcp_ready 同步后补上。
-        """
+    def draft_attachments(self) -> List[Dict[str, Any]]:
+        """草稿里的附件元数据（供恢复引用块）。"""
         st = self._state()
-        system_tools = True if st is None else st.system_tools
-        allowed = set(st.mcp_tools) if st is not None else set()
-        tools: List[Dict] = []
-        if system_tools:
-            tools.extend(TOOLS)
-        if self._mcp is not None:
-            for d in self._mcp.tools():
-                name = d.get("function", {}).get("name")
-                if not name:
-                    continue
-                if self._mcp.tool_owner(name) == BUNDLED_NAME:
-                    if system_tools:
-                        tools.append(d)
-                elif name in allowed:
-                    tools.append(d)
-        self.llm_tools = tools
+        return list(st.draft_attachments) if st is not None else []
 
-    def mcp_status(self) -> dict:
-        return self._mcp.server_status() if self._mcp else {}
-
-    def mcp_reload(self) -> None:
-        """后台重连全部 MCP server（读取最新配置），立即返回。"""
-        if not self._mcp:
-            raise RuntimeError("MCP 客户端未就绪")
-        self._mcp.reload()
-        self._mcp_synced = False
-
-    def close(self) -> None:
-        if self._mcp:
-            self._mcp.close()
-            self._mcp = None
+    @draft_attachments.setter
+    def draft_attachments(self, value: List[Dict[str, Any]]) -> None:
+        st = self._state()
+        if st is not None:
+            st.draft_attachments = list(value or [])
 
     # ---------------- 打断 ----------------
 
     def interrupt(self) -> bool:
-        """请求打断当前轮生成/命令执行（线程安全，可从 UI 线程调用）。
+        """请求打断当前轮生成（线程安全，可从 UI 线程调用）。
 
-        - 置位打断标志：流式循环在下一个 chunk 处停止读取（见 stream_response
-          的 should_stop），工具执行后也会检查并结束本轮；
-        - 立即请求内置 MCP server 终止正在运行的命令进程组，长任务不用再等
-          超时（第三方 server 无该内部工具，只会停止后续流程）。
-
-        返回是否发起了打断请求（当前是否处于可打断状态由 UI 侧感知）。
+        置位打断标志：流式循环在下一个 chunk 处停止读取（见 stream_response
+        的 should_stop），工具执行后也会检查并结束本轮。返回是否发起了打断请求。
         """
         self._interrupt_requested = True
-        if self._mcp is not None:
-            try:
-                self._mcp.cancel_running()
-            except Exception:
-                pass
         return True
 
     @property
@@ -800,218 +509,72 @@ class ChatController:
 
     # ---------------- 设置 ----------------
 
-    def set_system(self, system: str) -> None:
-        """设置系统提示词（全局设置：立即作用于所有已加载的对话树）。
-
-        这里设置的是「完整版」；只挂「对话」能力的树仍使用最小提示词，
-        见 _system_prompt_for。
-        """
-        self.current_system = system
-        for st in self._states.values():
-            self._apply_system_prompt(st)
-
     def set_temperature(self, temp: float) -> None:
         self.current_temperature = temp
+        self.config.temperature = temp
+        self._save_config()
 
     def set_model(self, model: str) -> bool:
-        """切换模型：支持 flash/pro/vision 简写与现役/已注册模型名。
-
-        旧模型名（deepseek-v4-flash、deepseek-v4-flash-vision-exp 等）自动
-        改写为现役名（vision → deepseek-flash，因为图片能力已并入 Flash）。
-        """
-        arg = (model or "").strip()
-        normalized = normalize_model_name(arg)
-        registered = load_models()
-        if normalized in MODELS_AVAILABLE or normalized in registered:
-            self.current_model = normalized
-            return True
-        # 未注册的自定义完整模型名（如 gpt-4o）原样接受
-        if arg in registered:
-            self.current_model = arg
-            return True
-        return False
+        """在 flash / pro 之间切换（支持简写与旧名）。"""
+        normalized = normalize_model_name(model or "")
+        if normalized not in (MODEL_FLASH, MODEL_PRO):
+            return False
+        self.current_model = normalized
+        self.config.model = normalized
+        self._save_config()
+        return True
 
     def set_detail(self, detail: str) -> bool:
-        """设置图片 detail 全局默认（low/auto/high/original）。
-
-        同时改写「待发送图片」的 detail 并重算 token 估算：用户多半是先导入图片
-        再 `/set detail low`，若只改全局默认，已入队的图片仍会按旧档发送。
-        """
+        """设置图片 detail 默认值（low/auto/high/original）。"""
         if detail not in ("low", "auto", "high", "original"):
             return False
         self.image_detail = detail
-        for att in self.pending_images:
-            att.detail = detail
-            att.tokens_est = estimate_image_tokens(att.width, att.height, detail)
         return True
 
     def set_thinking(self, on: bool) -> None:
-        self.thinking_enabled = on
+        self.thinking_enabled = bool(on)
+        self.config.thinking = bool(on)
+        self._save_config()
 
     def set_effort(self, effort: str) -> bool:
-        if effort in ("low", "high", "max"):
-            self.reasoning_effort = effort
-            return True
-        return False
-
-    def set_audit(self, level: int) -> bool:
-        if level in (1, 2, 3, 4):
-            self.audit_level = level
-            return True
-        return False
-
-    def set_file_confirm(self, enabled: bool) -> None:
-        """设置写文件/编辑文件时是否弹窗确认。"""
-        self.file_confirm = bool(enabled)
-
-    def set_workspace(self, path: str) -> bool:
-        """设置命令执行默认工作目录（不存在则创建）。"""
-        path = os.path.expanduser(path.strip())
-        try:
-            os.makedirs(path, exist_ok=True)
-        except OSError:
+        if effort not in EFFORTS:
             return False
-        self.workspace = os.path.abspath(path)
+        self.reasoning_effort = effort
+        self.config.effort = effort
+        self._save_config()
         return True
 
-    # ---------------- 导入 / 导出 ----------------
+    # ---------------- 能力开关（底部状态栏三路入口共用） ----------------
 
-    # 工具函数返回的错误文案前缀（视为导入失败而非内容）
-    _IMPORT_FAIL_PREFIXES = (
-        "文件不存在:",
-        "无法获取网页内容:",
-        "无法从网页中提取有效文本:",
-        "抓取或解析失败:",
-        "无法读取:",
-    )
+    def set_files_mode(self, mode: str) -> bool:
+        if mode not in FILE_MODES:
+            return False
+        self.config = self.config.with_files_mode(mode)
+        self._save_config()
+        self._rebuild_llm_tools()
+        return True
 
-    def import_target(self, target: str) -> Optional[str]:
-        """导入单个文件/网页为上下文（兼容入口）。
+    def set_web(self, enabled: bool) -> bool:
+        self.config = self.config.with_web(enabled)
+        self._save_config()
+        self._rebuild_llm_tools()
+        return True
 
-        图片路径/URL 转为待发送图片附件。成功返回 None，失败返回错误信息。
-        """
-        res = self.import_targets([target])
-        if res["errors"] and not res["images_added"] and not res["text_added"]:
-            return res["errors"][0]
-        return None
+    def set_recall(self, enabled: bool) -> bool:
+        self.config = self.config.with_recall(enabled)
+        self._save_config()
+        self._rebuild_llm_tools()
+        return True
 
-    def import_targets(self, targets: List[str]) -> dict:
-        """批量导入（/import 多文件）：图片→待发送图片，文本/网页→下次发送附带。
+    def _save_config(self) -> None:
+        try:
+            save_config(self.config)
+        except OSError:
+            pass
 
-        返回 {"images_added": int, "text_added": int, "errors": [str, ...]}。
-        """
-        images_before = len(self.pending_images)
-        text_before = len(self.imported_files)
-        errors: List[str] = []
-        for t in targets:
-            err = self._import_one(t)
-            if err:
-                errors.append(err)
-        return {
-            "images_added": len(self.pending_images) - images_before,
-            "text_added": len(self.imported_files) - text_before,
-            "errors": errors,
-        }
-
-    def _import_one(self, target: str) -> Optional[str]:
-        """导入单个目标。成功返回 None，失败返回错误信息。"""
-        target = target.strip()
-        if re.match(r"^https?://", target):
-            # 网页 URL：图片扩展名 → 图片附件；否则抓取网页文本
-            if looks_like_image_target(target):
-                added, errors = self.add_pending_images([target])
-                if added:
-                    return None
-                return errors[0] if errors else f"无法读取: {target}"
-            result = fetch_webpage(target)
-            if result and not result.startswith(self._IMPORT_FAIL_PREFIXES):
-                self._append_imported(result, {"kind": "web", "name": target[:120]})
-                return None
-            return result or f"无法读取: {target}"
-        # 本地文件：先展开 ~（否则 ~/图片 会漏过图片嗅探走进文本解析）
-        path = os.path.expanduser(target)
-        if os.path.isfile(path) and is_image_path(target):
-            added, errors = self.add_pending_images([target])
-            if added:
-                return None
-            return errors[0] if errors else f"无法读取: {target}"
-        result = parse_file(path)
-        if result and not result.startswith(self._IMPORT_FAIL_PREFIXES):
-            self._append_imported(result, {"kind": "text", "name": os.path.basename(path)})
-            return None
-        return result or f"无法读取: {target}"
-
-    def _append_imported(self, content: str, meta: Dict[str, str]) -> None:
-        """把一段导入内容拼接到 imported_content，并记录文件元数据。"""
-        if self.imported_content:
-            self.imported_content += "\n\n---\n\n"
-        self.imported_content = (self.imported_content or "") + content
-        self.imported_files.append(meta)
-
-    def clear_imports(self) -> int:
-        """清空待导入内容（图片 + 文本/网页），返回清除的文件数。"""
-        n = len(self.pending_images) + len(self.imported_files)
-        self.pending_images = []
-        self.imported_content = None
-        self.imported_files = []
-        return n
-
-    def import_summary(self) -> str:
-        """状态条中段文本：已导入文件数量 + 前 2 个文件名 + 图片 token 估算。"""
-        names = [a.name for a in self.pending_images] + [
-            f["name"] for f in self.imported_files
-        ]
-        if not names:
-            return ""
-        shown = "、".join(names[:2])
-        extra = "…" if len(names) > 2 else ""
-        return (
-            f"已导入 {len(names)} 个文件：{shown}{extra}{self.images_tokens_hint()}"
-            " · /import clear 清除"
-        )
-
-    def images_tokens_hint(self) -> str:
-        """待发送图片的 token 估算提示（无图片返回空串）。
-
-        按官方图片预处理公式逐张估算，让用户在发送前就知道这轮图片大概多少
-        token（只算图片本身，文本与工具定义不计）。
-        """
-        if not self.pending_images:
-            return ""
-        tokens = total_tokens_est(self.pending_images)
-        if not tokens:
-            return ""
-        return f" · 图片约 {tokens} tokens"
-
-    def import_file_list(self) -> List[Dict[str, str]]:
-        """完整导入文件列表（图片在前、文本/网页在后），供悬停弹窗展示。"""
-        items = [
-            {"kind": "image", "name": a.name, "tokens": a.tokens_est or 0}
-            for a in self.pending_images
-        ]
-        items += [
-            {"kind": f["kind"], "name": f["name"], "tokens": 0}
-            for f in self.imported_files
-        ]
-        return items
-
-    # ---------------- 多模态：待发送图片 ----------------
-
-    def add_pending_images(self, targets: List[str]) -> tuple:
-        """把路径/URL 添加为待发送图片。返回 (成功数, 错误信息列表)。"""
-        added = 0
-        errors: List[str] = []
-        for t in targets:
-            try:
-                if t.startswith(("http://", "https://")):
-                    att = make_url_attachment(t, self.image_detail)
-                else:
-                    att = make_path_attachment(t, self.image_detail)
-                self.pending_images.append(att)
-                added += 1
-            except ValueError as e:
-                errors.append(str(e))
-        return added, errors
+    def _rebuild_llm_tools(self) -> None:
+        """按当前能力状态刷新工具列表（发送时按本轮附件再算一次）。"""
+        self.llm_tools = available_tools(self.config, has_attachments=False)
 
     def save_node(self, node_id: str) -> Optional[str]:
         """导出节点为 Markdown 文件，返回文件路径；节点不存在返回 None。"""
@@ -1265,281 +828,19 @@ class ChatController:
                     pass
                 del self.temp_files[nid]
 
-    # ---------------- 工作流（/wf） ----------------
-
-    _WF_EXTRACT_INSTR = (
-        "你是操作流程提炼助手。把一段“已完成任务的完整记录”提炼成可复用的"
-        "工作流规范文档。规范用于以后每次执行同类任务时指导模型照做，因此必须"
-        "保留工作内容、执行步骤、每一步调用命令/工具的细节，同时剔除只会出现"
-        "在本次执行中的具体实例数据。"
-    )
-
-    _WF_EXTRACT_PROMPT = """请把下面的操作记录提炼成工作流规范文档，要求：
-
-1. 严格按此格式输出（只输出文档本身，禁止任何开场白或解释）：
-   目标：<一句话：这类任务要完成什么>
-   （空行）
-   变量：
-   - {{变量名}}：含义（示例：一个典型值）
-   （空行）
-   步骤：
-   1. <本步目的与动作>；若需命令，写明命令或工具与用法，如：`git log {{旧版本}}..HEAD`
-   2. …
-
-2. 步骤必须保留“命令/工具调用的细节”：工具名、关键参数/命令本身、该步要达成的
-   目的、结果如何处理，让没有上下文的人也能照做。
-
-3. 【重要】凡是每次执行都会变化的具体数据——版本号、日期、绝对路径、文件名、
-   本次的正文/数据内容、ID、URL 等——一律不得写死，改写成 {{变量名}} 并在
-   “变量”节说明含义与示例。例如不得写“v1.2.0”或“/Users/me/run.sh”，应写成
-   {{旧版本}}、{{脚本路径}}。
-
-4. 不包含思考过程、失败重试的花絮、只与本次记录相关的闲聊。
-
-5. 保留原记录语言（中文记录用中文输出）。
-
-操作记录：
-{source}"""
-
-    _WF_REVISE_INSTR = (
-        "你是工作流文档修订助手。根据用户的修改要求，把给定的工作流规范文档改写为"
-        "完整的新版本文档（输出整篇文档，不是 diff）。沿用原文档的格式与语言，"
-        "沿用其中 {{变量}} 的既有约定。"
-    )
-
-    _WF_REVISE_PROMPT = """以下是当前的工作流规范文档：
-
-{doc}
-
-用户修改要求：
-{request}
-
-请输出完整的新版规范文档（格式与原文一致：目标 / 变量 / 步骤）。"""
-
-    def wf_list(self) -> List[dict]:
-        """返回工作流摘要列表（用于 /wf list）。"""
-        out = []
-        for wf in self._wf_store.list():
-            goal, steps = (wf.goal(), len(
-                [ln for ln in wf.doc.splitlines()
-                 if re.match(r"^\s*\d+[.、]", ln)]))
-            out.append({
-                "name": wf.name,
-                "goal": goal,
-                "steps": steps,
-                "vars": wf.placeholders(),
-                "run_count": wf.run_count,
-                "updated_at": wf.updated_at,
-            })
-        return out
-
-    def wf_get(self, name: str) -> Optional[Workflow]:
-        return self._wf_store.get(name)
-
-    def _wf_build_source(self, nodes: List[ConversationNode]) -> str:
-        parts = []
-        for i, node in enumerate(nodes, start=1):
-            title = (node.title or "").strip()
-            head = f"--- 第 {i} 轮（节点 {node.id}）{('：' + title) if title else ''} ---"
-            parts.append(head)
-            user_line = node.user_msg or ""
-            if node.user_images:
-                img_marks = "；".join(
-                    image_placeholder_text(att) for att in node.user_images
-                )
-                user_line = f"{user_line}\n（附图：{img_marks}）"
-            parts.append(f"用户: {user_line}")
-            for tm in node.tool_messages:
-                role = tm.get("role")
-                if role == "assistant":
-                    for tc in tm.get("tool_calls") or []:
-                        fn = tc.get("function") or {}
-                        args = str(fn.get("arguments", ""))
-                        if len(args) > WF_TOOL_ARGS_MAX_CHARS:
-                            args = args[:WF_TOOL_ARGS_MAX_CHARS] + "…（已截断）"
-                        parts.append(f"调用工具: {fn.get('name', '?')} {args}")
-                elif role == "tool":
-                    content = str(tm.get("content", ""))
-                    if len(content) > WF_TOOL_RESULT_MAX_CHARS:
-                        content = content[:WF_TOOL_RESULT_MAX_CHARS] + "…（已截断）"
-                    parts.append(f"工具结果: {content}")
-            if node.reasoning:
-                parts.append(
-                    f"思考: {node.reasoning[:WF_REASONING_MAX_CHARS]}"
-                )
-            if node.assistant_msg:
-                ans = node.assistant_msg
-                if len(ans) > WF_ANSWER_MAX_CHARS:
-                    ans = ans[:WF_ANSWER_MAX_CHARS] + "…（已截断）"
-                parts.append(f"回答: {ans}")
-        return "\n\n".join(parts)
-
-    def _wf_call_model(self, messages: List[Dict], max_tokens: int) -> str:
-        """调用当前模型生成工作流文档（提炼/修订）；失败返回空串。"""
-        for tokens in (max_tokens, 2000):
-            try:
-                resp = self.client.chat.completions.create(
-                    model=self.current_model,
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=tokens,
-                    extra_body={"thinking": {"type": "disabled"}},
-                )
-                content = (resp.choices[0].message.content or "").strip()
-                if content:
-                    return content
-            except Exception:
-                continue
-        return ""
-
-    def wf_save(self, name: str, start_id: Optional[str] = None,
-                force: bool = False) -> dict:
-        """把当前节点（或 start_id→当前节点的连续链）提炼为工作流并保存。
-
-        返回：
-            {"status": "exists"} —— 同名已存在且未 force（UI 确认后带 force 重试）
-            {"status": "error", "message": ...}
-            {"status": "saved", "from": "extract"|"fallback", "name": ...,
-             "nodes": N, "doc": ..., "placeholders": [...]}
-        """
-        if not valid_name(name):
-            return {"status": "error",
-                    "message": "工作流名需为 1-32 位字母/数字/_/-（如 release、git-changelog）"}
-        if self._wf_store.has(name) and not force:
-            return {"status": "exists"}
-
-        if self.tree is None or self.tree.current_node is None:
-            return {"status": "error", "message": "当前没有可提炼的对话"}
-        current = self.tree.current_node
-
-        if start_id:
-            path = self._path_to_root(current)
-            path_ids = [n.id for n in path]
-            if start_id not in path_ids:
-                return {"status": "error",
-                        "message": f"起点节点 {start_id} 不在当前节点链上（应为当前节点或其祖先）"}
-            nodes = path[path_ids.index(start_id):]
-        else:
-            nodes = [current]
-        if not any(n.user_msg or n.assistant_msg or n.tool_messages for n in nodes):
-            return {"status": "error", "message": "所选对话没有可提炼的内容"}
-
-        source = self._wf_build_source(nodes)
-        if len(source) > WF_SOURCE_MAX_CHARS:
-            half = WF_SOURCE_MAX_CHARS // 2
-            source = (
-                source[:half]
-                + f"\n\n…（原文过长，中间 {len(source) - WF_SOURCE_MAX_CHARS} 字符已省略）…\n\n"
-                + source[-half:]
-            )
-
-        messages = [
-            {"role": "system", "content": self._WF_EXTRACT_INSTR},
-            {"role": "user",
-             "content": self._WF_EXTRACT_PROMPT.format(source=source)},
-        ]
-        doc = self._wf_call_model(messages, WF_EXTRACT_MAX_TOKENS)
-        from_status = "extract"
-        if not doc:
-            doc = (
-                f"{FALLBACK_MARK}\n\n目标：未能自动提炼\n\n"
-                f"原始操作记录：\n\n{source}"
-            )
-            from_status = "fallback"
-
-        wf = Workflow(
-            name=name,
-            doc=doc,
-            source_nodes=[n.id for n in nodes],
-        )
-        if not self._wf_store.put(wf, overwrite=True):
-            return {"status": "error", "message": f"工作流「{name}」保存失败（文件不可写）"}
-        return {
-            "status": "saved",
-            "from": from_status,
-            "name": name,
-            "nodes": len(nodes),
-            "doc": doc,
-            "placeholders": doc_placeholders(doc),
-        }
-
-    def wf_delete(self, name: str) -> bool:
-        return self._wf_store.delete(name)
-
-    def wf_rename(self, old: str, new: str) -> Optional[str]:
-        """重命名；成功返回 None，失败返回错误信息。"""
-        return self._wf_store.rename(old, new)
-
-    def wf_revise(self, name: str, request: str) -> dict:
-        """按用户要求让模型修订工作流文档并保存。"""
-        wf = self._wf_store.get(name)
-        if wf is None:
-            return {"status": "error", "message": f"工作流「{name}」不存在"}
-        messages = [
-            {"role": "system", "content": self._WF_REVISE_INSTR},
-            {"role": "user",
-             "content": self._WF_REVISE_PROMPT.format(
-                 doc=wf.doc, request=request)},
-        ]
-        new_doc = self._wf_call_model(messages, WF_EXTRACT_MAX_TOKENS)
-        if not new_doc:
-            return {"status": "error",
-                    "message": "修订失败（模型未返回内容），工作流未改变"}
-        wf.doc = new_doc
-        self._wf_store.put(wf, overwrite=True)
-        return {"status": "revised", "name": name, "doc": new_doc}
-
-    def wf_export_temp(self, name: str) -> Optional[str]:
-        """把工作流文档写入临时 .md 文件（供系统编辑器打开）；不存在返回 None。"""
-        wf = self._wf_store.get(name)
-        if wf is None:
-            return None
-        from mincli.workflows import write_doc_tempfile
-
-        return write_doc_tempfile(wf.doc)
-
-    def wf_import_text(self, name: str, text: str) -> bool:
-        """编辑器改回后更新工作流文档。"""
-        wf = self._wf_store.get(name)
-        if wf is None:
-            return False
-        wf.doc = text.strip() or wf.doc
-        return self._wf_store.put(wf, overwrite=True)
-
-    def wf_compose(self, name: str, typed: str = "",
-                   values: Optional[Dict[str, str]] = None) -> Optional[str]:
-        """为“下一次输入/立即运行”构造执行消息文本；不存在返回 None。
-
-        附带工作流规范全文（{占位符} 表示每次会变化的内容）。统计 run_count。
-        """
-        wf = self._wf_store.get(name)
-        if wf is None:
-            return None
-        doc, missing = substitute(wf.doc, values or {})
-        wf.run_count += 1
-        wf.last_run_at = now_iso()
-        self._wf_store.put(wf, overwrite=True)
-
-        extras = ""
-        if missing:
-            extras = "（未提供值的变量：" + "、".join(
-                "{" + m + "}" for m in missing) + "，请结合当前情况合理推断）"
-        head = (
-            f"请执行工作流「{wf.name}」{extras}。\n\n"
-            "下面是该工作流的完整规范，其中 {变量} 表示每次会变化的内容，"
-            "请结合本次输入与当前环境确定取值后严格按步骤执行，最后汇报结果：\n\n"
-            + doc
-        )
-        if typed and typed.strip():
-            return f"{head}\n\n本次输入：{typed}"
-        return head
-
     # ---------------- 发送消息 ----------------
 
     def send_message(
-        self, user_input: str, emit: EventSink
+        self,
+        user_input: str,
+        emit: EventSink,
+        attachments: Optional[List[Attachment]] = None,
     ) -> Optional[ConversationNode]:
         """在当前对话树里发送一条消息（可能触发多轮工具调用），返回新节点。
+
+        ``attachments`` 是本轮输入框里的附件：文本正文已由调用方用
+        compose_message 拼进 ``user_input``；这里负责把图片登记到节点、把正文
+        落盘供 read_attachment 续读，并随节点元数据持久化。
 
         多对话树：本方法在 worker 线程里执行，进入时把「当前树」绑定到发起
         生成的那棵树（线程局部），因此用户中途切到别的树也不会让生成写错树；
@@ -1562,7 +863,7 @@ class ChatController:
             emit(ev)
 
         try:
-            return self._send_message_impl(user_input, _emit)
+            return self._send_message_impl(user_input, _emit, attachments)
         except BaseException:
             failed = True
             raise
@@ -1575,7 +876,10 @@ class ChatController:
             self.save_tree(state.number)
 
     def _send_message_impl(
-        self, user_input: str, emit: EventSink
+        self,
+        user_input: str,
+        emit: EventSink,
+        attachments: Optional[List[Attachment]] = None,
     ) -> Optional[ConversationNode]:
         """发送消息的实际实现（已绑定好树上下文，见 send_message）。
 
@@ -1591,27 +895,31 @@ class ChatController:
         已生成部分同样落盘为「中断」节点，可直接继续。
         """
         self._interrupt_requested = False
-        if self.imported_content:
-            user_input = self.imported_content + "\n\n" + user_input
-            self.imported_content = None
-            self.imported_files = []
-
-        # 本轮待发送图片（已在上传前从待发送区摘出，避免重复发送）
-        this_turn_images = list(self.pending_images)
-        self.pending_images = []
+        turn_attachments = list(attachments or [])
 
         # 前置创建节点并设为当前节点：UI 立即进入新节点，流式输出归属该节点
         node = self._begin_node(user_input)
-        node.user_images = this_turn_images
+        node.user_images = [
+            att.image
+            for att in turn_attachments
+            if att.kind == KIND_IMAGE and att.image is not None
+        ]
+        # 正文先落盘，元数据里才带得上 stored_path
+        for att in turn_attachments:
+            if att.kind != KIND_IMAGE:
+                store_attachment_text(att, self.config.attachment_dir)
+        node.attachments = [att.metadata() for att in turn_attachments]
         emit(ControllerEvent.node_created(node))
 
         # 图片落地方式统一规划：detail=low 走内联（file 块不支持 detail），其余
         # 上传为 Files API file_id（含历史节点缺 file_id 的补传）
         self._prepare_attachments(node, emit)
 
-        # MCP 后台连接的收口：首次发送时若还没连完，这里等它（状态提示已发出），
-        # 保证本轮请求带上完整工具列表——工具中途就绪会导致前后两轮工具集不一致。
-        self.wait_mcp_ready(emit=emit)
+        # 本轮工具集：能力开关 + 是否有附件（附件续读与文件权限无关）
+        tools = available_tools(
+            self.config, has_attachments=self._node_has_attachments(node)
+        )
+        self.llm_tools = tools
 
         # 构建发送消息（历史链 + 本轮；图片构造为 OpenAI 兼容内容块）
         messages = self.tree.get_messages_for_node(node)
@@ -1630,14 +938,7 @@ class ChatController:
         # 请求体大小预检（内联 base64 才是大请求体来源：detail=low 内联或上传回退）
         inline_bytes = collect_inline_bytes(messages)
         if inline_bytes > VISION_REQUEST_MAX_BYTES:
-            low_inlined = any(
-                att.detail == "low" and not att.file_id and not att.is_url
-                for att in self._attachments_for_node(node)
-            )
-            hint = (
-                "输入 /set detail auto 改用 Files API 上传（file_id）可绕开请求体限制，"
-                if low_inlined else "请减少图片数量或压缩后重试"
-            )
+            hint = "请减少图片数量或压缩后重试"
             size_err = (
                 f"图片 base64 总量超限（约 {inline_bytes // 1024 // 1024} MiB "
                 f"> {VISION_REQUEST_MAX_BYTES // 1024 // 1024} MiB），{hint}"
@@ -1696,7 +997,7 @@ class ChatController:
                     user_input,
                     thinking_enabled=self.thinking_enabled,
                     reasoning_effort=self.reasoning_effort,
-                    tools=self.llm_tools,
+                    tools=tools,
                     on_chunk=_on_chunk,
                     should_stop=_interrupted,
                 )
@@ -1776,7 +1077,7 @@ class ChatController:
                             args = {}
                         args_repr = tc["function"]["arguments"]
                         emit(ControllerEvent.tool(name, args_repr, ""))
-                        tool_result = self._run_tool(name, args, emit)
+                        tool_result = self._run_tool(name, args, emit, node)
                         summary = (tool_result or "").strip()[:100].replace("\n", " ")
                         emit(ControllerEvent.tool(name, args_repr, summary or "（完成）"))
 
@@ -1965,13 +1266,13 @@ class ChatController:
         """检查当前模型是否支持图片理解；不支持时返回错误信息（不自动切换）。
 
         2026-09 起仅 `deepseek-flash` 支持图片（Pro 不支持），因此不再自动切换
-        模型，而是明确提示用户手动 `/set model flash`。
+        模型，而是明确提示用户手动 `/model flash`。
         """
         if self.current_model in VISION_MODELS:
             return None
         return (
             f"当前模型 {self.current_model} 不支持图片理解，"
-            f"请先 /set model flash 切换后重试（或移除图片）；"
+            f"请先 /model flash 切换后重试（或移除图片）；"
             f"本轮提问与图片已保存在该节点，切换后直接继续即可"
         )
 
@@ -2263,29 +1564,62 @@ class ChatController:
             cur = self.tree.nodes.get(cur.parent_id)
         return False
 
-    def _run_tool(self, name: str, args: dict, emit: EventSink) -> str:
-        """执行一个工具，返回文本结果。"""
-        if name == "query_conversation_tree":
+    def _node_has_attachments(self, node: ConversationNode) -> bool:
+        """当前节点链条上是否有附件（决定是否下发 read_attachment）。"""
+        return any(n.attachments for n in self._path_to_root(node))
+
+    def _tool_context(self, node: ConversationNode) -> ToolContext:
+        """一次工具调用需要的上下文：本会话全部附件 + 写确认 + 树查询。"""
+        pool: List[Attachment] = []
+        seen = set()
+        for n in self._path_to_root(node):
+            for meta in n.attachments:
+                if not isinstance(meta, dict):
+                    continue
+                key = str(meta.get("id") or "") or str(meta.get("stored_path") or "")
+                if key and key in seen:
+                    continue
+                seen.add(key)
+                pool.append(Attachment.from_metadata(meta))
+        return ToolContext(
+            config=self.config,
+            attachments=pool,
+            confirm=self._confirm_write,
+            recall=self._recall_dispatch,
+        )
+
+    def _confirm_write(self, description: str) -> bool:
+        """写文件确认：只有「写需确认」模式才弹窗，其余模式直接放行。"""
+        if not self.config.files_write_enabled:
+            return False
+        if not self.config.files_write_needs_confirm:
+            return True
+        return self.confirm("确认写入", description)
+
+    def _recall_dispatch(self, kind: str, args: dict) -> str:
+        if kind == "query":
             return self._query_conversation_tree(
-                args.get("root", ""), args.get("search", ""), args.get("tree", "")
+                str(args.get("root", "") or ""),
+                str(args.get("search", "") or ""),
+                args.get("tree", ""),
             )
-        if name == "read_conversation_nodes":
-            return self._read_conversation_nodes(
-                args.get("node_ids", ""), args.get("tree", "")
-            )
-        if name == "write_file":
-            return self._write_file(args.get("filepath", ""), args.get("content", ""))
-        if name == "edit_file":
-            return self._edit_file(
-                args.get("filepath", ""),
-                args.get("old_string", ""),
-                args.get("new_string", ""),
-            )
-        if name == "execute_command":
-            return self._execute_command_tool(args, emit)
-        if self._mcp is not None and name in self._mcp_tool_names:
-            return self._mcp.call(name, args)
-        return f"未知工具: {name}"
+        return self._read_conversation_nodes(
+            str(args.get("node_ids", "") or ""), args.get("tree", "")
+        )
+
+    def _run_tool(
+        self,
+        name: str,
+        args: dict,
+        emit: EventSink,
+        node: Optional[ConversationNode] = None,
+    ) -> str:
+        """在进程内执行一个工具（无 MCP、无子进程）。"""
+        if node is None:
+            ctx = ToolContext(config=self.config)
+        else:
+            ctx = self._tool_context(node)
+        return dispatch_tool(name, args, ctx)
 
     # ---------------- 工具实现 ----------------
 
@@ -2403,121 +1737,6 @@ class ChatController:
                     + f"回答: {node.assistant_msg}"
                 )
         return "\n\n".join(parts) if parts else "（未指定节点）"
-
-    def _write_file(self, filepath: str, content: str) -> str:
-        filepath = os.path.expanduser(filepath)
-        exists = os.path.exists(filepath)
-        mode = "覆盖已有文件" if exists else "创建新文件"
-        line_count = content.count("\n") + 1
-        preview = content
-        if line_count > 10:
-            preview_lines = content.split("\n")[:5]
-            preview = "\n".join(preview_lines) + f"\n…（共 {line_count} 行）"
-        details = f"路径: {filepath}\n操作: {mode}\n内容: {line_count} 行, {len(content)} 字符\n预览:\n{preview}"
-        if self.file_confirm and not self.confirm(f"即将{'覆盖' if exists else '写入'}文件", details):
-            return "用户已取消操作"
-        if self._interrupt_requested:
-            return "用户已打断，未写入文件"
-        if self._mcp is not None and "write_file" in self._mcp_tool_names:
-            return self._mcp.call("write_file", {"filepath": filepath, "content": content})
-        return "写文件工具不可用"
-
-    def _edit_file(self, filepath: str, old_string: str, new_string: str) -> str:
-        filepath = os.path.expanduser(filepath)
-        if not os.path.exists(filepath):
-            return f"文件不存在: {filepath}"
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            return f"读取文件失败: {e}"
-        if old_string not in content:
-            return "未找到匹配的原文，请确保 old_string 与文件内容完全一致（包括空格和换行）"
-        details = f"路径: {filepath}\n替换内容:\n"
-        for line in old_string.split("\n"):
-            details += f"  - {line}\n"
-        details += "  替换为:\n"
-        for line in new_string.split("\n"):
-            details += f"  + {line}\n"
-        if self.file_confirm and not self.confirm("即将修改文件", details):
-            return "用户已取消操作"
-        if self._interrupt_requested:
-            return "用户已打断，未修改文件"
-        if self._mcp is not None and "edit_file" in self._mcp_tool_names:
-            return self._mcp.call(
-                "edit_file",
-                {"filepath": filepath, "old_string": old_string, "new_string": new_string},
-            )
-        return "编辑文件工具不可用"
-
-    def _execute_command_tool(self, args: dict, emit: EventSink) -> str:
-        command = args.get("command", "")
-        timeout = args.get("timeout", EXEC_DEFAULT_TIMEOUT)
-        # 工作目录优先级：模型显式 cwd > /set workspace > 启动目录（服务端兜底）
-        cwd = args.get("cwd") or self.workspace or None
-        call_args: Dict[str, Any] = {"command": command, "timeout": timeout}
-        for key in ("cwd", "env", "shell", "max_output"):
-            if args.get(key) is not None:
-                call_args[key] = args[key]
-        if self.workspace and not call_args.get("cwd"):
-            call_args["cwd"] = self.workspace
-
-        def mcp_call() -> str:
-            """执行命令；若在审核/确认期间用户已打断，则不再启动进程。"""
-            if self._mcp is None or "execute_command" not in self._mcp_tool_names:
-                return "执行命令工具不可用"
-            if self._interrupt_requested:
-                return "用户已打断，未执行此命令"
-            return self._mcp.call("execute_command", call_args)
-
-        def _ctx_line() -> str:
-            parts = [f"工作目录: {cwd or '（启动目录）'}"]
-            if args.get("shell") and args["shell"] != "sh":
-                parts.append(f"shell: {args['shell']}")
-            return " | ".join(parts)
-
-        if self.audit_level == 4:
-            emit(ControllerEvent.status("▸ execute_command（无审核）"))
-            return mcp_call()
-
-        # 高危硬门：命中正则模式时，任何审核级别（除无审核）都强制用户确认
-        if matches_dangerous(command):
-            if self.confirm(
-                "高危命令",
-                f"命令: {command}\n\n⚠️ 匹配到高危命令模式，确认执行？\n{_ctx_line()}",
-            ):
-                return mcp_call()
-            return "用户未确认执行此命令"
-
-        if self.audit_level == 3:
-            emit(ControllerEvent.status("▸ execute_command（文本审核通过）"))
-            return mcp_call()
-
-        # 只读快速通道：无副作用命令跳过 AI 审核（level-1 仍确认，level-2 自动执行）
-        if is_safe_readonly(command):
-            if self.audit_level == 2:
-                emit(ControllerEvent.status(f"▸ {command[:60]}（只读命令，自动执行）"))
-                return mcp_call()
-            if self.confirm(
-                "执行确认",
-                f"命令: {command}\n\n审核: 只读命令快速通道（无副作用）\n{_ctx_line()}",
-            ):
-                return mcp_call()
-            return "用户未确认执行此命令"
-
-        level, desc, risk, audit_reasoning = audit_command(self.client, command)
-        if audit_reasoning:
-            emit(ControllerEvent.status(f"🧠 审核思考: {audit_reasoning}"))
-        risk_text = f"\n⚠️ {risk}" if risk else ""
-        if self.audit_level == 2 and level <= 2:
-            emit(ControllerEvent.status(f"▸ {desc}（等级{level}/5，自动执行）"))
-            return mcp_call()
-        if self.confirm(
-            "执行确认",
-            f"命令: {command}\n\n审核: 等级 {level}/5 | {desc}{risk_text}\n{_ctx_line()}",
-        ):
-            return mcp_call()
-        return "用户未确认执行此命令"
 
     # ---------------- 内部 ----------------
 

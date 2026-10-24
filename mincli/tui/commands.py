@@ -2,12 +2,12 @@
 
 结构是三级命令树：
 
-    /set                一级命令
-    /set thinking       二级子命令
-    /set thinking on    三级取值
+    /file               一级命令
+    /file read          二级子命令
+    /tree delete 1      子命令 + 动态候选
 
-运行时才知道的候选项（对话树编号、工作流名、MCP server 名）不写死在这里，
-由 ``providers`` 提供（见 ``runtime_providers``），补全时按需展开。
+运行时才知道的候选项（对话树编号）不写死在这里，由 ``providers`` 提供
+（见 ``runtime_providers``），补全时按需展开。
 
 补全、/help、用法提示都从这棵树生成，保证三处格式一致：新增命令只改这里。
 """
@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Optional
 
-from mincli.config import TEMPERATURE_MAX, TEMPERATURE_MIN
 
 
 @dataclass(frozen=True)
@@ -30,7 +29,7 @@ class Cmd:
     aliases       等价写法（不含 "/"）
     children      静态下一级
     group         仅一级命令使用：/help 分组
-    dyn           运行时候选项来源名（trees/workflows/servers）
+    dyn           运行时候选项来源名（trees）
     dyn_children  动态候选项自身的下一级
     extra         /help 里额外补的 (用法, 说明) 行（静态树表达不了的组合）
     """
@@ -52,25 +51,38 @@ class Cmd:
 
 
 # 动态候选项在用法里的占位写法
-DYN_LABEL = {"trees": "<编号>", "workflows": "<名称>", "servers": "<名称>"}
+DYN_LABEL = {"trees": "<编号>"}
 
-GROUP_ORDER = ("基本", "对话树", "工作流", "多模态", "多模型", "配置", "节点")
+GROUP_ORDER = ("基本", "对话树", "文件与附件", "联网", "模型", "节点跳转")
 
 # 仅用于 /tree：静态子命令表达不了「/tree <编号> tools」这种组合
-_TREE_TOOLS = Cmd("tools", "修改这棵树挂载的能力")
-
 CMD_SPEC: tuple[Cmd, ...] = (
-    Cmd("exit", "退出程序（自动保存会话）", aliases=("quit", "q", "e"), group="基本"),
-    Cmd("clear", "清空当前会话（当前树的全部节点）", aliases=("c",), group="基本"),
-    Cmd("compact", "把当前分支全部对话压缩成摘要并新建摘要节点", group="基本"),
     Cmd("help", "显示命令帮助", aliases=("h",), group="基本"),
-    Cmd("view", "用编辑器打开当前回答", group="基本"),
-    Cmd("import", "导入文件/网页/图片（图片转为待发送图片，并给出 token 估算）",
-        args="<文件路径或URL> [...]", group="多模态",
+    Cmd("clear", "清空当前对话树（全部节点）", aliases=("c",), group="基本"),
+    Cmd("compact", "把当前分支压缩成摘要并新建摘要节点", group="基本"),
+    Cmd("exit", "退出程序（自动保存会话）", aliases=("quit", "q"), group="基本"),
+    Cmd("tree", "对话树：列出全部、新建、删除", group="对话树",
         children=(
-            Cmd("clear", "清除已导入、待发送的内容", aliases=("c",)),
+            Cmd("list", "列出全部对话树（默认，也可只输 /tree）", aliases=("ls",)),
+            Cmd("new", "新建一棵空对话树（所有树完全一样）"),
+            Cmd("delete", "删除整棵树（需确认，编号不再复用）", args="<编号>",
+                aliases=("rm", "del"), dyn="trees"),
+        ),
+        dyn="trees"),
+    Cmd("up", "返回父节点", group="对话树"),
+    Cmd("home", "跳回根节点", group="对话树"),
+    Cmd("delete", "删除节点及其所有子节点（需确认）", args="<节点ID> [...]", group="对话树"),
+    Cmd("recall", "开关对话树检索工具（默认关）", args="<on|off>", group="对话树",
+        children=(Cmd("on", "允许模型查询历史节点"), Cmd("off", "关闭历史节点查询"))),
+    Cmd("file", "查看/切换文件权限（关闭/只读/写需确认/写直通）",
+        args="<off|read|confirm|direct>", group="文件与附件",
+        children=(
+            Cmd("off", "关闭：只提供附件续读工具"),
+            Cmd("read", "只读：允许读取本地文件与列目录"),
+            Cmd("confirm", "写需确认：读取 + 每次写文件前确认"),
+            Cmd("direct", "写直通：读取 + 写文件不再确认"),
         )),
-    Cmd("files", "管理已上传的 Files API 图片文件（默认最新在前）", group="多模态",
+    Cmd("files", "管理已上传的 Files API 图片文件（默认最新在前）", group="文件与附件",
         children=(
             Cmd("list", "列出最近上传的文件（含序号与容量统计）", args="[条数]",
                 aliases=("ls",)),
@@ -79,82 +91,20 @@ CMD_SPEC: tuple[Cmd, ...] = (
                 aliases=("rm", "del")),
             Cmd("clean", "清理不再被任何对话树引用的文件（需确认）"),
         )),
-    Cmd("tree", "列出全部对话树（编号、颜色、节点数、挂载能力）", group="对话树",
-        children=(
-            Cmd("new", "新建对话树并选择挂载的能力"),
-            Cmd("delete", "删除整棵树（需确认，编号不再复用）", args="<编号>",
-                aliases=("rm", "del"), dyn="trees"),
-        ),
-        dyn="trees", dyn_children=(_TREE_TOOLS,),
-        extra=(("/tree <编号> tools", _TREE_TOOLS.desc),)),
-    Cmd("wf", "把某次/一连串操作保存为可复用工作流", aliases=("workflow",), group="工作流",
-        children=(
-            Cmd("list", "列出全部工作流", aliases=("ls",)),
-            Cmd("show", "查看工作流规范", args="<名>", dyn="workflows"),
-            Cmd("save", "把当前节点提炼为工作流并长期保存", args="<名> [起点节点ID]"),
-            Cmd("use", "挂载到下一次输入（一次性）", args="<名>", dyn="workflows"),
-            Cmd("stop", "取消已挂载的工作流"),
-            Cmd("run", "立即按工作流执行", args="<名> [键=值...]", dyn="workflows"),
-            Cmd("edit", "修订工作流规范（不带要求时用编辑器打开）", args="<名> [修改要求]",
-                dyn="workflows"),
-            Cmd("rename", "重命名工作流", args="<旧名> <新名>"),
-            Cmd("delete", "删除工作流", args="<名>", aliases=("rm", "del"), dyn="workflows"),
-        )),
-    Cmd("model", "查看/注册模型配置", group="多模型",
-        children=(
-            Cmd("list", "列出内置与已注册模型", aliases=("ls",)),
-            Cmd("register", "注册 OpenAI 兼容模型", args="<模型名> <URL> [-p provider] [-k key_var]"),
-        )),
-    Cmd("file", "查看/切换文件权限（关闭/只读/写需确认/写直通）",
-        args="<off|read|confirm|direct>", group="配置",
-        children=(
-            Cmd("off", "关闭：不提供读写本地文件的工具，附件仍可读"),
-            Cmd("read", "只读：允许读取本地文件与列目录"),
-            Cmd("confirm", "写需确认：读取 + 每次写文件前确认"),
-            Cmd("direct", "写直通：读取 + 写文件不再确认"),
-        )),
-    Cmd("web", "开关联网（搜索 + 网页抓取）", args="<on|off>", group="配置",
+    Cmd("save", "导出节点为 Markdown 文件", args="[节点ID]", group="文件与附件"),
+    Cmd("web", "开关联网（搜索 + 网页抓取）", args="<on|off>", group="联网",
         children=(Cmd("on", "开启联网"), Cmd("off", "关闭联网"))),
-    Cmd("mcp", "管理第三方 MCP server", group="配置",
+    Cmd("model", "在 flash / pro 之间切换", args="<flash|pro>", group="模型",
         children=(
-            Cmd("list", "列出已配置的 server", aliases=("ls",)),
-            Cmd("add", "新增 server（本地命令或远程 URL）", args="<名称> <命令|URL> [参数...]"),
-            Cmd("remove", "移除 server", args="<名称>", aliases=("rm", "del"), dyn="servers"),
-            Cmd("reload", "重新连接所有 server"),
+            Cmd("flash", "deepseek-flash：支持图片理解"),
+            Cmd("pro", "deepseek-v4-pro：不支持图片"),
         )),
-    Cmd("set", "修改运行配置", group="配置",
-        children=(
-            Cmd("system", "修改系统提示词", args="<提示词>"),
-            Cmd("temp", f"设置温度（{TEMPERATURE_MIN}~{TEMPERATURE_MAX}）", args="<值>"),
-            Cmd("model", "切换模型（flash 支持图片理解）", args="<flash|pro|模型名>"),
-            Cmd("thinking", "开关思考模式", args="<on|off>",
-                children=(Cmd("on", "开启思考模式"), Cmd("off", "关闭思考模式"))),
-            Cmd("effort", "设置推理强度", args="<low|high|max>",
-                children=(
-                    Cmd("low", "更省时间的低强度推理"),
-                    Cmd("high", "默认的高强度推理"),
-                    Cmd("max", "最大推理强度（最慢）"),
-                )),
-            Cmd("audit", "设置审核层级", args="<1-4>"),
-            Cmd("workspace", "设置命令执行默认工作目录", args="<路径>"),
-            Cmd("detail", "设置图片清晰度（low 走内联真正省 token）",
-                args="<low|auto|high|original>",
-                children=(
-                    Cmd("low", "最低清晰度：本地图片改走内联，file_id 会忽略 detail"),
-                    Cmd("auto", "自动选择（默认，优先上传 Files API 复用）"),
-                    Cmd("high", "高清晰度（等价 original）"),
-                    Cmd("original", "原图，最清晰"),
-                )),
-            Cmd("file_confirm", "文件写入前是否弹窗确认", args="<on|off>",
-                children=(Cmd("on", "写入前弹窗确认"), Cmd("off", "直接写入不确认"))),
-            Cmd("show", "显示当前配置"),
-        )),
-    Cmd("info", "查看节点详情", args="[节点ID]", group="节点"),
-    Cmd("up", "返回父节点", group="节点"),
-    Cmd("home", "跳回根节点", group="节点"),
-    Cmd("full", "切换全览模式（节点树全宽显示）", aliases=("f",), group="节点"),
-    Cmd("save", "导出节点为 Markdown 文件", args="[节点ID]", group="节点"),
-    Cmd("delete", "删除节点及其所有子节点（需确认）", args="<节点ID> [...]", group="节点"),
+) + (
+    Cmd(
+        "a1",
+        "跳到指定节点（支持 a1 / b2 这类编号，输入 /a1 即进入）",
+        group="节点跳转",
+    ),
 )
 
 TOP_LEVEL: tuple[Cmd, ...] = CMD_SPEC
@@ -163,11 +113,7 @@ TOP_LEVEL: tuple[Cmd, ...] = CMD_SPEC
 # ---------------- 运行时候选项 ----------------
 
 def runtime_providers(ctrl) -> dict[str, Callable[[], list[tuple[str, str]]]]:
-    """把控制器里的运行时状态包成候选项来源（控制器不可用时返回空）。
-
-    每次按键都会调用一次，因此这里只读内存态：尤其不要用 tree_summary()
-    （未加载的树会逐个读盘解析），树编号的说明只用编号与「当前」标记。
-    """
+    """把控制器里的运行时状态包成候选项来源（控制器不可用时返回空）。"""
 
     def trees() -> list[tuple[str, str]]:
         numbers = ctrl.tree_numbers()
@@ -180,18 +126,7 @@ def runtime_providers(ctrl) -> dict[str, Callable[[], list[tuple[str, str]]]]:
             out.append((str(n), desc))
         return out
 
-    def workflows() -> list[tuple[str, str]]:
-        out = []
-        for wf in ctrl.wf_list():
-            steps = wf.get("steps", 0)
-            desc = f"{wf.get('goal') or '工作流'}（{steps} 步）"
-            out.append((str(wf.get("name", "")), desc))
-        return [item for item in out if item[0]]
-
-    def servers() -> list[tuple[str, str]]:
-        return [(name, "已配置的 MCP server") for name in ctrl.external_servers()]
-
-    return {"trees": trees, "workflows": workflows, "servers": servers}
+    return {"trees": trees}
 
 
 def _dyn_items(source: str, providers: Optional[Mapping[str, Callable[[], list[tuple[str, str]]]]]):
@@ -220,7 +155,7 @@ def _find_in(children: Iterable[Cmd], token: str) -> Optional[Cmd]:
 
 
 def node_at(path: str) -> Optional[Cmd]:
-    """按 "/set temp" 取静态节点（不展开动态候选项）。"""
+    """按 "/file read" 取静态节点（不展开动态候选项）。"""
     parts = [p for p in (path or "").split() if p]
     if not parts:
         return None
@@ -257,13 +192,13 @@ def usage_line(path: str) -> str:
 
 
 def _usage_of(base: str, name: str, args: str = "") -> str:
-    """把路径前缀与名字拼成用法文本：base="/set" + "temp" + "<值>"。"""
+    """把路径前缀与名字拼成用法文本：base="/file" + "read"。"""
     text = f"{base} {name}".strip() if base else f"/{name}"
     return f"{text} {args}" if args else text
 
 
 def command_block(path: str) -> str:
-    """某条命令的分行说明（Markdown 列表），用于 /wf 这类无参输出。"""
+    """某条命令的分行说明（Markdown 列表），用于无参命令输出。"""
     node = node_at(path)
     if node is None:
         return usage_line(path)
@@ -337,7 +272,6 @@ def complete(text: str, providers=None) -> Optional[Completion]:
     """解析输入框内容，返回补全状态；None 表示不该弹窗。"""
     if not text.startswith("/"):
         return None
-    trailing = text.endswith(" ")
     tokens = text.split()
     if not tokens:
         return None
@@ -347,7 +281,7 @@ def complete(text: str, providers=None) -> Optional[Completion]:
     consumed = 0
     children = list(TOP_LEVEL)
     for token in tokens:
-        # 一级命令带前导 "/"（"/set"），往下各级都是裸名字（"thinking"）
+        # 一级命令带前导 "/"（"/file"），往下各级都是裸名字（"read"）
         lookup = token.lstrip("/") if consumed == 0 else token
         child = _find_in(children, lookup)
         if child is None:

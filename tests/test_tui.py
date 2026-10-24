@@ -9,20 +9,19 @@ import asyncio
 import os
 import sys
 import tempfile
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mincli.models import ConversationTree
+from mincli.config import Config
 from mincli.controller import ChatController, ControllerEvent
-from mincli.tui.app import ChatApp
+from mincli.tui.app import AttachmentViewScreen, ChatApp
 from mincli.tui.commands import CMD_SPEC, complete, help_markdown, usage_line
 from mincli.tui.widgets import ChatInput
 from textual import events
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Button, Markdown, Static, Tree
+from textual.widgets import Button, Markdown, Static, TextArea, Tree
 from textual.widgets._markdown import (
     MarkdownBulletList,
     MarkdownOrderedList,
@@ -42,13 +41,16 @@ MARKUP_BAD_TEXT = (
 
 
 def check(name: str, cond: bool) -> None:
+    """记录并打印一条断言；在 pytest 下失败即抛出，避免测试静默通过。"""
     global PASS, FAIL
     if cond:
         PASS += 1
         print(f"  PASS  {name}")
-    else:
-        FAIL += 1
-        print(f"  FAIL  {name}")
+        return
+    FAIL += 1
+    print(f"  FAIL  {name}")
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        raise AssertionError(name)
 
 
 class _FakeDelta:
@@ -138,51 +140,47 @@ class _FakeClient:
 
 
 class FakeController(ChatController):
-    """真实 ChatController + 固定事件流（不联网）。"""
+    """真实 ChatController + 固定事件流（不联网）。
 
-    # 工作流提炼/修订的固定产出（不联网）
-    WF_STUB_DOC = (
-        "目标：测试工作流\n\n"
-        "变量：\n"
-        "- {path}：目标文件（示例：a.txt）\n\n"
-        "步骤：\n"
-        "1. 读取 {path} 并总结\n"
-    )
+    配置与提示词都落在临时目录，并同步设置 MINCLI_CONFIG_PATH /
+    MINCLI_PROMPT_PATH，避免界面开关写回用户主目录。
+    """
 
-    def __init__(self, with_tree: bool = True, trees_dir: str | None = None):
-        wf_dir = tempfile.mkdtemp(prefix="mincli_tui_wf_")
-        self.WORKFLOWS_FILE = os.path.join(wf_dir, "workflows.json")
+    def __init__(
+        self,
+        with_tree: bool = True,
+        trees_dir: str | None = None,
+        files_mode: str = "off",
+        web_enabled: bool = True,
+    ):
+        cfg_dir = tempfile.mkdtemp(prefix="mincli_tui_cfg_")
+        self.CONFIG_PATH = os.path.join(cfg_dir, "config.toml")
+        self.PROMPT_PATH = os.path.join(cfg_dir, "prompt.md")
+        self.ATTACHMENT_DIR = os.path.join(cfg_dir, "attachments")
+        os.environ["MINCLI_CONFIG_PATH"] = self.CONFIG_PATH
+        os.environ["MINCLI_PROMPT_PATH"] = self.PROMPT_PATH
+        os.environ["MINCLI_ATTACHMENTS_PATH"] = self.ATTACHMENT_DIR
         # 每个控制器一个独立树目录：树会落盘，共享目录会让用例互相污染
         self.TREES_DIR = trees_dir or tempfile.mkdtemp(prefix="mincli_tui_trees_")
+        self.config = Config(
+            files_mode=files_mode,
+            web_enabled=web_enabled,
+            attachment_dir=self.ATTACHMENT_DIR,
+            prompt_file=self.PROMPT_PATH,
+        )
         super().__init__(
             client=_FakeClient([]),
+            config=self.config,
             default_system="sys",
-            default_temperature=1.0,
-            auto_start_mcp=False,
             trees_dir=self.TREES_DIR,
         )
-        # 默认先建一棵树：没有树时 App 启动会弹建树向导，绝大多数用例不测这个
+        # 默认先建一棵树：没有树时 App 启动会显示欢迎页，绝大多数用例不测这个
         if with_tree and not self.has_trees:
             self.create_tree()
         self.saved = False
         self.closed = False
-        self.mcp_start_count = 0
 
-    def start_mcp(self):
-        """测试桩：不真的连接 MCP（会被 ChatApp 在挂载时调用）。
-
-        真实实现会起子进程 + 连远程 server，测试里既慢又要联网；这里只记录
-        调用次数，_mcp 保持未设置，App 侧也就不会派生就绪监听 worker。
-        """
-        self.mcp_start_count += 1
-
-    def _wf_call_model(self, messages, max_tokens):
-        user = str((messages[-1] or {}).get("content", ""))
-        if "用户修改要求" in user:
-            return "目标：已按修改要求更新的工作流\n\n步骤：\n1. 修订后的步骤"
-        return self.WF_STUB_DOC
-
-    def send_message(self, text, emit):
+    def send_message(self, text, emit, attachments=None):
         node = self.tree.create_root(text, "你好，世界！", "思考中", "测试标题", 10, 5)
         emit(ControllerEvent.node_created(node))
         emit(ControllerEvent.stream("你好", "思考中"))
@@ -448,7 +446,7 @@ async def test_interrupted_node_kept():
     """生成中断：节点保留（带 ⚠ 标记与「继续」提示），不再整轮回滚。"""
 
     class InterruptedController(FakeController):
-        def send_message(self, text, emit):
+        def send_message(self, text, emit, attachments=None):
             node = self.tree.create_root(text, "前半句", "先想想", "中断标题", 3, 2)
             node.error = "Error code: 400 - Content Exists Risk"
             emit(ControllerEvent.node_created(node))
@@ -483,14 +481,15 @@ async def test_interrupted_node_kept():
               and ctrl.tree.current_node.error != "")
 
         # 节点视图不再渲染「生成中断/已保存可继续」提示，但部分回答仍在
-        node_view = app._node_content(ctrl.tree.current_node)
+        head, rest = app._node_view_parts(ctrl.tree.current_node)
+        node_view = head + rest
         check("中断节点视图：不再显示中断提示",
               "生成中断" not in node_view and "本轮内容已保存" not in node_view)
         check("中断节点视图：仍保留部分回答", "前半句" in node_view)
         check("状态条等控件关闭 markup",
               all(not app.query_one(sel, Static)._render_markup
-                  for sel in ("#usage-left", "#usage-center", "#usage-right",
-                              "#import-popup")))
+                  for sel in ("#usage-left", "#usage-right",
+                              "#footer-hint", "#footer-file", "#footer-web")))
 
         # 确认弹窗里是模型生成的命令/文件内容，同样必须按纯文本渲染
         from mincli.tui.confirm import ConfirmScreen
@@ -522,7 +521,7 @@ async def test_interrupt_binding():
             self.interrupted = True
             return True
 
-        def send_message(self, text, emit):
+        def send_message(self, text, emit, attachments=None):
             node = self.tree.create_root(text, "", "", "慢回答", 0, 0)
             emit(ControllerEvent.node_created(node))
             self.started = True
@@ -682,65 +681,114 @@ async def test_adaptive_flush_interval():
               app._flush_interval == FLUSH_INTERVAL_MIN)
 
 
-async def test_mcp_background_ui():
-    """MCP 后台连接：状态条显示「连接中」，日志转通知（不往 stdout 写）。"""
-
-    class FakeMcp:
-        """最小 MCP 客户端替身：连接状态由测试显式放行（模拟慢连接）。"""
-
-        def __init__(self):
-            self.connecting = True
-            self.ok = False
-            self.release = threading.Event()
-
-        def wait_ready(self, timeout=None):
-            # 卡住「连接中」状态，等测试检查完状态条再放行
-            self.release.wait(timeout=5)
-            self.connecting = False
-            self.ok = True
-            return True
-
-        def tools(self):
-            return []
-
-        def tool_names(self):
-            return set()
-
-        def close(self):
-            pass
-
-    class McpController(FakeController):
-        def __init__(self):
-            super().__init__()
-            self._mcp = FakeMcp()
-
-        @property
-        def mcp_started(self):
-            return True  # 已启动：App 不会再调 start_mcp，避免起真实连接
-
-    ctrl = McpController()
+async def test_welcome_page():
+    """没有树时启动：聊天区显示欢迎页，点击新建按钮后创建树并消失。"""
+    ctrl = FakeController(with_tree=False)
     app = ChatApp(controller=ctrl)
-    notified = []
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(100, 40)) as pilot:
+        for _ in range(60):
+            await pilot.pause()
+            if app.query("#welcome"):
+                break
+        check("无树：聊天区显示欢迎页", bool(app.query("#welcome")))
+        check("无树：欢迎页有新建按钮", bool(app.query("#welcome-new")))
+        check("无树：输入框提示先建树",
+              "请先新建对话树" in str(app.query_one("#chat-input", ChatInput).placeholder))
+        check("无树：徽标提示未创建",
+              "未创建对话树" in str(app.query_one("#tree-badge", Static).content))
+        check("无树：此时没有任何对话树", not ctrl.has_trees)
+
+        app.query_one("#welcome-new", Button).press()
+        for _ in range(60):
+            await pilot.pause()
+            if ctrl.has_trees and not app.query("#welcome"):
+                break
+        check("欢迎页：按钮创建出编号 1 的树", ctrl.tree_numbers() == [1])
+        check("欢迎页：创建后欢迎页消失", not app.query("#welcome"))
+        check("欢迎页：输入框提示恢复",
+              "请先新建对话树" not in str(app.query_one("#chat-input", ChatInput).placeholder))
+        await pilot.press("ctrl+c")
+
+
+async def test_ctrl_n_new_tree():
+    """Ctrl+N：新建一棵对话树并切过去。"""
+    ctrl = FakeController()
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 40)) as pilot:
         for _ in range(30):
             await pilot.pause()
             if app.ctrl is ctrl:
                 break
-        left = str(app.query_one("#usage-left", Static).content)
-        check("MCP：连接中时状态条有提示", "MCP 连接中" in left)
-
-        app.notify = lambda message, **kwargs: notified.append(message)
-        app._show_mcp_log("连接 MCP server「demo」失败: boom，已跳过")
-        check("MCP：连接日志转成通知", bool(notified) and "boom" in notified[0])
-
-        ctrl._mcp.release.set()  # 放行后台等待，模拟连接完成
-        left = ""
-        for _ in range(60):
+        before = list(ctrl.tree_numbers())
+        await pilot.press("ctrl+n")
+        for _ in range(40):
             await pilot.pause()
-            left = str(app.query_one("#usage-left", Static).content)
-            if not ctrl.mcp_connecting and "MCP 连接中" not in left:
+            if len(ctrl.tree_numbers()) == len(before) + 1:
                 break
-        check("MCP：就绪后状态条提示消失", "MCP 连接中" not in left)
+        numbers = ctrl.tree_numbers()
+        check("Ctrl+N：新建一棵对话树", len(numbers) == len(before) + 1)
+        check("Ctrl+N：新树编号递增", numbers[-1] == before[-1] + 1)
+        check("Ctrl+N：自动切到新树", ctrl.active_number == numbers[-1])
+        await pilot.press("ctrl+c")
+
+
+async def test_footer_reflects_config():
+    """底部状态栏：显示当前文件四态/联网开关，点击与快捷键都能切换。"""
+    ctrl = FakeController(files_mode="off", web_enabled=True)
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 40)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            if "关闭" in str(app.query_one("#footer-file", Static).content):
+                break
+        footer_file = app.query_one("#footer-file", Static)
+        footer_web = app.query_one("#footer-web", Static)
+        check("状态栏：文件模式显示为关闭", "文件 关闭" in str(footer_file.content))
+        check("状态栏：联网显示为开", "联网 开" in str(footer_web.content))
+
+        await pilot.click("#footer-file")
+        for _ in range(30):
+            await pilot.pause()
+            if ctrl.config.files_mode == "read":
+                break
+        check("状态栏：点击文件开关切到下一态（关闭→只读）",
+              ctrl.config.files_mode == "read")
+        check("状态栏：文件文本跟随配置", "文件 只读" in str(footer_file.content))
+
+        await pilot.click("#footer-web")
+        for _ in range(30):
+            await pilot.pause()
+            if not ctrl.config.web_enabled:
+                break
+        check("状态栏：点击联网开关翻转", ctrl.config.web_enabled is False)
+        check("状态栏：联网文本跟随配置", "联网 关" in str(footer_web.content))
+
+        # 快捷键与点击共用同一套状态
+        await pilot.press("ctrl+r")
+        for _ in range(30):
+            await pilot.pause()
+            if ctrl.config.files_mode == "confirm":
+                break
+        check("状态栏：Ctrl+R 继续循环文件模式", ctrl.config.files_mode == "confirm")
+        check("状态栏：写需确认文案", "文件 写需确认" in str(footer_file.content))
+        await pilot.press("ctrl+w")
+        for _ in range(30):
+            await pilot.pause()
+            if ctrl.config.web_enabled:
+                break
+        check("状态栏：Ctrl+W 翻转联网", ctrl.config.web_enabled is True)
+        check("状态栏：联网重新显示为开", "联网 开" in str(footer_web.content))
+        await pilot.press("ctrl+c")
+
+
+def test_chip_display_is_inline_code():
+    """附件引用块在聊天区回显为行内代码（不被当链接解析、不丢字）。"""
+    out = ChatApp._chips_as_code("[DOCX a.docx] 看看")
+    check("引用块：转换为反引号包裹的行内代码", "`[DOCX a.docx]`" in out)
+    check("引用块：其余文字原样保留", out.endswith("看看") and out.startswith("`["))
+    check("引用块：空输入不崩溃", ChatApp._chips_as_code("") == "")
+    check("引用块：IMAGE/WEB 同样适用",
+          "`[WEB example.com]`" in ChatApp._chips_as_code("[WEB example.com] 读一下"))
 
 
 async def test_first_view_deferred():
@@ -760,7 +808,7 @@ async def test_first_view_deferred():
 async def test_tree_sidebar_ui():
     """多对话树：侧栏列表 / 徽标 / 主题 / 切换 / 草稿。"""
     ctrl = FakeController()
-    ctrl.create_tree(system_tools=False, mcp_tools=["tavily_search"])   # 树 2
+    ctrl.create_tree()                                                  # 树 2
     ctrl.tree.create_root("二问", "二答", "", "标题二", 1, 1)
     ctrl.create_tree()                                                  # 树 3
     ctrl.tree.create_root("三问", "三答", "", "标题三", 1, 1)
@@ -817,7 +865,8 @@ async def test_tree_sidebar_ui():
         src = app._chat_source()
         check("命令：/tree 列出全部对话树", "树 1" in src and "树 2" in src and "树 3" in src)
         check("命令：/tree 标注当前树", "（当前）" in src)
-        check("命令：/tree 显示挂载的能力", "无系统工具" in src or "外置工具" in src)
+        check("命令：/tree 显示每棵树的节点数", src.count("个节点") >= 3)
+        check("命令：/tree 列出子命令", "/tree delete <编号>" in src)
 
         # 超过 3 棵：这一栏高度不变，改为内部滚动
         ctrl.create_tree()
@@ -845,123 +894,87 @@ async def test_tree_sidebar_ui():
                   app.query_one("#tree-list", VerticalScroll).region.height == expected)
 
 
-async def test_tree_wizard_bootstrap():
-    """没有树时启动：弹出建树向导，选完能力后建树并进入。"""
-    from mincli.tui.tree_wizard import TreeWizardScreen
-
-    ctrl = FakeController(with_tree=False)
+async def test_delete_node_key():
+    """侧栏选中节点后按 Delete：确认弹窗（自动确认）后删除该节点。"""
+    ctrl = FakeController()
+    root = ctrl.tree.create_root("根问题", "根回答", "", "根标题", 1, 1)
+    child = ctrl.tree.add_child(root, "子问题", "子回答", "", "子标题", 1, 1)
+    ctrl.tree.current_node = child
     app = ChatApp(controller=ctrl)
-    async with app.run_test(size=(100, 35)) as pilot:
-        for _ in range(20):
+
+    def auto_confirm(title, text, on_result):
+        # 不弹真实弹窗：直接以「确认」结果回调（_on_delete_confirmed 是协程）
+        asyncio.ensure_future(on_result(True))
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        for _ in range(40):
             await pilot.pause()
-            if isinstance(app.screen, TreeWizardScreen):
+            if app._tree_rows:
                 break
-        check("无树：启动即弹建树向导", isinstance(app.screen, TreeWizardScreen))
-        check("无树：输入框提示先建树",
-              "请先新建对话树" in str(app.query_one("#chat-input", ChatInput).placeholder))
-        check("无树：徽标提示未创建", "未创建对话树" in str(app.query_one("#tree-badge", Static).content))
-        check("无树：侧栏那一栏只剩标题 1 行",
-              app.query_one("#tree-list", VerticalScroll).region.height == 0)
-
-        # 取消勾选系统工具，然后确定
-        screen = app.screen
-        screen.query_one("#cap-system").value = False
-        await pilot.pause()
-        screen.query_one("#wizard-ok", Button).press()
-        for _ in range(20):
-            await pilot.pause()
-            if ctrl.has_trees:
-                break
-        check("向导：确定后建出编号 1 的树", ctrl.tree_numbers() == [1])
-        check("向导：能力按勾选结果挂载", ctrl.tree_caps(1)["system_tools"] is False)
-        check("向导：关闭后回到主界面", not isinstance(app.screen, TreeWizardScreen))
-        check("向导：建树后输入框提示恢复",
-              "请先新建对话树" not in str(app.query_one("#chat-input", ChatInput).placeholder))
-
-
-async def test_tree_wizard_cancel_exits():
-    """没有树时取消建树向导 → 退出程序（不允许停在无法使用的界面）。"""
-    from mincli.tui.tree_wizard import TreeWizardScreen
-
-    ctrl = FakeController(with_tree=False)
-    app = ChatApp(controller=ctrl)
-    async with app.run_test(size=(100, 35)) as pilot:
-        for _ in range(20):
-            await pilot.pause()
-            if isinstance(app.screen, TreeWizardScreen):
-                break
-        check("取消：向导已弹出", isinstance(app.screen, TreeWizardScreen))
-        await pilot.press("escape")
-        for _ in range(20):
-            await pilot.pause()
-            if not app.is_running:
-                break
-        check("取消：程序退出", not app.is_running)
-        check("取消：没有建出任何树", not ctrl.has_trees)
-
-
-async def test_tree_wizard_mcp_refresh():
-    """建树向导开着时 MCP 连完：占位提示换成真实的工具复选框。"""
-    from mincli.tui.tree_wizard import TreeWizardScreen
-
-    class FakeMcp:
-        connecting = True
-        ready = False
-        ok = False
-
-        def tools(self):
-            return []
-
-        def tool_names(self):
-            return set()
-
-        def tool_owner(self, name):
-            return None
-
-        def tools_by_server(self):
-            return {}
-
-        def configured_servers(self):
-            return ["tavily"]
-
-        def server_status(self):
-            return {}
-
-        def reload(self):
-            pass
-
-        def cancel_running(self):
-            return True
-
-        def close(self):
-            pass
-
-    ctrl = FakeController(with_tree=False)
-    ctrl._mcp = FakeMcp()
-    app = ChatApp(controller=ctrl)
-    async with app.run_test(size=(100, 35)) as pilot:
-        for _ in range(20):
-            await pilot.pause()
-            if isinstance(app.screen, TreeWizardScreen):
-                break
-        screen = app.screen
-        check("向导：MCP 未就绪时显示占位提示",
-              "正在连接" in str(screen.query_one("#wizard-hint", Static).content))
-
-        # 模拟后台连接完成，并触发 UI 侧的就绪回调
-        ctrl._mcp.connecting = False
-        ctrl._mcp.ready = True
-        ctrl._mcp.ok = True
-        ctrl._mcp.tools_by_server = lambda: {
-            "mincli": ["read_file"], "tavily": ["tavily_search"]
-        }
-        app._on_mcp_ready_ui()
+        app._ask_confirm = auto_confirm
+        app._select_tree_node(child.id)
         for _ in range(10):
             await pilot.pause()
-        hint = str(screen.query_one("#wizard-hint", Static).content)
-        check("向导：连完后占位提示消失", "正在连接" not in hint)
-        check("向导：外置工具复选框自动补上", "tavily_search" in screen._boxes)
-        check("向导：内置工具不单独列出（归入系统工具）", "read_file" not in screen._boxes)
+        tree_w = app.query_one("#tree", Tree)
+        tree_w.focus()
+        for _ in range(5):
+            await pilot.pause()
+        check("删除键：侧栏已选中子节点",
+              tree_w.cursor_node is not None and tree_w.cursor_node.data == child.id)
+
+        await pilot.press("delete")
+        for _ in range(60):
+            await pilot.pause()
+            if child.id not in ctrl.tree.nodes:
+                break
+        check("删除键：按 Delete 后节点被删除", child.id not in ctrl.tree.nodes)
+        check("删除键：根节点保留",
+              ctrl.tree.root is not None and root.id in ctrl.tree.nodes)
+        await pilot.press("ctrl+c")
+
+
+async def test_attachment_buttons_and_view():
+    """节点下方渲染附件按钮；点击后打开只读全文弹窗。"""
+    ctrl = FakeController()
+    node = ctrl.tree.create_root("看看附件", "好的", "", "附件节点", 1, 1)
+    att_dir = tempfile.mkdtemp(prefix="mincli_tui_att_")
+    stored = os.path.join(att_dir, "a.txt")
+    with open(stored, "w", encoding="utf-8") as f:
+        f.write("这是附件的完整正文。\n第二行。")
+    node.attachments = [
+        {"name": "a.txt", "kind": "document", "stored_path": stored, "chars": 15}
+    ]
+    ctrl.tree.current_node = node
+    app = ChatApp(controller=ctrl)
+    async with app.run_test(size=(100, 40)) as pilot:
+        buttons: list[Button] = []
+        for _ in range(60):
+            await pilot.pause()
+            buttons = [
+                b for b in app.query(Button) if (b.id or "").startswith("att-")
+            ]
+            if buttons:
+                break
+        check("附件：节点下方出现附件按钮", len(buttons) == 1)
+        if buttons:
+            check("附件：按钮 id 以 att- 开头", buttons[0].id.startswith("att-"))
+            check("附件：按钮文字是附件名", str(buttons[0].label) == "a.txt")
+            await pilot.click(f"#{buttons[0].id}")
+            for _ in range(40):
+                await pilot.pause()
+                if isinstance(app.screen, AttachmentViewScreen):
+                    break
+            check("附件：点击后打开 AttachmentViewScreen",
+                  isinstance(app.screen, AttachmentViewScreen))
+            if isinstance(app.screen, AttachmentViewScreen):
+                text = app.screen.query_one("#attachment-view-text", TextArea).text
+                check("附件：弹窗显示附件全文", "这是附件的完整正文" in text)
+                await pilot.press("escape")
+                for _ in range(20):
+                    await pilot.pause()
+                check("附件：Escape 关闭弹窗",
+                      not isinstance(app.screen, AttachmentViewScreen))
+        await pilot.press("ctrl+c")
 
 
 async def test_tree_background_events():
@@ -1000,644 +1013,6 @@ async def test_tree_background_events():
               any("正在生成" in m for m in notified))
         check("后台生成期间：消息没有进入会话",
               "趁它忙我也要发" not in app._chat_source())
-
-
-async def main() -> int:
-    print("== ChatApp headless 验证（2b） ==")
-    test_command_spec()
-    await test_command_completion_levels()
-    test_markdown_safety()
-    test_selection_safety()
-    test_screen_forward_safety()
-    test_tool_args_width()
-    test_packaging()
-    test_markup_safety()
-    test_quote_marker_safety()
-    fake = FakeController()
-    app = ChatApp(controller=fake)
-    async with app.run_test(size=(100, 30)) as pilot:
-        # --- 1. 布局 ---
-        check("布局：输入框存在且聚焦", app.query_one("#chat-input", ChatInput) is not None)
-        check("布局：消息流存在", bool(app.query_one("#chat-log", VerticalScroll)))
-        check("布局：会话树存在", bool(app.query_one("#tree", Tree)))
-        check("布局：状态条存在", bool(app.query_one("#usage-bar", Horizontal)))
-        check("布局：状态条三分栏", bool(app.query_one("#usage-left", Static))
-              and bool(app.query_one("#usage-center", Static))
-              and bool(app.query_one("#usage-right", Static)))
-        for _ in range(10):
-            await pilot.pause()
-        usage_left = str(app.query_one("#usage-left", Static).content)
-        check("状态条左栏显示缓存/余额", "缓存" in usage_left)
-        check("启动：空会话显示欢迎页", "DeepSeek 树状对话 TUI" in app._chat_source())
-
-        # --- 2. 发送消息 → 流式渲染 ---
-        inp = app.query_one("#chat-input", ChatInput)
-        await pilot.press("你", "好")
-        check("输入中文正常", inp.text == "你好")
-        await pilot.press("enter")
-        for _ in range(30):
-            await pilot.pause()
-            if "世界！" in app._chat_source():
-                break
-        chat = app._chat_source()
-        check("流式内容已追加", "你好，世界！" in chat)
-        # 思考过程不折叠：完整内容以灰色块引用显示（无点击展开交互）
-        check("思考以引用格式显示", "思考过程" in chat and "> 思考中" in chat)
-        check("token 统计已显示", "tokens" in chat)
-
-        # --- 3. 会话树更新 + 光标跟随新节点 ---
-        for _ in range(5):
-            await pilot.pause()
-        tree = app.query_one("#tree", Tree)
-        check("树根节点已更新", str(tree.root.label) == "main: 测试标题")
-        check(
-            "树光标跟随新节点",
-            tree.cursor_node is not None and tree.cursor_node.data == "main",
-        )
-
-        # --- 3.5 表格按终端宽度换行（不被横向截断） ---
-        for _ in range(10):
-            await pilot.pause()
-            if app.query(MarkdownTableContent):
-                break
-        chat = app.query_one("#chat-log", VerticalScroll)
-        tables = list(app.query(MarkdownTableContent))
-        check("表格已渲染", len(tables) >= 1)
-        if tables:
-            tc = tables[0]
-            check("表格宽度不超出消息区", tc.region.width <= chat.region.width - 4)
-            heights = [c.region.height for c in tc.query(".cell")]
-            check("超长单元格自动换行", heights and max(heights) > 1)
-
-        # --- 3.6 消息区紧贴右边缘（滚动条不悬空） ---
-        check(
-            "消息区紧贴终端右边缘",
-            chat.region.x + chat.region.width == app.screen.size.width,
-        )
-
-        # --- 3.7 列表项紧凑无大间隔 ---
-        for _ in range(10):
-            await pilot.pause()
-            if app.query(MarkdownBulletList) or app.query(MarkdownOrderedList):
-                break
-        list_rows = [
-            w
-            for w in app.query(Horizontal)
-            if w.parent is not None
-            and type(w.parent).__name__ in ("MarkdownBulletList", "MarkdownOrderedList")
-        ]
-        check("列表项行高为内容高度", list_rows and all(r.region.height == 1 for r in list_rows))
-
-        # --- 4. 点击树节点切换 ---
-        tree.select_node(tree.root)
-        await pilot.pause()
-        check("切换节点显示内容", "测试标题" in app._chat_source())
-
-        # --- 5. 锁定键过滤 ---
-        inp.clear()
-        app.post_message(events.Key("caps_lock", "A"))
-        await pilot.pause()
-        check("caps_lock 不产生输入", inp.text == "")
-
-        # --- 6. 确认弹窗 ---
-        check("confirm 回调存在", callable(fake.confirm))
-
-        # --- 7. 斜杠命令 ---
-        async def type_command(cmd: str) -> None:
-            inp.clear()
-            await pilot.press(*list(cmd))
-            await pilot.press("enter")
-
-        await type_command("/help")
-        for _ in range(10):
-            await pilot.pause()
-            if "**帮助**" in app._chat_source():
-                break
-        check("命令：/help 显示帮助", "**帮助**" in app._chat_source()
-              and "/set thinking <on|off>" in app._chat_source())
-
-        await type_command("/set model pro")
-        await pilot.pause()
-        check("命令：/set model pro", fake.current_model.endswith("pro"))
-
-        await type_command("/tree")
-        for _ in range(10):
-            await pilot.pause()
-            if "main: 测试标题" in app._chat_source():
-                break
-        check("命令：/tree 显示对话树", "main: 测试标题" in app._chat_source())
-
-        # --- 7.5 命令补全弹窗 + /delete 确认删除（节点此时已存在） ---
-        fake.tree.add_child(fake.tree.root, "子问题", "子回答", "", "子节点", 1, 1)
-        inp.clear()
-        await pilot.press("/", "d", "e", "l")
-        for _ in range(5):
-            await pilot.pause()
-        popup = app.query_one("#cmd-popup")
-        body = app.query_one("#cmd-popup-body", Static)
-        check("补全：/del 显示候选列表", popup.has_class("visible") and "/delete" in str(body.content))
-
-        await pilot.press("tab")
-        for _ in range(5):
-            await pilot.pause()
-        check("补全：Tab 补全为 /delete（带参数命令补空格）", inp.text == "/delete ")
-        check("补全：补全后转为命令提示", "/delete <节点ID> [...]" in str(body.content))
-
-        await pilot.press("a", "1")
-        await pilot.press("enter")
-        for _ in range(30):
-            await pilot.pause()
-            if app.screen.query("#confirm-yes"):
-                break
-        check("删除：确认弹窗出现", bool(app.screen.query("#confirm-yes")))
-        app.screen.query_one("#confirm-yes", Button).press()
-        for _ in range(10):
-            await pilot.pause()
-        check("删除：确认后节点已删除", fake.tree.nodes.get("a1") is None)
-
-        await type_command("/clear")
-        await pilot.pause()
-        check("命令：/clear 清空会话", fake.tree.root is None)
-
-        await type_command("/set show")
-        for _ in range(10):
-            await pilot.pause()
-            if "当前配置" in app._chat_source():
-                break
-        check("命令：/set show 显示配置", "当前配置" in app._chat_source())
-
-        # --- 7.6 多模态：/import、/files、/set detail、/set model vision、节点视图占位 ---
-        from mincli.tools.images import ImageAttachment
-        _tmp_img = tempfile.mkdtemp(prefix="mincli_tui_img_")
-        _tpng = os.path.join(_tmp_img, "t.png")
-        with open(_tpng, "wb") as f:
-            f.write(
-                b"\x89PNG\r\n\x1a\n"
-                + b"\x00\x00\x00\x0dIHDR"
-                + (800).to_bytes(4, "big")
-                + (600).to_bytes(4, "big")
-                + b"\x08\x06\x00\x00\x00"
-            )
-        _txt = os.path.join(_tmp_img, "note.txt")
-        with open(_txt, "w", encoding="utf-8") as f:
-            f.write("hello")
-
-        await type_command(f"/import {_tpng}")
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/import 添加待发送图片", len(fake.pending_images) == 1)
-        hint = app.query_one("#usage-center", Static)
-        check("导入提示显示在状态条中段", "已导入 1 个文件" in str(hint.content) and hint.has_class("visible"))
-
-        # 一次导入多个文件（图片 + 文本）+ 悬停弹窗（完整文件名列表）
-        await type_command("/import clear")
-        for _ in range(10):
-            await pilot.pause()
-        await type_command(f"/import {_tpng} {_txt}")
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/import 多文件", len(fake.pending_images) == 1 and len(fake.imported_files) == 1)
-        check("状态条中段数量与前2文件名", "已导入 2 个文件" in str(hint.content) and "note.txt" in str(hint.content))
-        # 悬停弹窗（固定显示在状态条上方，完整文件名列表）；移出中段自动消失
-        popup = app.query_one("#import-popup", Static)
-        sr = hint.region
-        app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
-                                          screen_x=sr.x + 1, screen_y=sr.y))
-        for _ in range(5):
-            await pilot.pause()
-        check("悬停显示完整列表", popup.has_class("visible") and "note.txt" in str(popup.content))
-        app.post_message(events.MouseMove(None, 1, 1, 0, 0, 0, False, False, False,
-                                          screen_x=sr.x + 1, screen_y=max(0, sr.y - 5)))
-        for _ in range(5):
-            await pilot.pause()
-        check("移开鼠标自动消失", not popup.has_class("visible"))
-
-        await type_command("/import clear")
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/import clear 清空", len(fake.pending_images) == 0 and len(fake.imported_files) == 0
-              and not app.query_one("#usage-center", Static).has_class("visible"))
-
-        # --- 7.6b 拖入文件直接导入（终端把路径粘贴进输入框） ---
-        inp.clear()
-        await pilot.pause()
-        app.post_message(events.Paste(f'"{_tpng}" "{_txt}"'))
-        for _ in range(20):
-            await pilot.pause()
-        check("拖入：多文件自动导入", len(fake.pending_images) == 1 and len(fake.imported_files) == 1)
-        check("拖入：输入框未残留路径文本", inp.text == "")
-        check("拖入：状态栏显示数量", "已导入 2 个文件" in str(hint.content) and hint.has_class("visible"))
-
-        await type_command("/import clear")
-        for _ in range(10):
-            await pilot.pause()
-
-        # 普通文本粘贴不触发导入、照常插入
-        inp.clear()
-        await pilot.pause()
-        app.post_message(events.Paste("这是一段普通粘贴的文本"))
-        for _ in range(10):
-            await pilot.pause()
-        check("普通粘贴不导入", len(fake.pending_images) == 0 and len(fake.imported_files) == 0)
-        check("普通粘贴照常插入（仅一次）", inp.text == "这是一段普通粘贴的文本")
-
-        # 焦点不在输入框时（如在对话树），路径粘贴仍兜底导入
-        inp.clear()
-        app.set_focus(app.query_one("#tree", Tree))
-        await pilot.pause()
-        app.post_message(events.Paste(_tpng))
-        for _ in range(20):
-            await pilot.pause()
-        check("焦点在树时拖入也导入", len(fake.pending_images) == 1)
-        inp.focus()
-        await pilot.pause()
-        await type_command("/import clear")
-        for _ in range(10):
-            await pilot.pause()
-        check("拖入后 clear 清空", len(fake.pending_images) == 0 and len(fake.imported_files) == 0)
-
-        # --- 7.6c Windows 反斜杠路径（跨平台解析回归） ---
-        # 在 POSIX 上创建文件名含「C:\...」的真实文件，模拟 Windows 拖入/粘贴路径：
-        # POSIX 版 shlex 会把反斜杠当转义吃掉 → 导入失效；修复后必须原样识别并导入。
-        if os.name != "nt":
-            _win_txt = os.path.join(_tmp_img, r"C:\Users\me\notes.txt")
-            with open(_win_txt, "w", encoding="utf-8") as f:
-                f.write("windows style path")
-            check("拖入：Windows 反斜杠路径被识别为可导入",
-                  ChatInput._paths_from_paste(_win_txt) == [_win_txt])
-            app.post_message(events.Paste(_win_txt))
-            for _ in range(20):
-                await pilot.pause()
-            check("拖入：Windows 反斜杠路径成功导入文本",
-                  any("notes.txt" in f["name"] for f in fake.imported_files))
-            await type_command("/import clear")
-            for _ in range(10):
-                await pilot.pause()
-            # /import 命令参数解析同样需保留反斜杠（此前会被 shlex 吃掉）
-            await app._handle_command(f"/import {_win_txt}")
-            for _ in range(10):
-                await pilot.pause()
-            check("命令：/import 支持 Windows 反斜杠路径",
-                  any("notes.txt" in f["name"] for f in fake.imported_files))
-            await type_command("/import clear")
-            for _ in range(10):
-                await pilot.pause()
-
-        await type_command("/set detail low")
-        await pilot.pause()
-        check("命令：/set detail low", fake.image_detail == "low")
-
-        await type_command("/set model vision")
-        await pilot.pause()
-        check("命令：/set model vision 映射为 flash", fake.current_model == "deepseek-flash")
-        await type_command("/set model pro")
-        await pilot.pause()
-        check("命令：/set model pro", fake.current_model == "deepseek-v4-pro")
-        await type_command("/set model flash")
-        await pilot.pause()
-        check("命令：/set model flash", fake.current_model == "deepseek-flash")
-
-        await type_command("/files list")
-        for _ in range(10):
-            await pilot.pause()
-        src_files = app._chat_source()
-        check("命令：/files list 表格带序号与最新在前",
-              "已上传图片文件" in src_files and "| 1 |" in src_files
-              and src_files.index("tui.png") < src_files.index("old.jpg"))
-        check("命令：/files list 显示容量与配额",
-              "合计" in src_files and "配额 10000 个 / 25 GiB" in src_files)
-        check("命令：/files list 提示按序号操作",
-              "/files delete <ID|序号>" in src_files and "/files clean" in src_files)
-
-        await type_command("/files list 1")
-        for _ in range(10):
-            await pilot.pause()
-        src_one = app._chat_source()
-        check("命令：/files list N 限制条数",
-              "共 1 个（最新在前）" in src_one and "还有更早的文件未列出" in src_one)
-        await type_command("/clear")
-        await type_command("/files list")
-        for _ in range(10):
-            await pilot.pause()
-
-        await type_command("/files info 1")
-        for _ in range(10):
-            await pilot.pause()
-        src_info = app._chat_source()
-        check("命令：/files info 按序号查询",
-              "文件信息（Files API）" in src_info and "tui.png" in src_info
-              and "2 KiB" in src_info)
-        check("命令：/files info 显示永久有效", "永久有效" in src_info)
-
-        await type_command("/files delete 2")
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/files delete 按序号删除",
-              [f["id"] for f in fake.client.files.items] == ["file-api-tui"])
-
-        await type_command("/files clean")
-        for _ in range(20):
-            await pilot.pause()
-            if app.screen.query("#confirm-yes"):
-                break
-        check("命令：/files clean 需确认", bool(app.screen.query("#confirm-yes")))
-        app.screen.query_one("#confirm-yes", Button).press()
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/files clean 删除未引用文件", fake.client.files.items == [])
-
-        # 节点视图：带图片的节点渲染占位（直接驱动 node_created 事件）
-        node = fake.tree.create_root("看图", "", "", "图题", 0, 0)
-        node.user_images = [ImageAttachment(source=_tpng, name="t.png", width=800, height=600)]
-        fake.tree.current_node = node
-        await app._handle_event(ControllerEvent.node_created(node))
-        for _ in range(10):
-            await pilot.pause()
-        check("节点视图含图片占位", "[图片: t.png (800x600)]" in app._chat_source())
-        await type_command("/clear")
-
-        # --- 7.6c 多轮工具调用：多个思考块穿插正文，各自按引用格式显示 ---
-        node_m = fake.tree.create_root("多轮问题", "", "", "多轮标题", 0, 0)
-        fake.tree.current_node = node_m
-        await app._handle_event(ControllerEvent.node_created(node_m))
-        await app._handle_event(ControllerEvent.stream("", "第一轮思考内容"))
-        await app._handle_event(ControllerEvent.stream("第一轮正文", ""))
-        await app._handle_event(ControllerEvent.tool("execute_command", '{"command":"ls"}', ""))
-        await app._handle_event(ControllerEvent.tool("execute_command", '{"command":"ls"}', "（完成）"))
-        await app._handle_event(ControllerEvent.stream("", "第二轮思考内容"))
-        await app._handle_event(ControllerEvent.stream("第二轮正文", ""))
-        await app._handle_event(ControllerEvent.done(node_m))
-        for _ in range(30):
-            await pilot.pause()
-        src_m = app._chat_source()
-        check("多轮：两个思考块各带标题", src_m.count("思考过程") == 2)
-        check("多轮：第一轮思考按引用显示", "> 第一轮思考内容" in src_m)
-        check("多轮：第二轮思考按引用显示", "> 第二轮思考内容" in src_m)
-        check("多轮：两轮正文都显示", "第一轮正文" in src_m and "第二轮正文" in src_m)
-        check("多轮：工具卡片显示工具名", "▸ 工具调用：execute_command" in src_m)
-        check("多轮：工具卡片参数逐行", "command=\"ls\"" in src_m and "    command=\"ls\"" in src_m)
-        check("多轮：工具卡片状态完成", "状态：完成" in src_m)
-        check("多轮：工具卡片作为控件穿插在正文段之间",
-              [type(b).__name__ for b in app._chat_blocks] == ["Markdown", "ToolCard", "Markdown"])
-        node_m.reasoning = "第一轮思考内容\n第二轮思考内容"  # 模拟 controller 汇总全部轮次思考
-        check("多轮：节点视图也含思考引用", "思考过程" in app._node_content(node_m)
-              and "> 第二轮思考内容" in app._node_content(node_m))
-        await type_command("/clear")
-
-        await type_command("/unknown_cmd")
-        await pilot.pause()
-        check("未知命令不发送给 LLM", fake.client.chat.completions.script == [])
-
-        # --- 7.7 /compact 命令（全部压缩 + 新建摘要节点） ---
-        fake.tree.create_root("问题1", "回答1", "", "标题1", 1, 1)
-        n2 = fake.tree.add_child(fake.tree.root, "问题2", "回答2", "", "标题2", 1, 1)
-        n3 = fake.tree.add_child(n2, "问题3", "回答3", "", "标题3", 1, 1)
-        n4 = fake.tree.add_child(n3, "问题4", "回答4", "", "标题4", 1, 1)
-        fake.tree.current_node = n4
-        fake.client.chat.completions.script.append(_FakeChatResponse(content="【摘要】TUI 压缩测试内容"))
-
-        # 带参数被拦截
-        await type_command("/compact 0")
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/compact 带参数被拦截", fake.tree.compaction is None)
-
-        await type_command("/compact")
-        for _ in range(30):
-            await pilot.pause()
-            if fake.tree.compaction and fake.tree.current_node.id == fake.tree.compaction["boundary_id"]:
-                break
-        chat = app._chat_source()
-        check("命令：/compact 新建摘要节点", fake.tree.compaction is not None)
-        node_id = fake.tree.compaction["boundary_id"]
-        check(
-            "命令：/compact 显示摘要",
-            "上下文压缩摘要" in chat and "TUI 压缩测试内容" in chat,
-        )
-        check("命令：/compact 摘要节点为当前", fake.tree.current_node.id == node_id)
-
-        # 当前已是摘要节点 → 再次 /compact 被拦截
-        await type_command("/compact")
-        for _ in range(10):
-            await pilot.pause()
-        check("命令：/compact 禁止重复压缩",
-              fake.tree.compaction["boundary_id"] == node_id and len(fake.tree.nodes) == 5)
-
-        # --- 7.8 /delete 多节点 ---
-        await type_command("/clear")
-        fake.tree.create_root("根", "回", "", "根", 1, 1)
-        da1 = fake.tree.add_child(fake.tree.root, "q", "a", "", "t", 1, 1)
-        db1 = fake.tree.add_child(fake.tree.root, "q", "a", "", "t", 1, 1)
-        db2 = fake.tree.add_child(db1, "q", "a", "", "t", 1, 1)
-        fake.tree.current_node = db2
-        await type_command(f"/delete {da1.id} {db1.id} {db2.id}")
-        for _ in range(30):
-            await pilot.pause()
-            if app.screen.query("#confirm-yes"):
-                break
-        check("删除：多节点确认弹窗", bool(app.screen.query("#confirm-yes")))
-        app.screen.query_one("#confirm-yes", Button).press()
-        for _ in range(10):
-            await pilot.pause()
-        check("删除：父节点级联删除子节点",
-              da1.id not in fake.tree.nodes and db1.id not in fake.tree.nodes and db2.id not in fake.tree.nodes)
-        check("删除：根节点保留", fake.tree.root is not None and fake.tree.current_node is not None)
-        check("删除：当前节点被删后自动跳转", "main: 根" in app._chat_source())
-        tree_w = app.query_one("#tree", Tree)
-        cursor_node = getattr(tree_w, "cursor_node", None)
-        check("删除：树光标跟随新的当前节点", cursor_node is not None and cursor_node.data == "main")
-
-        # --- 7.9 文字选择 + 复制 ---
-        chat = app._chat_source()
-        check("选区：ALLOW_SELECT 已开启", app.ALLOW_SELECT)
-        await pilot.mouse_down("#chat-log", offset=(10, 4))
-        await pilot.pause()
-        await pilot.mouse_up("#chat-log", offset=(45, 14))
-        for _ in range(8):
-            await pilot.pause()
-        check("选区：拖选后产生选区", bool(app.screen.selections))
-        sel_text = app.screen.get_selected_text()
-        check("选区：可提取选中文本", bool(sel_text))
-
-        copied: list[str] = []
-        app.copy_to_clipboard = lambda t: copied.append(t)  # 记录而非真复制
-        await pilot.press("ctrl+c")  # 有选区 → 复制而非退出（所有平台统一）
-        for _ in range(8):
-            await pilot.pause()
-        check("复制：Ctrl+C 复制选中文本而非退出", bool(copied) and copied[0] == sel_text)
-        check("复制：有选区时未退出", app.screen is not None)
-        del app.copy_to_clipboard  # 恢复为类方法
-        app.screen.clear_selection()
-        await pilot.pause()
-        check("选区：清除后无选区", not app.screen.selections)
-
-        # --- 8. Ctrl+C 退出 ---
-        await pilot.press("ctrl+c")
-
-    # --- 9. 启动即显示上次会话的当前节点（而非欢迎页） ---
-    fake2 = FakeController()
-    fake2.reset()
-    fake2.tree.create_root("上次的问题", "上次的回答", "", "上次标题", 1, 1)
-    app2 = ChatApp(controller=fake2)
-    async with app2.run_test(size=(100, 30)) as pilot2:
-        for _ in range(10):
-            await pilot2.pause()
-        src2 = app2._chat_source()
-        check("启动：直接显示当前节点（非欢迎页）", "上次标题" in src2 and "DeepSeek 树状对话 TUI" not in src2)
-        tree2 = app2.query_one("#tree", Tree)
-        cursor2 = getattr(tree2, "cursor_node", None)
-        check("启动：树光标跟随当前节点", cursor2 is not None and cursor2.data == "main")
-        await pilot2.press("ctrl+c")
-
-    # --- 10. 工作流（/wf）：保存 / 挂载 / 执行 / 列表 / 修订 / 管理 ---
-    fake3 = FakeController()
-    app3 = ChatApp(controller=fake3)
-    async with app3.run_test(size=(100, 30)) as pilot3:
-        for _ in range(5):
-            await pilot3.pause()
-        inp3 = app3.query_one("#chat-input", ChatInput)
-
-        async def type_wf_cmd(cmd: str) -> None:
-            inp3.clear()
-            await pilot3.press(*list(cmd))
-            await pilot3.press("enter")
-
-        # 先发一条消息，成为可提炼的当前节点
-        await type_wf_cmd("总结一下项目变更")
-        for _ in range(30):
-            await pilot3.pause()
-            if fake3.tree.current_node is not None:
-                break
-        check("工作流：准备当前节点成功", fake3.tree.current_node is not None
-              and fake3.tree.current_node.user_msg == "总结一下项目变更")
-
-        # /wf save（提炼被 stub）
-        await type_wf_cmd("/wf save demo")
-        for _ in range(40):
-            await pilot3.pause()
-            if fake3.wf_get("demo") is not None:
-                break
-        wf_demo = fake3.wf_get("demo")
-        check("工作流：/wf save 提炼保存", wf_demo is not None
-              and wf_demo.doc.startswith("目标：测试工作流"))
-        check("工作流：来源节点与变量", wf_demo is not None
-              and wf_demo.source_nodes == ["main"] and wf_demo.placeholders() == ["path"])
-
-        # /wf list / show
-        await type_wf_cmd("/wf list")
-        for _ in range(12):
-            await pilot3.pause()
-            if "工作流列表" in app3._chat_source():
-                break
-        check("工作流：/wf list 显示列表", "工作流列表" in app3._chat_source()
-              and "demo" in app3._chat_source())
-        await type_wf_cmd("/wf show demo")
-        for _ in range(12):
-            await pilot3.pause()
-            if "目标：测试工作流" in app3._chat_source():
-                break
-        check("工作流：/wf show 显示规范", "目标：测试工作流" in app3._chat_source())
-
-        # /wf use：状态条中段提示 → 下一条消息按工作流合成执行 → 一次性解除
-        await type_wf_cmd("/wf use demo")
-        for _ in range(8):
-            await pilot3.pause()
-        center3 = app3.query_one("#usage-center", Static)
-        check("工作流：挂载提示显示于状态条中段",
-              center3.has_class("visible") and "工作流已挂载：demo" in str(center3.content))
-        await type_wf_cmd("请针对 notes/a.txt 执行")
-        for _ in range(30):
-            await pilot3.pause()
-            cur = fake3.tree.current_node
-            if cur is not None and "请执行工作流「demo」" in cur.user_msg:
-                break
-        cur3 = fake3.tree.current_node
-        check("工作流：下一条消息按工作流合成执行",
-              cur3 is not None and "请执行工作流「demo」" in cur3.user_msg
-              and "本次输入：请针对 notes/a.txt 执行" in cur3.user_msg)
-        check("工作流：挂载一次性解除", app3._pending_wf is None
-              and not center3.has_class("visible"))
-
-        # /wf run：无需再输入，立即执行（位置参数按变量顺序填充）
-        await type_wf_cmd("/wf run demo notes/b.txt")
-        for _ in range(30):
-            await pilot3.pause()
-            cur = fake3.tree.current_node
-            if cur is not None and "请执行工作流「demo」" in cur.user_msg:
-                break
-        cur3b = fake3.tree.current_node
-        check("工作流：/wf run 立即执行", cur3b is not None
-              and "请执行工作流「demo」" in cur3b.user_msg
-              and "notes/b.txt" in cur3b.user_msg and "本次输入：" not in cur3b.user_msg)
-
-        # /wf 参数里的 Windows 反斜杠路径不能被 POSIX shlex 吃掉（同类解析修复）
-        await app3._handle_command(r"/wf run demo C:\work\b.txt")
-        for _ in range(30):
-            await pilot3.pause()
-            cur = fake3.tree.current_node
-            if cur is not None and "C:\\work\\b.txt" in cur.user_msg:
-                break
-        cur3c = fake3.tree.current_node
-        check("工作流：/wf run 支持 Windows 反斜杠路径参数",
-              cur3c is not None and r"C:\work\b.txt" in cur3c.user_msg
-              and "C:workb.txt" not in cur3c.user_msg)
-
-        # /wf edit 带修改要求 → 模型修订并落盘
-        await type_wf_cmd("/wf edit demo 增加一条校验步骤")
-        for _ in range(30):
-            await pilot3.pause()
-            wf = fake3.wf_get("demo")
-            if wf is not None and wf.doc.startswith("目标：已按修改要求更新的工作流"):
-                break
-        check("工作流：/wf edit 修订保存",
-              fake3.wf_get("demo").doc.startswith("目标：已按修改要求更新的工作流"))
-
-        # /wf rename / delete（确认弹窗）
-        await type_wf_cmd("/wf rename demo demo2")
-        for _ in range(8):
-            await pilot3.pause()
-        check("工作流：/wf rename 生效", fake3.wf_get("demo") is None
-              and fake3.wf_get("demo2") is not None)
-        await type_wf_cmd("/wf delete demo2")
-        for _ in range(20):
-            await pilot3.pause()
-            if app3.screen.query("#confirm-yes"):
-                break
-        check("工作流：删除需确认", bool(app3.screen.query("#confirm-yes")))
-        app3.screen.query_one("#confirm-yes", Button).press()
-        for _ in range(10):
-            await pilot3.pause()
-        check("工作流：确认后已删除", fake3.wf_get("demo2") is None)
-
-        # 错误路径不崩溃
-        await type_wf_cmd("/wf run 不存在的工作流")
-        for _ in range(5):
-            await pilot3.pause()
-        check("工作流：运行不存在的工作流给出警告且不崩溃", app3.screen is not None
-              and fake3.tree.current_node is not None)
-
-        await pilot3.press("ctrl+c")
-
-    await test_reasoning_quote_after_tool()
-    await test_interrupted_node_kept()
-    await test_interrupt_binding()
-    await test_quit_forces_exit_after_interrupt()
-    test_stream_segment_sealable()
-    await test_stream_segment_sealing()
-    await test_adaptive_flush_interval()
-    await test_mcp_background_ui()
-    await test_first_view_deferred()
-    await test_tree_sidebar_ui()
-    await test_tree_wizard_bootstrap()
-    await test_tree_wizard_cancel_exits()
-    await test_tree_wizard_mcp_refresh()
-    await test_tree_background_events()
-
-    check("退出时保存会话", fake.saved)
-    check("退出时关闭控制器", fake.closed)
-
-    print(f"\n结果: {PASS} 通过, {FAIL} 失败")
-    return 0 if FAIL == 0 else 1
 
 
 def test_selection_safety():
@@ -1731,67 +1106,88 @@ def test_tool_args_width():
 def test_command_spec():
     """命令规格引擎：分级补全、别名、动态候选、用法与 /help 同源（纯逻辑，不起 App）。"""
     prov = {
-        "trees": lambda: [("1", "对话树 1（3 个节点）（当前）"), ("2", "对话树 2（0 个节点）")],
-        "workflows": lambda: [("demo", "示例工作流（2 步）")],
-        "servers": lambda: [("tavily", "已配置的 MCP server")],
+        "trees": lambda: [("1", "对话树 1（当前）"), ("2", "对话树 2")],
     }
 
     c = complete("/", prov)
-    check("规格：/ 列出全部一级命令", c is not None and len(c.candidates) == len(CMD_SPEC))
+    check("规格：/ 列出全部一级命令", c is not None and len(c.candidates) == len(CMD_SPEC) == 15)
 
-    c = complete("/set", prov)
-    check("规格：/set 列出二级命令", c is not None and len(c.candidates) == 10)
-    check("规格：二级候选项带用法与说明",
-          any(x.usage == "/set temp <值>" and "温度" in x.desc for x in c.candidates))
-    check("规格：含子命令的候选项补空格", any(x.insert == "/set thinking " for x in c.candidates))
-    check("规格：叶子候选项补空格（还要填参数）", any(x.insert == "/set show" for x in c.candidates))
+    names = {x.insert.strip() for x in c.candidates}
+    check(
+        "规格：一级命令清单",
+        names
+        == {
+            "/help", "/clear", "/compact", "/exit", "/tree", "/up", "/home",
+            "/delete", "/recall", "/file", "/files", "/save", "/web", "/model",
+            "/a1",
+        },
+    )
+    check(
+        "规格：已删除的命令不再出现",
+        not any(x in names for x in ("/set", "/wf", "/mcp", "/import", "/view", "/info", "/full")),
+    )
 
-    c = complete("/set thinking ", prov)
-    check("规格：三级取值枚举", c is not None and {x.usage for x in c.candidates} ==
-          {"/set thinking on", "/set thinking off"})
-    check("规格：三级标题回显参数", c is not None and c.title == "/set thinking <on|off>")
+    c = complete("/file", prov)
+    check(
+        "规格：/file 列出四态",
+        c is not None and [x.insert for x in c.candidates]
+        == ["/file off", "/file read", "/file confirm", "/file direct"],
+    )
+    check("规格：二级候选项带用法与说明", any(
+        x.usage == "/file read" and "只读" in x.desc for x in c.candidates
+    ))
 
-    c = complete("/set thinking of", prov)
-    check("规格：三级前缀过滤", c is not None and [x.insert for x in c.candidates] == ["/set thinking off"])
+    c = complete("/file re", prov)
+    check("规格：二级前缀过滤", c is not None and [x.insert for x in c.candidates] == ["/file read"])
 
-    c = complete("/set te", prov)
-    check("规格：二级前缀过滤", c is not None and [x.insert for x in c.candidates] == ["/set temp "])
+    c = complete("/web ", prov)
+    check("规格：/web 取值枚举", c is not None and {x.insert for x in c.candidates} == {"/web on", "/web off"})
+
+    c = complete("/recall ", prov)
+    check("规格：/recall 取值枚举", c is not None and {x.insert for x in c.candidates} == {"/recall on", "/recall off"})
+
+    c = complete("/model ", prov)
+    check("规格：/model 只列 flash/pro", c is not None and {x.insert for x in c.candidates} == {"/model flash", "/model pro"})
 
     c = complete("/tree ", prov)
     check("规格：动态候选（对话树编号）",
-          c is not None and any(x.usage == "/tree 2" and "对话树 2" in x.desc for x in c.candidates))
-    c = complete("/tree 2 ", prov)
-    check("规格：动态候选自身还有下一级", c is not None and [x.usage for x in c.candidates] == ["/tree 2 tools"])
+          c is not None and any(x.usage == "/tree 1" and "当前" in x.desc for x in c.candidates))
+    check("规格：静态子命令优先列出",
+          c is not None and [x.insert for x in c.candidates][:3] == ["/tree list", "/tree new", "/tree delete "])
+
     c = complete("/tree delete ", prov)
     check("规格：子命令后的动态候选", c is not None and
           [x.insert for x in c.candidates] == ["/tree delete 1", "/tree delete 2"])
-    c = complete("/wf show ", prov)
-    check("规格：动态候选（工作流名）", c is not None and [x.insert for x in c.candidates] == ["/wf show demo"])
-    c = complete("/mcp remove ", prov)
-    check("规格：动态候选（MCP server 名）", c is not None and
-          [x.insert for x in c.candidates] == ["/mcp remove tavily"])
 
-    c = complete("/workflow list", prov)
-    check("规格：别名按本体归位", c is not None and c.title == "/wf list")
+    c = complete("/h", prov)
+    check("规格：别名按本体归位", c is not None and c.title == "/help")
 
-    c = complete("/set temp", prov)
-    check("规格：叶子命令转提示（无候选）", c is not None and not c.candidates and c.title == "/set temp <值>")
+    c = complete("/file read", prov)
+    check("规格：叶子命令转提示（无候选）", c is not None and not c.candidates and c.title == "/file read")
+
     check("规格：未知命令不弹窗", complete("/zzz", prov) is None)
     check("规格：非命令不弹窗", complete("你好", prov) is None)
-    # 动态来源不可用时不崩
+
     def boom():
         raise RuntimeError("控制器未就绪")
+
     c = complete("/tree ", {"trees": boom})
     check("规格：动态来源异常不崩且退回静态候选",
-          c is not None and [x.usage for x in c.candidates] == ["/tree new", "/tree delete <编号>"])
+          c is not None and [x.insert for x in c.candidates] == ["/tree list", "/tree new", "/tree delete "])
 
-    check("用法：含子命令给名称清单", usage_line("/set").endswith("（system/temp/model/thinking/effort/audit/workspace/detail/file_confirm/show）"))
-    check("用法：取值枚举直接写全", usage_line("/set detail") == "用法: /set detail <low|auto|high|original>")
-    check("用法：叶子给完整参数", usage_line("/wf show") == "用法: /wf show <名>")
+    check("用法：取值枚举直接写全",
+          usage_line("/file") == "用法: /file <off|read|confirm|direct>")
+    check("用法：含子命令给名称清单",
+          usage_line("/tree") == "用法: /tree <子命令>（list/new/delete/<编号>）")
+    check("用法：叶子给完整参数", usage_line("/delete") == "用法: /delete <节点ID> [...]")
 
     help_text = help_markdown()
     check("帮助：一级命令全部出现", all(f"/{c0.name}" in help_text for c0 in CMD_SPEC))
-    check("帮助：二级命令分行列出", "/set thinking <on|off>" in help_text and "/tree <编号> tools" in help_text)
+    check("帮助：二级命令分行列出",
+          "/file read" in help_text and "/tree delete <编号>" in help_text)
+    check("帮助：不再提到已删功能", "/wf" not in help_text and "/set" not in help_text
+          and "/mcp" not in help_text)
+
     def _has_emoji(text: str) -> bool:
         # emoji / dingbat / 箭头符号等图形字符区间（AGENTS.md 禁止在交付物引入）
         return any(
@@ -1802,6 +1198,7 @@ def test_command_spec():
             or 0xFE00 <= ord(ch) <= 0xFE0F
             for ch in text
         )
+
     check("帮助：无 emoji", not _has_emoji(help_text))
 
 
@@ -1828,12 +1225,12 @@ async def test_command_completion_levels():
 
         await type_text("/")
         text = popup_text()
-        check("补全：/ 每行一个候选（用法 + 灰色说明）", "/exit" in text and "/wf" in text)
+        check("补全：/ 每行一个候选（用法 + 灰色说明）", "/exit" in text and "/file" in text)
         check("补全：灰字统一为说明（不再混入用法行）", "用法:" not in text)
         check("补全：输入 / 时无高亮项也能滚到第一项", popup.scroll_y == 0)
-        check("补全：标题给出候选序号", "第 1/18 项" in text)
+        check("补全：标题给出候选序号", "第 1/15 项" in text)
 
-        # 18 个一级命令在 30 行终端里超出弹窗可视高度：Tab 必须把高亮项滚进视野
+        # 15 个一级命令在 30 行终端里可能超出弹窗可视高度：Tab 必须把高亮项滚进视野
         indices = []
         for _ in range(len(app._completion.candidates)):
             await pilot.press("tab")
@@ -1847,7 +1244,6 @@ async def test_command_completion_levels():
         expected = list(range(1, len(CMD_SPEC))) + [0]
         check("补全：Tab 循环覆盖全部候选", [i for i, _, _ in indices] == expected)
         check("补全：Tab 时高亮项滚入可视区", all(vis for _, _, vis in indices))
-        check("补全：确实发生了滚动（不再固定不动）", max(sy for _, sy, _ in indices) > 0)
 
         await pilot.press("shift+tab")
         for _ in range(2):
@@ -1856,31 +1252,30 @@ async def test_command_completion_levels():
         check("补全：Shift+Tab 反向切换", app._completion_index == len(CMD_SPEC) - 1)
         check("补全：序号随高亮更新", f"第 {len(CMD_SPEC)}/{len(CMD_SPEC)} 项" in popup_text())
 
-        await type_text("/set")
+        await type_text("/file")
         text = popup_text()
-        check("补全：/set 分行列出二级命令", text.count("\n") == 10)
-        check("补全：二级候选带用法与说明", "→ /set system <提示词>" in text and "修改系统提示词" in text)
+        check("补全：/file 分行列出四态", text.count("\n") == 4)
+        check("补全：二级候选带用法与说明", "/file read" in text and "只读" in text)
 
         await pilot.press("tab")
         for _ in range(3):
             await pilot.pause()
-        check("补全：Tab 选中第二项", app._completion.candidates[app._completion_index].insert == "/set temp ")
+        check("补全：Tab 选中第二项",
+              app._completion.candidates[app._completion_index].insert == "/file read")
         await pilot.press("enter")
         for _ in range(6):
             await pilot.pause()
-        check("补全：Enter 只补全不执行 /set", inp.text == "/set temp ")
-        check("补全：Enter 后弹窗转为该命令提示", "/set temp <值>" in popup_text())
-
-        await type_text("/set thinking ")
-        check("补全：三级取值枚举候选", "→ /set thinking on" in popup_text()
-              and "/set thinking off" in popup_text())
+        check("补全：Enter 只补全不执行", inp.text == "/file read")
 
         await type_text("/tree ")
         text = popup_text()
-        check("补全：动态列出对话树编号", "/tree 1" in text and "/tree 2" in text
-              and "树 2" in text.replace("对话树 2", "树 2"))
-        await type_text("/tree 2 ")
-        check("补全：编号后还有三级命令", "→ /tree 2 tools" in popup_text())
+        check("补全：动态列出对话树编号", "/tree 1" in text and "/tree 2" in text)
+        await type_text("/tree delete ")
+        check("补全：子命令后的动态候选",
+              "/tree delete 1" in popup_text() and "/tree delete 2" in popup_text())
+
+        await type_text("/web ")
+        check("补全：/web 取值枚举", "→ /web on" in popup_text() and "/web off" in popup_text())
 
         await type_text("/zzz")
         check("补全：未知命令不弹窗", not popup.has_class("visible"))
@@ -1942,9 +1337,3 @@ def test_markdown_safety():
             break
     check("极端输入不触发 IndexError", not crashed)
 
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        pass
