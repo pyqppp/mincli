@@ -352,3 +352,32 @@ ConfirmScreen {
         background: $panel; /* “否”无边框后与盒子底色相同，给个浅底区分 */
     }
 }
+
+/* 底部能力开关状态栏（替代不可点击的 Textual Footer）：
+   左=按键提示，右=「文件」「联网」两个开关，外观仍是一行 */
+#status-footer {
+    height: 1;
+    width: 1fr;
+    background: $panel;
+}
+
+#footer-hint {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
+}
+
+#footer-file, #footer-web {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    color: $text;
+}
+
+#footer-file:hover, #footer-web:hover {
+    background: $primary 30%;
+}

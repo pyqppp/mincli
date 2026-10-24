@@ -26,7 +26,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Header, Markdown, Static, Tree
+from textual.widgets import Button, Header, Markdown, Static, Tree
 from textual.widgets._header import HeaderIcon, HeaderTitle
 
 # 防御 Textual 选区提取越界：流式渲染会重建 Markdown 块，拖选跨越重建
@@ -118,6 +118,7 @@ from mincli.config import (
     save_mcp_servers,
 )
 from mincli.controller import AUDIT_LABELS, ChatController, ControllerEvent
+from mincli.attachments import Attachment, compose_message, load_attachment
 from mincli.helpers import open_path_with_os, split_path_args
 from mincli.tools.files import FilesAPIError
 from mincli.tools.images import image_placeholder_text
@@ -317,6 +318,10 @@ class ChatApp(App):
             show=False,
             priority=True,
         ),
+        # 能力开关：Ctrl+R 循环文件四态；Ctrl+W 与 TextArea 的删词同键，这里
+        # 用 priority 覆盖掉（删词仍可用 Ctrl+Backspace / Alt+Backspace）。
+        Binding("ctrl+r", "cycle_file_mode", "文件权限", show=False, priority=True),
+        Binding("ctrl+w", "toggle_web", "联网开关", show=False, priority=True),
     ] + _TREE_SWITCH_BINDINGS
 
     def __init__(self, controller: ChatController | None = None, **kwargs) -> None:
@@ -360,6 +365,9 @@ class ChatApp(App):
         self._pending_wf: Optional[str] = None
         # /files：最近一次列表结果（供 /files info|delete 用序号引用，免手抄 file_id）
         self._files_listing: list = []
+        # 能力开关（Phase 0 先放内存，Phase 1 接 config.toml 持久化）
+        self._file_mode = "off"   # off | read | confirm | direct
+        self._web_on = True
         # /wf edit：系统编辑器打开的临时文档轮询（检测改动后自动回写）
         self._wf_edit_timer = None  # textual Interval
         self._wf_edit_path: Optional[str] = None
@@ -448,7 +456,10 @@ class ChatApp(App):
             yield Static("", id="usage-left", markup=False)
             yield Static("", id="usage-center", markup=False)
             yield Static("", id="usage-right", markup=False)
-        yield Footer()
+        with Horizontal(id="status-footer"):
+            yield Static("", id="footer-hint", markup=False)
+            yield Static("", id="footer-file", markup=False)
+            yield Static("", id="footer-web", markup=False)
 
     async def on_mount(self) -> None:
         self.theme = theme_name(1)  # 默认树 1 的青色；_refresh_tree_ui 会按当前树覆盖
@@ -481,6 +492,7 @@ class ChatApp(App):
         self._start_balance_refresh()
         self._refresh_usage_bar()
         self._refresh_import_status()
+        self._refresh_status_footer()
         # 启动即进入上次会话的当前节点：渲染放在首帧之后（恢复长对话的
         # Markdown 要 0.5s 左右，没必要挡在界面出现之前），界面先出来，
         # 内容紧接着补上——见 _restore_current_view。
@@ -886,6 +898,64 @@ class ChatApp(App):
             f"⏭ 下次输入 {tokens:,} tok {price_txt}（{peak_txt}价）"
         )
 
+    # ---------------- 能力开关（文件四态 / 联网） ----------------
+
+    FILE_MODE_LABELS = {
+        "off": "文件 关闭",
+        "read": "文件 只读",
+        "confirm": "文件 写需确认",
+        "direct": "文件 写直通",
+    }
+    FILE_MODE_ORDER = ("off", "read", "confirm", "direct")
+
+    def _refresh_status_footer(self) -> None:
+        """把当前能力状态写进底部状态栏（失败静默：首帧前控件可能还没挂）。"""
+        try:
+            self.query_one("#footer-hint", Static).update(
+                "Ctrl+R 文件权限   Ctrl+W 联网   /help 帮助"
+            )
+            self.query_one("#footer-file", Static).update(
+                self.FILE_MODE_LABELS.get(self._file_mode, "文件 关闭")
+            )
+            self.query_one("#footer-web", Static).update(
+                f"联网 {'开' if self._web_on else '关'}"
+            )
+        except Exception:
+            pass
+
+    def _set_file_mode(self, mode: str) -> None:
+        if mode not in self.FILE_MODE_LABELS:
+            self.notify(f"无效文件权限: {mode}", severity="warning")
+            return
+        self._file_mode = mode
+        self._refresh_status_footer()
+        self.notify(f"文件权限：{self.FILE_MODE_LABELS[mode]}")
+
+    def action_cycle_file_mode(self) -> None:
+        """Ctrl+R：关闭 → 只读 → 写需确认 → 写直通 → 关闭。"""
+        current = self._file_mode if self._file_mode in self.FILE_MODE_ORDER else "off"
+        index = self.FILE_MODE_ORDER.index(current)
+        self._set_file_mode(self.FILE_MODE_ORDER[(index + 1) % len(self.FILE_MODE_ORDER)])
+
+    def _set_web(self, enabled: bool) -> None:
+        self._web_on = bool(enabled)
+        self._refresh_status_footer()
+        self.notify(f"联网：{'开' if self._web_on else '关'}")
+
+    def action_toggle_web(self) -> None:
+        """Ctrl+W：开 / 关联网。"""
+        self._set_web(not self._web_on)
+
+    def on_click(self, event) -> None:
+        """点击底部状态栏上的开关（鼠标路径）。"""
+        widget_id = event.widget.id if event.widget is not None else ""
+        if widget_id == "footer-file":
+            event.stop()
+            self.action_cycle_file_mode()
+        elif widget_id == "footer-web":
+            event.stop()
+            self.action_toggle_web()
+
     def _refresh_import_status(self) -> None:
         """刷新状态条中段的提示：工作流挂载提示优先，其次「已导入文件」提示。
 
@@ -977,43 +1047,53 @@ class ChatApp(App):
             if self._import_popup_w.has_class("visible"):
                 self._import_popup_w.remove_class("visible")
 
-    # ---------------- 拖入文件直接导入（终端路径粘贴） ----------------
+    # ---------------- 拖入文件：在输入框里生成引用块 ----------------
+
+    def _attach_targets(self, targets: list[str], input_widget: ChatInput) -> None:
+        """把路径/URL 逐个解析为附件，成功一个就在光标处插一个引用块。"""
+        detail = self.ctrl.image_detail if self.ctrl is not None else "auto"
+        added = 0
+        for target in targets:
+            try:
+                attachment = load_attachment(target, detail=detail)
+            except ValueError as exc:
+                self.notify(str(exc), severity="warning")
+                continue
+            input_widget.insert_chip(attachment)
+            added += 1
+        if added:
+            self.notify(f"已插入 {added} 个附件引用，内容将在发送时附在消息之后")
 
     def _notify_import_result(self, res: dict) -> None:
-        """统一展示 import_targets 的导入结果通知（图片附带 token 估算）。"""
+        """旧 /import 路径的结果通知（Phase 5 删掉 /import 时一并移除）。"""
         bits = []
         if res["images_added"]:
             bits.append(f"{res['images_added']} 张图片")
         if res["text_added"]:
             bits.append(f"{res['text_added']} 个文本/网页")
         if bits:
-            self.notify(
-                f"已导入 {'、'.join(bits)}{self.ctrl.images_tokens_hint()}，发送时自动附带"
-            )
+            self.notify(f"已导入 {'、'.join(bits)}，发送时自动附带")
         for err in res["errors"][:2]:
             self.notify(err, severity="warning")
         if len(res["errors"]) > 2:
             self.notify(f"…共 {len(res['errors'])} 个失败", severity="warning")
 
     async def on_chat_input_files_dropped(self, message: ChatInput.FilesDropped) -> None:
-        """输入框内拖入文件：终端把路径粘贴进输入框 → 直接导入。"""
-        if self.ctrl is None:
-            return
-        res = self.ctrl.import_targets(message.paths)
-        self._refresh_import_status()
-        self._notify_import_result(res)
-        self.query_one("#chat-input", ChatInput).focus()
+        """输入框内拖入文件：终端把路径粘贴进来 → 转成引用块。"""
+        input_widget = self.query_one("#chat-input", ChatInput)
+        self._attach_targets(message.paths, input_widget)
+        input_widget.focus()
 
     async def on_paste(self, event: events.Paste) -> None:
-        """兜底：焦点不在输入框时，粘贴内容若为文件路径也直接导入。"""
-        if self.ctrl is None:
-            return
+        """兜底：焦点不在输入框时，粘贴内容若为文件路径也转成引用块。"""
         paths = ChatInput._paths_from_paste(event.text)
         if paths is None:
             return
-        res = self.ctrl.import_targets(paths)
-        self._refresh_import_status()
-        self._notify_import_result(res)
+        if self.ctrl is None:
+            return
+        input_widget = self.query_one("#chat-input", ChatInput)
+        self._attach_targets(paths, input_widget)
+        input_widget.focus()
 
     # ---------------- 对话树侧栏 ----------------
 
@@ -1479,6 +1559,32 @@ class ChatApp(App):
             res = ctrl.import_targets(targets)
             self._refresh_import_status()
             self._notify_import_result(res)
+            return True
+
+        if low == "/file" or low.startswith("/file "):
+            parts = cmd.split()
+            if len(parts) == 1:
+                self.notify(
+                    f"当前：{self.FILE_MODE_LABELS[self._file_mode]}"
+                    "；用法: /file off|read|confirm|direct"
+                )
+            else:
+                self._set_file_mode(parts[1].lower())
+            return True
+        if low == "/web" or low.startswith("/web "):
+            parts = cmd.split()
+            if len(parts) == 1:
+                self.notify(
+                    f"当前：联网{'开' if self._web_on else '关'}；用法: /web on|off"
+                )
+            else:
+                arg = parts[1].lower()
+                if arg in ("on", "开", "true", "1"):
+                    self._set_web(True)
+                elif arg in ("off", "关", "false", "0"):
+                    self._set_web(False)
+                else:
+                    self.notify("用法: /web on|off", severity="warning")
             return True
 
         if low.startswith("/files"):
@@ -2574,9 +2680,18 @@ class ChatApp(App):
             return  # 命令未输完：先补全，等再次 Enter 执行
         if await self._handle_command(event.text):
             return
+        # 附件引用块：Submitted 已带上提交瞬间解析出的附件，内容在这里追加到
+        # 「---」之后；聊天区仍显示用户原话（Phase 4 再换成彩色块与按钮）。
+        attachments = event.attachments
+        if attachments:
+            composed, images = compose_message(event.text, attachments)
+            if images:
+                self.ctrl.pending_images = images
+            await self._send_user_text(composed, display_text=event.text)
+            return
         await self._send_user_text(event.text)
 
-    async def _send_user_text(self, text: str) -> None:
+    async def _send_user_text(self, text: str, display_text: str | None = None) -> None:
         """发送一条用户消息（普通输入或 /wf run）。
 
         若已挂载工作流（/wf use），先把它合成为“按工作流执行”的消息再发送，
@@ -2609,8 +2724,10 @@ class ChatApp(App):
             text = composed
             self.notify(f"已按工作流「{wf_name}」执行")
         self._cancel_flush()  # 新消息开始前丢弃上一轮残留的流式缓冲
-        img_md = self._pending_images_md()
-        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{text}{img_md}")
+        # 聊天区回显用户原话（带引用块）；附件正文只发给模型，不重复渲染。
+        shown = text if display_text is None else display_text
+        img_md = "" if display_text is not None else self._pending_images_md()
+        await self._chat_stream_append(f"\n\n---\n\n**你**\n\n{shown}{img_md}")
         await self._chat_shrink_lists()
         self._refresh_import_status()  # 待发送图片随消息进入发送流程，先隐藏提示行
         self._stream_active = False

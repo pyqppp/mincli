@@ -105,6 +105,16 @@ CMD_SPEC: tuple[Cmd, ...] = (
             Cmd("list", "列出内置与已注册模型", aliases=("ls",)),
             Cmd("register", "注册 OpenAI 兼容模型", args="<模型名> <URL> [-p provider] [-k key_var]"),
         )),
+    Cmd("file", "查看/切换文件权限（关闭/只读/写需确认/写直通）",
+        args="<off|read|confirm|direct>", group="配置",
+        children=(
+            Cmd("off", "关闭：不提供读写本地文件的工具，附件仍可读"),
+            Cmd("read", "只读：允许读取本地文件与列目录"),
+            Cmd("confirm", "写需确认：读取 + 每次写文件前确认"),
+            Cmd("direct", "写直通：读取 + 写文件不再确认"),
+        )),
+    Cmd("web", "开关联网（搜索 + 网页抓取）", args="<on|off>", group="配置",
+        children=(Cmd("on", "开启联网"), Cmd("off", "关闭联网"))),
     Cmd("mcp", "管理第三方 MCP server", group="配置",
         children=(
             Cmd("list", "列出已配置的 server", aliases=("ls",)),

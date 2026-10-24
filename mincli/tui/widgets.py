@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import os
 
+from rich.style import Style
+from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Static, TextArea
 
+from mincli.attachments import Attachment
 from mincli.helpers import split_path_args
 
 # 锁定键（Caps Lock / Num Lock / Scroll Lock）绝不应产生输入。
@@ -51,11 +54,16 @@ class ChatInput(TextArea):
     ]
 
     class Submitted(Message):
-        """用户按下 Enter 提交消息。"""
+        """用户按下 Enter 提交消息。
 
-        def __init__(self, text: str) -> None:
+        ``attachments`` 在提交瞬间就从正文里解析出来：提交后输入框会立刻
+        清空，若等 App 收到消息再去解析，引用块已经不存在了。
+        """
+
+        def __init__(self, text: str, attachments: list[Attachment] | None = None) -> None:
             super().__init__()
             self.text = text
+            self.attachments = list(attachments or [])
 
     class TextChanged(Message):
         """输入内容发生变化（用于命令补全弹窗）。"""
@@ -74,6 +82,161 @@ class ChatInput(TextArea):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._target_height = MIN_INPUT_HEIGHT
+        # 附件引用块：标签文本（含方括号）→ 附件。标签在正文里出现几次就有几个块。
+        self._chips: dict[str, Attachment] = {}
+        # 每行起点的字符偏移缓存（块样式与原子删除都要按偏移换算行列）
+        self._line_starts_key: str | None = None
+        self._line_starts: list[int] = [0]
+
+    # ---------------- 附件引用块 ----------------
+
+    CHIP_STYLE = Style(bgcolor="grey27", color="bright_cyan")
+
+    def _ensure_line_starts(self) -> None:
+        text = self.text
+        if self._line_starts_key == text:
+            return
+        starts = [0]
+        for index, char in enumerate(text):
+            if char == "\n":
+                starts.append(index + 1)
+        self._line_starts_key = text
+        self._line_starts = starts
+
+    def _offset_of(self, location) -> int:
+        self._ensure_line_starts()
+        row, column = location
+        if row < len(self._line_starts):
+            return self._line_starts[row] + column
+        return len(self.text)
+
+    def _location_of(self, offset: int) -> tuple[int, int]:
+        self._ensure_line_starts()
+        starts = self._line_starts
+        low, high = 0, len(starts) - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if starts[middle] <= offset:
+                low = middle
+            else:
+                high = middle - 1
+        return low, offset - starts[low]
+
+    def chip_spans(self) -> list[tuple[int, int]]:
+        """正文里所有引用块的字符区间（按出现位置排序）。"""
+        text = self.text
+        spans: list[tuple[int, int]] = []
+        for label in self._chips:
+            start = text.find(label)
+            while start != -1:
+                spans.append((start, start + len(label)))
+                start = text.find(label, start + len(label))
+        spans.sort()
+        return spans
+
+    def get_line(self, line_index: int) -> Text:
+        """渲染前给引用块上色（Rich Text 层着色，光标/选区/折行都不受影响）。"""
+        line = super().get_line(line_index)
+        chips = getattr(self, "_chips", None)
+        if not chips:
+            return line
+        self._ensure_line_starts()
+        if line_index >= len(self._line_starts):
+            return line
+        base = self._line_starts[line_index]
+        end = base + len(line.plain)
+        for start, stop in self.chip_spans():
+            left, right = max(start, base), min(stop, end)
+            if left < right:
+                line.stylize(self.CHIP_STYLE, left - base, right - base)
+        return line
+
+    def insert_chip(self, attachment: Attachment) -> None:
+        """在光标处插入一个引用块（前后补空格，避免和文字粘连）。"""
+        label = attachment.chip_label
+        self._chips[label] = attachment
+        position = self.cursor_location
+        offset = self._offset_of(position)
+        lead = "" if offset == 0 or self.text[offset - 1].isspace() else " "
+        self.replace(f"{lead}{label} ", position, position)
+        self._line_starts_key = None
+        self._line_cache.clear()
+        self.refresh()
+
+    def take_chip_attachments(self) -> list[Attachment]:
+        """取走正文里实际出现的附件（按出现顺序），并清空登记表。"""
+        attachments: list[Attachment] = []
+        text = self.text
+        for start, stop in self.chip_spans():
+            attachment = self._chips.get(text[start:stop])
+            if attachment is not None:
+                attachments.append(attachment)
+        self._chips.clear()
+        return attachments
+
+    def _selection_empty(self) -> bool:
+        start, end = self.selection
+        return start == end
+
+    def _chip_before_cursor(self) -> tuple[int, int] | None:
+        offset = self._offset_of(self.cursor_location)
+        for start, stop in self.chip_spans():
+            if start < offset <= stop:
+                return start, stop
+        return None
+
+    def _chip_after_cursor(self) -> tuple[int, int] | None:
+        offset = self._offset_of(self.cursor_location)
+        for start, stop in self.chip_spans():
+            if start <= offset < stop:
+                return start, stop
+        return None
+
+    def _delete_span(self, span: tuple[int, int]) -> None:
+        start, stop = span
+        self.replace("", self._location_of(start), self._location_of(stop))
+        self.move_cursor(self._location_of(start))
+        self._line_starts_key = None
+        self._line_cache.clear()
+        self.refresh()
+
+    def action_delete_left(self) -> None:
+        """退格：光标紧贴块尾或块内时整块删除。"""
+        if self._selection_empty():
+            span = self._chip_before_cursor()
+            if span is not None:
+                self._delete_span(span)
+                return
+        super().action_delete_left()
+
+    def action_delete_right(self) -> None:
+        """Delete：光标紧贴块首或块内时整块删除。"""
+        if self._selection_empty():
+            span = self._chip_after_cursor()
+            if span is not None:
+                self._delete_span(span)
+                return
+        super().action_delete_right()
+
+    def action_cursor_left(self, select: bool = False) -> None:
+        """左移：不把光标放进块内，直接跳到块首。"""
+        if not select and self._selection_empty():
+            offset = self._offset_of(self.cursor_location)
+            for start, stop in self.chip_spans():
+                if start < offset <= stop:
+                    self.move_cursor(self._location_of(start))
+                    return
+        super().action_cursor_left(select)
+
+    def action_cursor_right(self, select: bool = False) -> None:
+        """右移：不把光标放进块内，直接跳到块尾。"""
+        if not select and self._selection_empty():
+            offset = self._offset_of(self.cursor_location)
+            for start, stop in self.chip_spans():
+                if start <= offset < stop:
+                    self.move_cursor(self._location_of(stop))
+                    return
+        super().action_cursor_right(select)
 
     @staticmethod
     def _paths_from_paste(text: str) -> list[str] | None:
@@ -120,11 +283,12 @@ class ChatInput(TextArea):
         await super()._on_paste(event)
 
     def action_submit_message(self) -> None:
-        """提交当前输入并清空输入框。"""
+        """提交当前输入并清空输入框（引用块在清空之前先取走）。"""
         text = self.text.strip()
         if not text:
             return
-        self.post_message(self.Submitted(text))
+        attachments = self.take_chip_attachments()
+        self.post_message(self.Submitted(text, attachments))
         self.clear()
         self.focus()
 
@@ -327,3 +491,4 @@ class ToolCard(Static):
     def card_summary(self) -> str:
         """聚合 source 用：卡片文本。"""
         return self._render_text()
+
