@@ -1428,6 +1428,57 @@ def test_cross_tree_tools():
     check("不存在的编号给出可用编号提示", "不存在" in bad and "1" in bad)
 
 
+def test_tool_markup_not_leaked():
+    print("== 工具标记泄漏：正文过滤 ==")
+    dsml = (
+        '<|DSML| | calls> <|DSML| | invoke name="web_search"> '
+        '<|DSML| | parameter name="query" string="true">新闻 用法</|DSML| | parameter> '
+        "</|DSML| | invoke> </|DSML| | calls>"
+    )
+    script = [[FakeChunk(content=dsml)], FakeChatResponse("新闻搜索")]
+    ctrl = TestController(FakeClient(script), config=make_config(web_enabled=False))
+    node, events = collect(ctrl, "搜一下新闻")
+
+    shown = "".join(e.content for e in events if e.kind == "stream")
+    check("泄漏标记未显示给用户", "DSML" not in shown and "web_search" not in shown)
+    check("节点内容不含标记", "DSML" not in node.assistant_msg)
+    check("节点内容给出替代说明", node.assistant_msg.strip() != "")
+    status = [e.message for e in events if e.kind == "status"]
+    check("状态提示指出未提供的工具", any("web_search" in m for m in status))
+
+
+def test_capability_prompt_reflects_switches():
+    print("== 能力状态：随开关注入 system ==")
+    script = [[FakeChunk(content="好的")], FakeChatResponse("能力测试")]
+    ctrl = TestController(
+        FakeClient(list(script)),
+        config=make_config(files_mode="off", web_enabled=False, recall_enabled=False),
+    )
+    collect(ctrl, "你好")
+    system = ctrl.client.chat.completions.calls[0]["messages"][0]["content"]
+    check("能力块：列出本轮工具", "本轮没有提供任何工具" in system)
+    check("能力块：联网关闭", "联网已关闭" in system)
+    check("能力块：文件关闭", "文件权限已关闭" in system)
+    check("能力块：历史查询关闭", "历史对话查询已关闭" in system)
+    check("能力块：禁止输出调用标记", "不要输出任何工具调用标记" in system)
+
+    script2 = [[FakeChunk(content="好的")], FakeChatResponse("能力测试2")]
+    ctrl2 = TestController(
+        FakeClient(list(script2)),
+        config=make_config(files_mode="read", web_enabled=True),
+    )
+    collect(ctrl2, "你好")
+    system2 = ctrl2.client.chat.completions.calls[0]["messages"][0]["content"]
+    check("能力块：联网开启时不再提示关闭", "联网已关闭" not in system2)
+    tool_line = next(
+        line for line in system2.split("\n") if line.startswith("- 本轮只提供这些工具")
+    )
+    check(
+        "能力块：只读时只列读工具",
+        "read_file" in tool_line and "write_file" not in tool_line,
+    )
+
+
 def run_test(fn) -> None:
     """每个用例前清空对话树目录：树是持久化的，不隔离会互相污染。"""
     TestController.reset_store()
@@ -1460,5 +1511,7 @@ if __name__ == "__main__":
     run_test(test_multi_tree_no_tree_guard)
     run_test(test_background_tree_mark)
     run_test(test_cross_tree_tools)
+    run_test(test_tool_markup_not_leaked)
+    run_test(test_capability_prompt_reflects_switches)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     raise SystemExit(0 if FAIL == 0 else 1)

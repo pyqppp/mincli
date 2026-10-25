@@ -57,6 +57,7 @@
 | 22 | 树编号 | 取最小可用正整数：删掉 1 号后新建就是 1 号；有 1、3 号时新建是 2 号 |
 | 23 | 通知 | 成功类操作一律静默（开关切换、新建/删除树、删除节点、清空、保存、模型切换、复制、附件插入、取消删除/清理）；只保留警告、错误，以及压缩过程与结果 |
 | 24 | 思考开关 | 三路入口：状态栏「思考 开/关」、`Ctrl+T`、`/thinking on|off`；改动立即生效并写回配置 |
+| 25 | 工具标记泄漏 | 每次请求在 system 末尾注入「本轮能力状态」；正文里泄漏的 `<\|DSML\|>` 等标记由 `mincli/tool_markup.py` 流式过滤，不写进历史 |
 
 ### 已执行的数据清理（2026-10-24）
 
@@ -330,7 +331,13 @@ Phase 0 临时状态（后续 Phase 修）：
 9. **环境**：Python 3.11.9（`/Library/Frameworks/Python.framework/Versions/3.11/bin/python3`）；依赖用清华源装进本机，无虚拟环境：`textual 8.2.8`、`rich 15.0.0`、`pytest 9.1.1`、`pytest-asyncio`，`mincli` 为可编辑安装。安装写 site-packages 需要 danger-full-access。
 10. **旧测试基线**：改动前 74 个测试在 textual 8.2.8 下全绿；Phase 0 后 85 个全绿。
 11. **MCP 现状**：内置 server 通过 `python -m mincli.mcp_server` 子进程提供 `read_file` / `list_directory` / `write_file` / `edit_file` / `execute_command` / `fetch_webpage` / `cancel_command`；Phase 3 起全部改进程内，Phase 6 删文件。
-12. **工具调用链**：`controller._run_tool` 目前先分派进程内两个树查询工具与写/编辑/执行，再转发 MCP。Phase 3 改成纯本地分派。
+12. **工具调用链**：`controller._run_tool` 在进程内直接分派（无 MCP、无子进程）。
+13. **工具标记泄漏**：某个工具没有下发时，DeepSeek 偶尔会把内部调用语法当正文输出，
+    形如 `<|DSML| | calls> <|DSML| | invoke name="web_search"> …`。两层处理：
+    - `_capability_prompt()` 把「本轮只提供这些工具 + 哪些能力已关闭」注入 system，模型不再凭空调用；
+    - `ToolMarkupFilter` 在流式层丢弃标记（普通正文立即透传，标记丢到行尾），
+      `strip_tool_markup()` 再清理最终回答，避免落盘和下一轮上下文被污染。
+    检测到泄漏时发一条 status 提示，若整段只有标记则用 `MARKUP_FALLBACK` 兜底回答。
 
 ---
 
@@ -386,6 +393,7 @@ python3 -m pytest -q tests/   # 当前 114 passed
 - 用户拖入或粘贴文件由客户端完成；附件内容确实不够时，先说明缺什么，再请用户补充。
 
 ## 工具与能力状态
+- 只使用本轮实际提供的工具；未提供的功能直接说明不可用，不要输出工具调用标记（如 <|DSML|>）。
 - 文件：read_file 按行读取文本、Markdown、CSV、PDF、DOCX，list_directory 列目录（不递归）；文件权限为只读及以上时可用。write_file 覆盖写入、edit_file 局部替换，写需确认或写直通时可用。
 - 文件权限关闭时你只能读附件。需要读文件时，请用户点底部状态栏的「文件」、按 Ctrl+R，或用 /file read；需要写时用 /file confirm 或 /file direct。
 - 联网：web_search 返回标题、链接与摘要，web_fetch 抓单个网页正文。关闭时请用户点「联网」、按 Ctrl+W，或用 /web on。

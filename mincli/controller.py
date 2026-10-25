@@ -69,6 +69,7 @@ from mincli.helpers import (
 )
 from mincli.models import ConversationNode, ConversationTree
 from mincli.streaming import stream_response
+from mincli.tool_markup import MARKUP_FALLBACK, ToolMarkupFilter, strip_tool_markup
 from mincli.tools.builtin import ToolContext, available_tools, dispatch_tool
 from mincli.tools.files import (
     FilesAPIError,
@@ -576,6 +577,50 @@ class ChatController:
         """按当前能力状态刷新工具列表（发送时按本轮附件再算一次）。"""
         self.llm_tools = available_tools(self.config, has_attachments=False)
 
+    def _capability_prompt(self, tools: List[Dict]) -> str:
+        """本轮能力状态：告诉模型哪些工具真的可用，避免它「凭空调用」。
+
+        这段内容只随请求发送，不写进树、不落盘；开关变化时内容跟着变。
+        """
+        cfg = self.config
+        names = [str(t.get("function", {}).get("name", "")) for t in tools]
+        lines = ["## 本轮能力状态"]
+        if names:
+            lines.append(
+                "- 本轮只提供这些工具：" + "、".join(names)
+                + "。未列出的工具不可用，不要调用，也不要输出任何工具调用标记"
+                "（如 <|DSML|>、<tool_call>）。"
+            )
+        else:
+            lines.append(
+                "- 本轮没有提供任何工具。不要调用工具，也不要输出任何工具调用标记"
+                "（如 <|DSML|>、<tool_call>）。"
+            )
+        if not cfg.web_enabled:
+            lines.append(
+                "- 联网已关闭：web_search / web_fetch 不可用。需要联网时直接说明，"
+                "并告诉用户按 Ctrl+W 或 /web on 打开。"
+            )
+        if not cfg.files_read_enabled:
+            lines.append(
+                "- 文件权限已关闭：read_file / list_directory 不可用，只能读本轮附件。"
+                "需要读文件时请用户按 Ctrl+R 或 /file read。"
+            )
+        elif not cfg.files_write_enabled:
+            lines.append(
+                "- 文件权限为只读：可以读文件与列目录，不能写入。"
+                "需要写入时请用户 /file confirm 或 /file direct。"
+            )
+        elif cfg.files_write_needs_confirm:
+            lines.append("- 文件权限为写需确认：每次写入会弹窗，用户可能拒绝。")
+        if not cfg.recall_enabled:
+            lines.append(
+                "- 历史对话查询已关闭：不要声称读过历史节点；需要时请用户 /recall on。"
+            )
+        if self.current_model == MODEL_PRO:
+            lines.append("- 当前模型 deepseek-v4-pro 不支持图片。")
+        return "\n".join(lines)
+
     def save_node(self, node_id: str) -> Optional[str]:
         """导出节点为 Markdown 文件，返回文件路径；节点不存在返回 None。"""
         node = self.tree.nodes.get(node_id)
@@ -921,8 +966,16 @@ class ChatController:
         )
         self.llm_tools = tools
 
-        # 构建发送消息（历史链 + 本轮；图片构造为 OpenAI 兼容内容块）
+        # 构建发送消息（历史链 + 本轮；图片构造为 OpenAI 兼容内容块）。
+        # system 里追加「本轮能力状态」：工具没下发的功能明确告诉模型不可用。
         messages = self.tree.get_messages_for_node(node)
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {
+                "role": "system",
+                "content": (
+                    self.current_system + "\n\n" + self._capability_prompt(tools)
+                ).strip(),
+            }
 
         # 图片消息：仅 deepseek-flash 支持；其余模型给出明确提示（不自动切换）
         if self._messages_contain_images(messages):
@@ -959,12 +1012,19 @@ class ChatController:
         tool_messages: List[Dict] = []
         file_degraded = False  # file_id 失效降级重试标志（只重试一次）
 
+        markup = ToolMarkupFilter()
+
         def _on_chunk(content_delta: str, reasoning_delta: str) -> None:
-            """累积本轮正文（出错时也要落盘到节点）+ 转发 UI。"""
+            """累积本轮正文（出错时也要落盘到节点）+ 转发 UI。
+
+            正文先过滤掉泄漏的工具调用标记：不给用户看乱码，也不写进历史。
+            """
             nonlocal accumulated_content
-            if content_delta:
-                accumulated_content += content_delta
-            emit(ControllerEvent.stream(content_delta, reasoning_delta))
+            clean = markup.feed(content_delta) if content_delta else ""
+            if clean:
+                accumulated_content += clean
+            if clean or reasoning_delta:
+                emit(ControllerEvent.stream(clean, reasoning_delta))
 
         def _finalize(reason: str) -> ConversationNode:
             """把当前已生成的部分落盘为「中断」节点（打断/错误共用）。"""
@@ -1001,6 +1061,10 @@ class ChatController:
                     on_chunk=_on_chunk,
                     should_stop=_interrupted,
                 )
+                tail = markup.flush()
+                if tail:
+                    accumulated_content += tail
+                    emit(ControllerEvent.stream(tail, ""))
                 if _interrupted():
                     # 本轮已流出的思考/用量也计入中断节点（正文经 _on_chunk 已累积）
                     accumulated_reasoning += sr.reasoning or ""
@@ -1111,7 +1175,17 @@ class ChatController:
                     continue
 
                 if sr.content is not None:
-                    final_answer = sr.content
+                    cleaned, leaked, names = strip_tool_markup(sr.content)
+                    if leaked:
+                        markup.leaked = True
+                        for name in names:
+                            if name not in markup.names:
+                                markup.names.append(name)
+                    final_answer = (
+                        cleaned
+                        if cleaned.strip()
+                        else (MARKUP_FALLBACK if leaked else sr.content)
+                    )
                     break
 
                 empty_err = "回答生成失败，请重试"
@@ -1150,6 +1224,14 @@ class ChatController:
                 tool_messages=tool_messages,
             )
             raise
+
+        if markup.leaked:
+            names = "、".join(markup.names) or "未提供的工具"
+            emit(ControllerEvent.status(
+                f"模型尝试调用未提供的工具（{names}），已忽略这次调用"
+            ))
+            if not (final_answer or "").strip():
+                final_answer = MARKUP_FALLBACK
 
         title = generate_conversation_title(self.client, user_input)
         node.assistant_msg = final_answer

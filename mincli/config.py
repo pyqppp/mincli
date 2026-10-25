@@ -164,6 +164,7 @@ DEFAULT_PROMPT = """\
 - 用户拖入或粘贴文件由客户端完成；附件内容确实不够时，先说明缺什么，再请用户补充。
 
 ## 工具与能力状态
+- 只使用本轮实际提供的工具；未提供的功能直接说明不可用，不要输出工具调用标记（如 <|DSML|>）。
 - 文件：read_file 按行读取文本、Markdown、CSV、PDF、DOCX，list_directory 列目录（不递归）；文件权限为只读及以上时可用。write_file 覆盖写入、edit_file 局部替换，写需确认或写直通时可用。
 - 文件权限关闭时你只能读附件。需要读文件时，请用户点底部状态栏的「文件」、按 Ctrl+R，或用 /file read；需要写时用 /file confirm 或 /file direct。
 - 联网：web_search 返回标题、链接与摘要，web_fetch 抓单个网页正文。关闭时请用户点「联网」、按 Ctrl+W，或用 /web on。
