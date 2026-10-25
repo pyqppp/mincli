@@ -140,6 +140,36 @@ def test_default_prompt_has_no_emoji_requirement():
     assert "✅" not in config.DEFAULT_PROMPT
 
 
+def test_default_prompt_matches_current_tools():
+    """默认提示词必须与当前工具面和命令面一致，不能提到已删除的功能。"""
+    prompt = config.DEFAULT_PROMPT
+    for tool in (
+        "read_attachment",
+        "read_file",
+        "list_directory",
+        "write_file",
+        "edit_file",
+        "web_search",
+        "web_fetch",
+        "query_conversation_tree",
+        "read_conversation_nodes",
+    ):
+        assert tool in prompt, f"缺少工具说明：{tool}"
+
+    for command in ("/file", "/web", "/recall", "/model", "/thinking", "/help"):
+        assert command in prompt, f"缺少命令入口：{command}"
+
+    for removed in ("/set", "/import", "/wf", "/mcp", "execute_command", "MCP", "工作流"):
+        assert removed not in prompt, f"提示词仍提到已删除功能：{removed}"
+
+
+def test_prompt_file_gets_new_default(tmp_path):
+    path = tmp_path / "prompt.md"
+    cfg = config.Config(prompt_file=str(path))
+    config.ensure_prompt_file(cfg)
+    assert path.read_text(encoding="utf-8") == config.DEFAULT_PROMPT
+
+
 def test_api_key_from_env(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     assert config.api_key() == "sk-test"
