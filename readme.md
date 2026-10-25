@@ -15,7 +15,7 @@ Streaming Markdown, reasoning display, branching conversations and multiple tree
 - **Reasoning** — DeepSeek reasoning chain shown in its own block, toggleable
 - **Attachments** — drop a file or paste a path to create a chip such as `[DOCX report.docx]`; short content is inlined, long content is truncated and can be paged with `read_attachment`
 - **Three built-in tool groups** — files (read/write/edit/list), web (official Search / Fetch API), conversation-tree recall (off by default)
-- **Capability switches** — four file modes and a web toggle, reachable from the status bar, keyboard shortcuts, or commands; changes are written back to the config immediately
+- **Capability switches** — four file modes, web access and thinking, reachable from the status bar, keyboard shortcuts, or commands; changes are written back to the config immediately
 - **Context compaction** — `/compact` turns the current branch into a detailed summary node
 - **Image understanding** — native multimodal support on `deepseek-flash`; local images are uploaded to the Files API, managed with `/files`
 - **Usage and balance** — the status line shows cache hit rate, balance, next input tokens and estimated cost
@@ -101,6 +101,8 @@ File modes:
 
 Web and file permissions are independent. Conversation-tree recall is controlled separately by `/recall on|off` (off by default, not shown in the status bar).
 
+Thinking has the same three entry points: the status bar item, `Ctrl+T`, and `/thinking on|off`. Changes apply to the next request and are written back to `thinking` in `config.toml`; reasoning effort still lives in the config file.
+
 ---
 
 ## Attachments
@@ -151,6 +153,7 @@ Web access uses the official DeepSeek endpoints (`POST /v1/tools/search`, `POST 
 | `/save [node-id]` | export a node as Markdown |
 | `/web <on\|off>` | toggle web access |
 | `/model [flash\|pro]` | show or switch model |
+| `/thinking [on\|off]` | show or toggle thinking |
 | `/a1` style input | jump to a node |
 
 Type `/` for completions: `Tab` cycles, `Shift+Tab` reverses, `Enter` accepts.
@@ -168,6 +171,7 @@ Type `/` for completions: `Tab` cycles, `Shift+Tab` reverses, `Enter` accepts.
 | `Ctrl+N` | new tree |
 | `Ctrl+R` | cycle file mode |
 | `Ctrl+W` | toggle web |
+| `Ctrl+T` | toggle thinking |
 | `Ctrl+1..8` | switch to tree N |
 | `Delete` | delete the selected sidebar node (asks first) |
 | `Ctrl+Backspace` / `Alt+Backspace` | delete a word in the input |

@@ -148,12 +148,13 @@ HELP_TAIL = """
 - 输入 `/` 打开命令补全：继续输入过滤候选，**Tab** 循环（**Shift+Tab** 反向），**Enter** 补全；命令写完按 **Enter** 执行
 - `/<节点ID>`（如 `/a3`）— 直接跳转到指定节点
 - 图片理解仅 flash 支持；当前模型不支持时会提示切换
-- 底部状态栏的「文件」「联网」可点击，也可用 `/file`、`/web` 切换
+- 底部状态栏的「文件」「联网」「思考」都可点击，也可用 `/file`、`/web`、`/thinking` 切换
 
 **快捷键**
 - **Enter** 发送 · **Ctrl+J** 换行 · **Alt+Enter** 换行
 - **Tab** 命令补全/循环候选 · **Shift+Tab** 反向循环候选
 - **Ctrl+N** 新建对话树 · **Ctrl/Alt+1~8** 切换对话树 · 侧栏选中节点后 **Delete** 删除
+- **Ctrl+T** 开关思考 · **Ctrl+R** 循环文件权限 · **Ctrl+W** 开关联网
 - **Esc** / 生成中 **Ctrl+C** 打断当前生成（再按一次 **Ctrl+C** 强制退出） · **Ctrl+C** 退出
 """
 
@@ -341,6 +342,7 @@ class ChatApp(App):
         # 用 priority 覆盖掉（删词仍可用 Ctrl+Backspace / Alt+Backspace）。
         Binding("ctrl+r", "cycle_file_mode", "文件权限", show=False, priority=True),
         Binding("ctrl+w", "toggle_web", "联网开关", show=False, priority=True),
+        Binding("ctrl+t", "toggle_thinking", "思考开关", show=False, priority=True),
         # 新建对话树 / 删除侧栏选中节点（输入框聚焦时由 check_action 让位）
         Binding("ctrl+n", "new_tree", "新建对话树", show=False, priority=True),
         Binding("delete", "delete_node", "删除节点", show=False, priority=True),
@@ -466,6 +468,7 @@ class ChatApp(App):
             yield Static("", id="footer-hint", markup=False)
             yield Static("", id="footer-file", markup=False)
             yield Static("", id="footer-web", markup=False)
+            yield Static("", id="footer-think", markup=False)
 
     async def on_mount(self) -> None:
         self.theme = theme_name(1)  # 默认树 1 的青色；_refresh_tree_ui 会按当前树覆盖
@@ -826,10 +829,13 @@ class ChatApp(App):
         cfg = self.ctrl.config
         try:
             self.query_one("#footer-hint", Static).update(
-                "Ctrl+R 文件权限   Ctrl+W 联网   /help 帮助"
+                "Ctrl+R 文件权限   Ctrl+W 联网   Ctrl+T 思考   /help 帮助"
             )
             self.query_one("#footer-file", Static).update(f"文件 {cfg.files_label}")
             self.query_one("#footer-web", Static).update(f"联网 {cfg.web_label}")
+            self.query_one("#footer-think", Static).update(
+                f"思考 {'开' if cfg.thinking else '关'}"
+            )
         except Exception:
             pass
 
@@ -869,6 +875,19 @@ class ChatApp(App):
             return
         self._set_web(not self.ctrl.config.web_enabled)
 
+    def _set_thinking(self, enabled: bool) -> None:
+        """切换思考模式：写回配置后刷新状态栏（不弹通知）。"""
+        if self.ctrl is None:
+            return
+        self.ctrl.set_thinking(bool(enabled))
+        self._refresh_status_footer()
+
+    def action_toggle_thinking(self) -> None:
+        """Ctrl+T：开 / 关思考。"""
+        if self.ctrl is None:
+            return
+        self._set_thinking(not self.ctrl.config.thinking)
+
     def on_click(self, event) -> None:
         """点击底部状态栏上的开关（鼠标路径）。"""
         widget_id = event.widget.id if event.widget is not None else ""
@@ -878,6 +897,9 @@ class ChatApp(App):
         elif widget_id == "footer-web":
             event.stop()
             self.action_toggle_web()
+        elif widget_id == "footer-think":
+            event.stop()
+            self.action_toggle_thinking()
 
     # ---------------- 拖入文件：在输入框里生成引用块 ----------------
 
@@ -1512,6 +1534,9 @@ class ChatApp(App):
         if head == "/model":
             await self._cmd_model(cmd)
             return True
+        if head == "/thinking":
+            self._cmd_thinking(parts[1:])
+            return True
 
         # /<节点ID>：如 /a3、/main
         m = re.match(r"^/([A-Za-z]+\d+|main)$", cmd)
@@ -1949,6 +1974,22 @@ class ChatApp(App):
             return
         if not self.ctrl.set_model(sub):
             self.notify("模型切换失败", severity="error")
+
+    def _cmd_thinking(self, args: list[str]) -> None:
+        """`/thinking [on|off]`：查看或开关思考模式（改动静默，状态栏可见）。"""
+        if self.ctrl is None:
+            return
+        if not args:
+            state = "开" if self.ctrl.config.thinking else "关"
+            self.notify(f"思考：{state}；{usage_line('/thinking')}")
+            return
+        arg = args[0].lower()
+        if arg in ("on", "开", "true", "1"):
+            self._set_thinking(True)
+        elif arg in ("off", "关", "false", "0"):
+            self._set_thinking(False)
+        else:
+            self.notify(usage_line("/thinking"), severity="warning")
 
     async def _model_list(self) -> None:
         """只列 flash 与 pro 两个现役模型，并标明当前。"""

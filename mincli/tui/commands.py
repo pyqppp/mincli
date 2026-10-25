@@ -99,6 +99,11 @@ CMD_SPEC: tuple[Cmd, ...] = (
             Cmd("flash", "deepseek-flash：支持图片理解"),
             Cmd("pro", "deepseek-v4-pro：不支持图片"),
         )),
+    Cmd("thinking", "查看/开关思考模式", args="<on|off>", group="模型",
+        children=(
+            Cmd("on", "开启思考，显示推理过程"),
+            Cmd("off", "关闭思考，回答更快"),
+        )),
 ) + (
     Cmd(
         "a1",

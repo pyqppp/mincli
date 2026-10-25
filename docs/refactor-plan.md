@@ -48,7 +48,7 @@
 | 13 | 行号 | 内联段不带行号；工具输出带行号 |
 | 14 | 引用块标签 | 图片 `[IMAGE x.jpg]`；文档按扩展名大写 `[DOCX x.docx]` `[PDF x.pdf]` `[MD x.md]`；网页 `[WEB example.com/标题]`，无标题退化为 `[WEB example.com]`；文件名完整显示不省略 |
 | 15 | 聊天区 | 引用块用行内代码样式显示；消息下方一行附件按钮，点击弹只读全文 |
-| 16 | 命令面 | 14 条：`/help` `/clear` `/exit` `/tree` `/model` `/compact` `/save` `/up` `/home` `/files` `/file` `/web` `/delete` `/recall`；另有 `/a1` 这类节点跳转语法 |
+| 16 | 命令面 | 15 条：`/help` `/clear` `/exit` `/tree` `/model` `/thinking` `/compact` `/save` `/up` `/home` `/files` `/file` `/web` `/delete` `/recall`；另有 `/a1` 这类节点跳转语法 |
 | 17 | 删节点 | 侧栏选中 + `Delete` 键，同时保留 `/delete` 命令 |
 | 18 | 目录列举 | `list_directory` 保留，只读及以上可用 |
 | 19 | CLI | 只留 `mincli chat` 与 `mincli info`；启动参数收敛到配置文件（不加 `-m/--temp` 等） |
@@ -56,6 +56,7 @@
 | 21 | 旧数据 | 旧 `workflows.json`、`mcp_servers.json`、`models.json` 保留文件但不读取、不删除 |
 | 22 | 树编号 | 取最小可用正整数：删掉 1 号后新建就是 1 号；有 1、3 号时新建是 2 号 |
 | 23 | 通知 | 成功类操作一律静默（开关切换、新建/删除树、删除节点、清空、保存、模型切换、复制、附件插入、取消删除/清理）；只保留警告、错误，以及压缩过程与结果 |
+| 24 | 思考开关 | 三路入口：状态栏「思考 开/关」、`Ctrl+T`、`/thinking on|off`；改动立即生效并写回配置 |
 
 ### 已执行的数据清理（2026-10-24）
 
@@ -296,7 +297,7 @@ Phase 0 临时状态（后续 Phase 修）：
 
 ### Phase 5 命令面与界面：已完成
 
-- `mincli/tui/commands.py` 收敛为 15 个一级命令并同步补全与 `/help`
+- `mincli/tui/commands.py` 收敛为 15 个一级命令（加 `/a1` 共 16 项）并同步补全与 `/help`
 - 删除 `/wf` `/mcp` `/import` `/view` `/info` `/full` `/set`
 - 欢迎页（`#welcome` + `#welcome-new`）、侧栏新建、`Ctrl+N`；删除 `tui/tree_wizard.py`
 - `/recall on|off`；底部状态栏三路入口一致

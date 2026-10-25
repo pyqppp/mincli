@@ -743,8 +743,10 @@ async def test_footer_reflects_config():
                 break
         footer_file = app.query_one("#footer-file", Static)
         footer_web = app.query_one("#footer-web", Static)
+        footer_think = app.query_one("#footer-think", Static)
         check("状态栏：文件模式显示为关闭", "文件 关闭" in str(footer_file.content))
         check("状态栏：联网显示为开", "联网 开" in str(footer_web.content))
+        check("状态栏：思考默认关闭", "思考 关" in str(footer_think.content))
 
         await pilot.click("#footer-file")
         for _ in range(30):
@@ -778,6 +780,42 @@ async def test_footer_reflects_config():
                 break
         check("状态栏：Ctrl+W 翻转联网", ctrl.config.web_enabled is True)
         check("状态栏：联网重新显示为开", "联网 开" in str(footer_web.content))
+
+        # 思考：快捷键、点击、命令三路一致
+        await pilot.press("ctrl+t")
+        for _ in range(30):
+            await pilot.pause()
+            if ctrl.config.thinking:
+                break
+        check("状态栏：Ctrl+T 开启思考", ctrl.config.thinking is True)
+        check("状态栏：思考文本跟随配置", "思考 开" in str(footer_think.content))
+        try:
+            saved = open(ctrl.CONFIG_PATH, encoding="utf-8").read()
+        except OSError:
+            saved = ""
+        check("状态栏：思考开关写回 config.toml", "thinking = true" in saved)
+        await pilot.click("#footer-think")
+        for _ in range(30):
+            await pilot.pause()
+            if not ctrl.config.thinking:
+                break
+        check("状态栏：点击思考开关关闭", ctrl.config.thinking is False)
+        check("状态栏：思考重新显示为关", "思考 关" in str(footer_think.content))
+
+        inp = app.query_one("#chat-input", ChatInput)
+        inp.clear()
+        for _ in range(4):
+            await pilot.pause()
+        await pilot.press(*list("/thinking on"))
+        for _ in range(8):
+            await pilot.pause()
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if ctrl.config.thinking:
+                break
+        check("命令：/thinking on 开启思考", ctrl.config.thinking is True)
+        check("命令：底部状态栏同步", "思考 开" in str(footer_think.content))
         await pilot.press("ctrl+c")
 
 
@@ -1110,7 +1148,7 @@ def test_command_spec():
     }
 
     c = complete("/", prov)
-    check("规格：/ 列出全部一级命令", c is not None and len(c.candidates) == len(CMD_SPEC) == 15)
+    check("规格：/ 列出全部一级命令", c is not None and len(c.candidates) == len(CMD_SPEC) == 16)
 
     names = {x.insert.strip() for x in c.candidates}
     check(
@@ -1119,7 +1157,7 @@ def test_command_spec():
         == {
             "/help", "/clear", "/compact", "/exit", "/tree", "/up", "/home",
             "/delete", "/recall", "/file", "/files", "/save", "/web", "/model",
-            "/a1",
+            "/thinking", "/a1",
         },
     )
     check(
@@ -1148,6 +1186,10 @@ def test_command_spec():
 
     c = complete("/model ", prov)
     check("规格：/model 只列 flash/pro", c is not None and {x.insert for x in c.candidates} == {"/model flash", "/model pro"})
+
+    c = complete("/thinking ", prov)
+    check("规格：/thinking 取值枚举",
+          c is not None and {x.insert for x in c.candidates} == {"/thinking on", "/thinking off"})
 
     c = complete("/tree ", prov)
     check("规格：动态候选（对话树编号）",
@@ -1228,7 +1270,7 @@ async def test_command_completion_levels():
         check("补全：/ 每行一个候选（用法 + 灰色说明）", "/exit" in text and "/file" in text)
         check("补全：灰字统一为说明（不再混入用法行）", "用法:" not in text)
         check("补全：输入 / 时无高亮项也能滚到第一项", popup.scroll_y == 0)
-        check("补全：标题给出候选序号", "第 1/15 项" in text)
+        check("补全：标题给出候选序号", "第 1/16 项" in text)
 
         # 15 个一级命令在 30 行终端里可能超出弹窗可视高度：Tab 必须把高亮项滚进视野
         indices = []

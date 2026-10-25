@@ -357,13 +357,13 @@ ConfirmScreen {
     overflow: hidden;
 }
 
-#footer-file, #footer-web {
+#footer-file, #footer-web, #footer-think {
     width: auto;
     height: 1;
     padding: 0 1;
     color: $text;
 }
 
-#footer-file:hover, #footer-web:hover {
+#footer-file:hover, #footer-web:hover, #footer-think:hover {
     background: $primary 30%;
 }
