@@ -407,7 +407,6 @@ class ChatApp(App):
         if self.ctrl is None or not self._turn_active:
             return
         self.ctrl.interrupt()
-        self.notify("正在打断当前生成…", timeout=3)
 
     def _set_turn_active(self, active: bool) -> None:
         """切换「生成中」状态：占用期间输入框占位提示如何打断。"""
@@ -429,8 +428,7 @@ class ChatApp(App):
                 subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
             except Exception:
                 pass
-        if text:
-            self.notify(f"已复制 {len(text)} 字符")
+
 
     def notify(self, message, **kwargs) -> None:
         """统一关闭 markup 解析。
@@ -705,7 +703,7 @@ class ChatApp(App):
         self._load_draft()
         self._refresh_usage_bar()
 
-    async def _switch_tree(self, number: int, notify: bool = True) -> bool:
+    async def _switch_tree(self, number: int) -> bool:
         """切换到指定对话树（正在生成的那棵树会继续在后台跑）。"""
         if self.ctrl is None:
             return False
@@ -716,10 +714,6 @@ class ChatApp(App):
             return False
         self._refresh_tree_ui()
         await self._render_active_tree()
-        if notify:
-            self.notify(
-                f"已进入对话树 {number}（{color_label(self.ctrl.tree_color())}）"
-            )
         return True
 
     def action_switch_tree(self, number="1") -> None:
@@ -746,7 +740,6 @@ class ChatApp(App):
     async def _after_tree_created(self, number: int) -> None:
         self._refresh_tree_ui()
         await self._render_active_tree()
-        self.notify(f"已创建对话树 {number}（{color_label(self.ctrl.tree_color())}）")
 
     async def _show_welcome(self) -> None:
         """一棵树都没有：聊天区显示欢迎页（含新建按钮）。"""
@@ -894,7 +887,6 @@ class ChatApp(App):
         解析可能包含网页抓取（网络请求），放到线程里做，避免卡住 UI。
         """
         detail = self.ctrl.image_detail if self.ctrl is not None else "auto"
-        added = 0
         for target in targets:
             try:
                 attachment = await asyncio.to_thread(
@@ -907,9 +899,6 @@ class ChatApp(App):
                 self.notify(f"导入失败：{exc}", severity="warning")
                 continue
             input_widget.insert_chip(attachment)
-            added += 1
-        if added:
-            self.notify(f"已插入 {added} 个附件引用，内容将在发送时附在消息之后")
 
     async def on_chat_input_files_dropped(self, message: ChatInput.FilesDropped) -> None:
         """输入框内拖入文件：终端把路径粘贴进来 → 转成引用块。"""
@@ -1483,7 +1472,6 @@ class ChatApp(App):
         if head in ("/clear", "/c"):
             if ctrl is not None and ctrl.has_trees:
                 ctrl.reset()
-                self.notify("对话历史已清除")
             await self._render_active_tree()
             self._answer_started = False
             self._refresh_usage_bar()
@@ -1556,9 +1544,7 @@ class ChatApp(App):
         current_id = tree.current_node.id if tree.current_node else None
         node_id = args[0] if args else current_id
         filepath = self.ctrl.save_node(node_id) if node_id else None
-        if filepath:
-            self.notify(f"节点已保存到 {filepath}")
-        else:
+        if not filepath:
             self.notify("节点不存在", severity="error")
 
     async def _cmd_delete(self, nids: list[str]) -> None:
@@ -1781,33 +1767,24 @@ class ChatApp(App):
         if file_id is None:
             self.notify(self._file_ref_error(ref), severity="warning")
             return
-        name = next(
-            (f.get("name", "") for f in self._files_listing if f.get("id") == file_id),
-            "",
-        )
         try:
             self.ctrl.files_delete(file_id)
         except FilesAPIError as e:
             self.notify(str(e), severity="error")
             return
         self._files_listing = [f for f in self._files_listing if f.get("id") != file_id]
-        self.notify(f"已删除文件 {file_id}" + (f"（{name}）" if name else ""))
 
     def _on_files_clean_confirmed(self, ids: list, ok: bool) -> None:
         """确认后逐个删除未被引用的远端文件（失败只提示，不中断其余删除）。"""
         if not ok or not ids:
-            if not ok:
-                self.notify("已取消清理")
             return
-        done, failed = 0, []
+        failed = []
         for fid in ids:
             try:
                 self.ctrl.files_delete(fid)
-                done += 1
             except FilesAPIError as e:
                 failed.append(f"{fid}: {e}")
         self._files_listing = [f for f in self._files_listing if f.get("id") not in set(ids)]
-        self.notify(f"已清理 {done} 个未被引用的远端文件" + (f"，{len(failed)} 个失败" if failed else ""))
         for msg in failed[:2]:
             self.notify(msg, severity="warning")
 
@@ -1919,7 +1896,6 @@ class ChatApp(App):
 
     async def _on_tree_delete_confirmed(self, number: int, ok: bool) -> None:
         if not ok:
-            self.notify("已取消删除")
             return
         if self._turn_active and self.ctrl.generating_number == number:
             self.notify("这棵树正在生成，先按 Esc 打断再删除", severity="warning")
@@ -1930,12 +1906,10 @@ class ChatApp(App):
             return
         self._refresh_tree_ui()
         await self._render_active_tree()
-        self.notify(f"已删除对话树 {number}")
 
     async def _on_delete_confirmed(self, nids: list, ok: bool) -> None:
         """确认弹窗回调：ok=True 时批量删除（App 消息泵空闲时才被调用）。"""
         if not ok:
-            self.notify("已取消删除")
             return
         tree = self.ctrl.tree
         prev_current_id = tree.current_node.id if tree.current_node else None
@@ -1953,9 +1927,7 @@ class ChatApp(App):
             self._rebuild_tree()
             if tree.current_node:
                 self._select_tree_node(tree.current_node.id)
-        if result["deleted"]:
-            self.notify(f"已删除 {len(result['deleted'])} 个节点（含其子节点及关联图片文件）")
-        else:
+        if not result["deleted"]:
             self.notify("没有可删除的节点", severity="warning")
 
     MODEL_CHOICES = (
@@ -1975,9 +1947,7 @@ class ChatApp(App):
         if sub not in ("flash", "pro"):
             self.notify(usage_line("/model"), severity="warning")
             return
-        if self.ctrl.set_model(sub):
-            self.notify(f"模型已切换为：{self.ctrl.current_model}")
-        else:
+        if not self.ctrl.set_model(sub):
             self.notify("模型切换失败", severity="error")
 
     async def _model_list(self) -> None:
