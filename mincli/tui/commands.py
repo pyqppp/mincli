@@ -65,7 +65,7 @@ CMD_SPEC: tuple[Cmd, ...] = (
         children=(
             Cmd("list", "列出全部对话树（默认，也可只输 /tree）", aliases=("ls",)),
             Cmd("new", "新建一棵空对话树（所有树完全一样）"),
-            Cmd("delete", "删除整棵树（需确认，编号不再复用）", args="<编号>",
+            Cmd("delete", "删除整棵树（需确认，编号会被复用）", args="<编号>",
                 aliases=("rm", "del"), dyn="trees"),
         ),
         dyn="trees"),

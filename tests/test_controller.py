@@ -1334,7 +1334,7 @@ def test_multi_tree():
     check("删除树 2", result["ok"] and ctrl.tree_numbers() == [1])
     check("删除后文件也没了",
           not os.path.exists(os.path.join(TestController.TREES_DIR, "2.json")))
-    check("编号不复用：新建得到 3", ctrl.create_tree() == 3)
+    check("编号复用：删了 2 号后新建得到 2", ctrl.create_tree() == 2)
 
 
 def test_multi_tree_no_tree_guard():

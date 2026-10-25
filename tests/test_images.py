@@ -34,13 +34,16 @@ _TMP = tempfile.mkdtemp(prefix="mincli_imgtest_")
 
 
 def check(name: str, cond: bool) -> None:
+    """记录并打印一条断言；在 pytest 下失败即抛出，避免测试静默通过。"""
     global PASS, FAIL
     if cond:
         PASS += 1
         print(f"  PASS  {name}")
-    else:
-        FAIL += 1
-        print(f"  FAIL  {name}")
+        return
+    FAIL += 1
+    print(f"  FAIL  {name}")
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        raise AssertionError(name)
 
 
 # ---------------- 手工构造最小合法图片字节 ----------------

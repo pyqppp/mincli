@@ -12,8 +12,8 @@
 - 树数量不设上限时，索引文件依然很小。
 
 写入一律先写同目录临时文件再 `os.replace`，避免中途崩溃留下半个 JSON。
-编号从 1 起单调递增、永不复用；颜色由编号固定推导（见 `color_of`），
-因此删树不会让其它树变色。
+编号取当前最小的未使用正整数：删掉 1 号后再新建，新树就是 1 号。
+颜色由编号固定推导（见 `color_of`），因此删树不会让其它树变色。
 """
 
 import json
@@ -95,7 +95,6 @@ class TreeStore:
     def _empty_index(self) -> Dict[str, Any]:
         return {
             "version": INDEX_VERSION,
-            "next": 1,
             "active": None,
             "trees": {},       # "1": {"color": 1}
             "global": {},      # 全局设置（模型/温度/系统提示词…由 controller 解释）
@@ -123,10 +122,6 @@ class TreeStore:
                     except (TypeError, ValueError):
                         color = color_of(number)
                 index["trees"][str(number)] = {"color": color}
-        try:
-            index["next"] = max(1, int(data.get("next") or 1))
-        except (TypeError, ValueError):
-            index["next"] = 1
         active = data.get("active")
         try:
             index["active"] = int(active) if active is not None else None
@@ -134,9 +129,6 @@ class TreeStore:
             index["active"] = None
         if isinstance(data.get("global"), dict):
             index["global"] = data["global"]
-        # next 至少要大于已有最大编号，防止手工改坏索引后编号撞车
-        if index["trees"]:
-            index["next"] = max(index["next"], max(int(n) for n in index["trees"]) + 1)
         return index
 
     def _prune_missing(self) -> None:
@@ -187,17 +179,19 @@ class TreeStore:
                 return color
         return color_of(number)
 
-    def next_number(self) -> int:
-        return int(self._index["next"])
-
     def allocate(self) -> int:
-        """分配一个新编号并登记进索引（颜色按编号推导），返回编号。
+        """分配编号：当前最小的未使用正整数，登记进索引后返回。
+
+        编号会被复用：删掉 1 号树后，下一个新建的树就是 1 号；有 1、3 号时
+        新建得到 2 号。颜色按编号推导。
 
         只登记编号，不创建树文件——调用方随后应立刻 `save_tree`；
         若中途失败，下次启动的 `_prune_missing` 会把空编号清掉。
         """
-        number = int(self._index["next"])
-        self._index["next"] = number + 1
+        used = {int(n) for n in self._index["trees"]}
+        number = 1
+        while number in used:
+            number += 1
         self._index["trees"][str(number)] = {"color": color_of(number)}
         self.save_index()
         return number
@@ -225,7 +219,7 @@ class TreeStore:
         return _atomic_write_json(self.tree_path(number), payload)
 
     def delete_tree(self, number: int) -> bool:
-        """删除树文件与索引条目（编号不复用）。"""
+        """删除树文件与索引条目（编号会被下一个新树复用）。"""
         number = int(number)
         existed = self.has_tree(number)
         try:

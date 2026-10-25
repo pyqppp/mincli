@@ -447,7 +447,7 @@ class ChatController:
         return number
 
     def delete_tree(self, number: int) -> dict:
-        """删除整棵对话树（含数据文件）。编号不复用。"""
+        """删除整棵对话树（含数据文件）。编号会被下一个新树复用。"""
         number = int(number)
         if not self._store.has_tree(number):
             return {"ok": False, "reason": "missing"}

@@ -850,7 +850,6 @@ class ChatApp(App):
             )
             return
         self._refresh_status_footer()
-        self.notify(f"文件权限：{self.ctrl.config.files_label}")
 
     def action_cycle_file_mode(self) -> None:
         """Ctrl+R：关闭 → 只读 → 写需确认 → 写直通 → 关闭。"""
@@ -870,7 +869,6 @@ class ChatApp(App):
             return
         self.ctrl.set_web(bool(enabled))
         self._refresh_status_footer()
-        self.notify(f"联网：{self.ctrl.config.web_label}")
 
     def action_toggle_web(self) -> None:
         """Ctrl+W：开 / 关联网。"""
@@ -1601,9 +1599,6 @@ class ChatApp(App):
             self.ctrl.set_recall(False)
         else:
             self.notify(usage_line("/recall"), severity="warning")
-            return
-        state = "开" if self.ctrl.config.recall_enabled else "关"
-        self.notify(f"对话树检索：{state}")
 
     def _cmd_file(self, args: list[str]) -> None:
         if self.ctrl is None:
@@ -1913,7 +1908,7 @@ class ChatApp(App):
             self._ask_confirm(
                 "删除对话树",
                 f"确定删除对话树 {number}（{summary['nodes']} 个节点）吗？\n"
-                "该树的数据文件会一并删除，编号不再复用。",
+                "该树的数据文件会一并删除；编号会被下一个新树复用。",
                 lambda ok, n=number: self._on_tree_delete_confirmed(n, ok),
             )
             return

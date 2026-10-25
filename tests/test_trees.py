@@ -21,13 +21,16 @@ FAIL = 0
 
 
 def check(name: str, cond: bool) -> None:
+    """记录并打印一条断言；在 pytest 下失败即抛出，避免测试静默通过。"""
     global PASS, FAIL
     if cond:
         PASS += 1
         print(f"  PASS  {name}")
-    else:
-        FAIL += 1
-        print(f"  FAIL  {name}")
+        return
+    FAIL += 1
+    print(f"  FAIL  {name}")
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        raise AssertionError(name)
 
 
 def fresh_dir() -> str:
@@ -50,7 +53,6 @@ def test_allocate_and_numbers():
     try:
         store = TreeStore(base)
         check("初始没有任何树", store.numbers() == [] and not store.has_trees())
-        check("初始 next 为 1", store.next_number() == 1)
 
         n1 = store.allocate()
         check("首个编号是 1", n1 == 1)
@@ -64,8 +66,13 @@ def test_allocate_and_numbers():
         check("删除后只剩 1", store.numbers() == [1])
         check("树文件已删除", not os.path.exists(store.tree_path(2)))
         n3 = store.allocate()
-        check("编号不复用（删了 2 号，新建是 3 号）", n3 == 3)
-        check("颜色按编号推导", store.color_of(3) == 3)
+        check("编号复用（删了 2 号，新建仍是 2 号）", n3 == 2)
+        check("颜色按编号推导", store.color_of(2) == 2)
+        store.save_tree(n3, {"number": n3})
+        store.delete_tree(1)
+        n4 = store.allocate()
+        check("删掉 1 号后新建回到 1 号", n4 == 1)
+        check("编号列表始终从空位补齐", store.numbers() == [1, 2])
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -153,7 +160,7 @@ def test_corrupt_index():
             json.dump({"version": 1, "next": 5, "active": 4, "trees": {"4": {"color": 4}}}, f)
         store2 = TreeStore(base)
         check("缺失文件的编号被清理", store2.numbers() == [] and store2.active() is None)
-        check("next 至少大于最大已用编号", store2.next_number() >= 5)
+        check("清理后新建从 1 号开始", store2.allocate() == 1)
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
